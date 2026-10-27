@@ -2896,23 +2896,6 @@ const __scBgKeepAlive = (function() {
         Utils.uiAlert(status);
     });
 
-    GM_registerMenuCommand("🔎 检测每日活动卡片（只读）", async () => {
-        const map = await API.getPromotionMap(true);
-        if (!map) { Utils.uiAlert("无法读取 DAPI 任务列表（请先完成授权）"); return; }
-        const todayStr = Utils.getTodayStr();
-        const lines = [`📅 今日 ${todayStr} 日常卡片状态（DAPI 权威）\n`];
-        const children = [...map.values()].filter(i =>
-            i.offerId.includes(RewardsAuto.appConfig.offerIds.dailySetPrefix) || i.dailySetDate === todayStr);
-        if (children.length === 0) lines.push("未在 DAPI 中找到今日日常卡片");
-        for (const c of children) {
-            lines.push(`${c.complete ? "✅" : "⏳"} ${c.progress}/${c.max}  ${c.title || c.offerId}`);
-            lines.push(`     ${c.offerId}`);
-        }
-        const streak = map.get(RewardsAuto.appConfig.offerIds.streakCounter);
-        if (streak) lines.push(`\n🔥 连续打卡：${streak.progress} 天`);
-        Utils.uiAlert(lines.join("\n"));
-    });
-
     const init = () => {
         TaskManager.init();
 
