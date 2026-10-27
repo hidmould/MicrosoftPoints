@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         微软积分（全能任务版）
+// @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
 // @version      1.3.6
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务（全程后台运行，不打开多余标签页）
@@ -125,10 +125,7 @@ Notice:
 const __scBgKeepAlive = (function() {
     'use strict';
 
-    // 授权回调页（login.live.com/oauth20_desktop.srf?code=...）：
-    // 这里只记录标记，不做任何任务初始化，也不在这里处理授权码。
-    // 真正的「捕获授权码 → 立刻换取 Token」放在脚本末尾的 Auth.handleCallback()，
-    // 因为它需要用到下面才定义的 Utils / API / Auth。
+    // 授权回调页：此处只做标记，真正的「捕获授权码 → 换 Token」在脚本末尾的 Auth.handleCallback()
     const IS_OAUTH_CALLBACK = location.hostname === "login.live.com"
         && location.pathname === "/oauth20_desktop.srf";
 
@@ -227,7 +224,7 @@ const __scBgKeepAlive = (function() {
             "punch card", "ancient coin", "sea of thieves", "rewards extension",
             "redemption goal", "order history", "claim your gift", "shop to earn",
             "set goal", "Available tomorrow", "Offer is Locked", "Earn -1 points",
-            /* "拼图", "quiz" allowed */
+            // 拼图 / quiz 不跳过
         ],
         skipHrefs: [
             "sweepstakes/", "referandearn", "aka.ms/win", "workinprogress",
@@ -365,15 +362,9 @@ const __scBgKeepAlive = (function() {
             }));
         },
 
-        /* ---------------- 交互兼容层 ----------------
-         * ScriptCat 的后台脚本（@background）把脚本跑在 service_worker 里，那里没有
-         * prompt / alert / confirm（调用会直接抛 ReferenceError）。
-         * 旧版菜单里直接用 prompt，在后台上下文里就会「点了没反应、什么都没保存」，
-         * 这正是「授权码有时候能保存、有时候保存不了」的原因之一。
-         * 这里统一封装：有 DOM 用原生对话框，没有 DOM 就转成页面内输入框或通知。
-         * -------------------------------------------- */
-        // 注意：脚本是 @run-at document-start，那时 document.body 还是 null，
-        // 所以这里只判断 document 存在，domPrompt 内部再等 body。
+        /* 交互兼容层：@background 的 service_worker 里没有 prompt/alert/confirm，
+         * 有 DOM 用原生对话框，没有 DOM 就转成页内输入框或通知。
+         * @run-at document-start 时 body 还是 null，故只判断 document，domPrompt 内部再等 body。 */
         hasDOM() {
             return typeof document !== "undefined" && !!document && !!document.documentElement;
         },
@@ -560,12 +551,8 @@ const __scBgKeepAlive = (function() {
             });
         },
 
-        /* ==================== 跨上下文互斥锁 ====================
-         * 后台常驻实例（@background）与已打开的 rewards 标签页会同时运行本脚本，
-         * 并发运行会互相覆盖 Token（refresh_token 轮换）并造成重复上报/限流，
-         * 这是「有时候全完成、有时只完成一两张、有时一张不完成」的主要原因之一。
-         * 这里用 GM 存储做一个带 TTL 的互斥锁，只允许一个上下文真正执行任务。
-         * ==================================================== */
+        /* 跨上下文互斥锁：后台实例与已打开的 rewards 标签页会同时跑脚本，
+         * 并发会互相覆盖 Token 并重复上报，这里用 GM 存储做带 TTL 的锁，只允许一个上下文执行任务。 */
         lockId() {
             if (!RewardsAuto.state.lockId) RewardsAuto.state.lockId = Utils.getRandomUUID();
             return RewardsAuto.state.lockId;
@@ -592,22 +579,8 @@ const __scBgKeepAlive = (function() {
         }
     };
 
-    /* ==================== 授权码 / Token ====================
-     * 1.3.1 及之前的三个硬伤（1.3.2 修复）：
-     *  ① 「📋 粘贴授权码」只把内容写进 Config.code，但 renewTokenInner 从头到尾
-     *     没有读过 Config.code —— 粘贴的码永远不会被拿去换 Token，
-     *     表现为「授权码: 有 / Token: 无」。
-     *  ② fetchCode() 一进来就 GM_setValue("Config.code", "")，与手动粘贴/页面捕获
-     *     形成竞态，经常把刚存好的码清掉 → 「有时候能保存、有时候保存不了」。
-     *  ③ 自动获取只发一次 GM_xmlhttpRequest 并读 res.finalUrl，多数情况下拿到的是
-     *     登录页 HTML 或空 finalUrl，于是必然失败，而且没有任何兜底。
-     *  另外 token 端点在失败时返回 400 + JSON（invalid_grant 等），旧代码把它当网络
-     *  错误重试 3 次，既看不到真实原因，也白等十几秒。
-     *
-     * 现在的策略：
-     *  解析任意形态的输入 → 保存 → 立刻兑换 → 明确报错；
-     *  自动获取先静默请求，失败再打开授权页，由 @match 的 handleCallback() 捕获。
-     * ==================================================== */
+    /* 授权码 / Token 策略：解析任意形态的输入 → 保存 → 立刻兑换 → 明确报错；
+     * 自动获取先静默请求，失败再打开授权页，由 @match 的 handleCallback() 捕获。 */
     const CLIENT_ID = "0000000040170455";
     const REDIRECT_URI = "https://login.live.com/oauth20_desktop.srf";
     const TOKEN_SCOPE = "service::prod.rewardsplatform.microsoft.com::MBI_SSL";
@@ -615,7 +588,7 @@ const __scBgKeepAlive = (function() {
     const Auth = {
         authUrl: `https://login.live.com/oauth20_authorize.srf?client_id=${CLIENT_ID}&response_type=code&scope=${TOKEN_SCOPE}&redirect_uri=${REDIRECT_URI}`,
 
-        // 只解 %XX，不把 + 当空格（MS 授权码里可能出现 * ! $ . _ -，不会出现 +）
+        // 只解 %XX，不把 + 当空格（授权码里可能出现 *!$._- ，但不会出现 +）
         decode(s) {
             return String(s).replace(/%([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
         },
@@ -629,13 +602,8 @@ const __scBgKeepAlive = (function() {
             return c.length >= 20 ? c : null;
         },
 
-        /**
-         * 从任意粘贴内容里取出 code：
-         *  - 完整跳转地址：https://login.live.com/oauth20_desktop.srf?code=M.C561...%24%24&lc=2052
-         *  - 被 HTML 转义过的地址（&amp;）、被 JSON 转义过的地址（\u0026、\/）
-         *  - 只粘 code= 后面那一段
-         *  - 前后带空格/引号/换行的粘贴
-         */
+        /** 从任意粘贴内容里取出 code：支持完整跳转地址、HTML/JSON 转义过的地址、
+         *  只粘 code= 后那一段、以及前后带空格/引号/换行的粘贴。 */
         parseCode(input) {
             if (input == null) return null;
             let s = String(input)
@@ -714,9 +682,8 @@ const __scBgKeepAlive = (function() {
             if (reason) Utils.log("🟡", `已清除授权码：${reason}`);
         },
 
-        /** 用授权码换 Token（成功即写入 refresh_token / access_token 缓存）
-         *  keep=true 时**成功兑换后保留授权码**（只标记为已兑换，不再重复使用），
-         *  这样状态菜单里始终能看到当初填进去的码。 */
+        /** 用授权码换 Token（成功即写入 refresh_token / access_token 缓存）。
+         *  keep=true 时保留授权码，只标记已兑换，便于状态菜单回显。 */
         async exchange(code, keep = true) {
             Utils.log("🟡", `正在用授权码换取 Token（${this.preview(code)}）...`);
             const r = await API.tokenRequest({
@@ -728,7 +695,6 @@ const __scBgKeepAlive = (function() {
             if (r.ok) {
                 API.applyToken(r.json);
                 if (keep) {
-                    // 保留授权码，只打「已兑换」标记：授权码只能用一次，留着是为了回显与留档
                     GM_setValue("Config.codeUsed", true);
                     GM_setValue("Config.codeFingerprint", String(code).slice(-32));
                     Utils.log("🟢", "授权码换取 Token 成功（授权码已保留）", true);
@@ -795,9 +761,8 @@ const __scBgKeepAlive = (function() {
                 const freshToken = () => GM_getValue("Config.token", false)
                     && (Number(GM_getValue("Config.tokenTime", 0)) || 0) >= since;
                 if (code && t >= since) {
-                    // 回调页自己也在这条链路上（捕获 → 保存 → 兑换），可能正好同时在兑换。
-                    // 先给 2.5 秒让那边把 Token 换完，避免同一个 code 被兑换两次
-                    // （第二次必然 invalid_grant，看起来像是「授权失败」）。
+                    // 回调页可能正在同时兑换同一个 code，先等 2.5 秒，
+                    // 避免第二次必然 invalid_grant（看起来像「授权失败」）。
                     await Utils.delay(2500);
                     if (freshToken()) return { tokenReady: true };
                     return { code };
@@ -892,9 +857,8 @@ const __scBgKeepAlive = (function() {
     };
 
     const API = {
-        /* 统一走 POST 表单请求 token 端点，并解析 400 响应里的 JSON 错误体。
-         * 旧实现用 Utils.xhr，非 2xx 直接抛 "HTTP 400"，于是 invalid_grant 被当成
-         * 网络错误重试 3 次：既看不到真实原因，也白等 10 秒。 */
+        /* 统一走 POST 表单请求 token 端点，并解析 400 响应里的 JSON 错误体，
+         * 否则 invalid_grant 会被当成网络错误盲重试。 */
         async tokenRequest(params) {
             const body = Object.entries(params)
                 .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
@@ -952,9 +916,8 @@ const __scBgKeepAlive = (function() {
                 return await requestFn(token);
             } catch (e) {
                 if (e.message && e.message.includes("401")) {
-                    // 注意：401 只代表「access_token 过期」，绝不能在这里清掉 refresh_token。
-                    // 旧实现在此删除 Config.token，一次偶发 401 就会让当天后续所有任务
-                    // 退化成「需要手动授权」而全部失败（表现为有时 0/3、有时 1-2/3）。
+                    // 401 只代表 access_token 过期，绝不能清 refresh_token，
+                    // 否则一次偶发 401 会让当天后续任务全部退化成「需要手动授权」。
                     Utils.log("🟡", "access_token 过期，使用 refresh_token 续期...");
                     RewardsAuto.state.token = null;
                     GM_setValue("Config.accessToken", "");
@@ -967,12 +930,8 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        /**
-         * 统一的 Token 获取入口（带缓存复用 + 跨上下文单飞）。
-         * 背景：MS 的 refresh_token 在每次刷新后会轮换，两个上下文同时刷新会让其中一个
-         * 拿着已被作废的 refresh_token 请求，返回 invalid_grant，进而被误判成「需要重新授权」。
-         * 缓存 access_token（有效期 1 小时，这里用 45 分钟）可把刷新次数降到最低。
-         */
+        /** 统一 Token 入口（缓存复用 + 跨上下文单飞）。
+         *  MS 的 refresh_token 每次刷新都轮换，并发刷新会让其中一个拿着作废的 token 换来 invalid_grant。 */
         async renewToken() {
             if (!GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true)) return true;
             const cachedAt = GM_getValue("Config.accessTokenTime", 0);
@@ -1034,8 +993,6 @@ const __scBgKeepAlive = (function() {
             }
 
             // ---------- 2) 优先使用「📋 粘贴授权码」保存的码 ----------
-            // 1.3.1 之前这里完全没有读 Config.code，粘贴的码永远不会被兑换，
-            // 于是永远显示「授权码: 有 / Token: 无」。
             const storedCode = Auth.stored();
             if (storedCode) {
                 Utils.log("🟡", "发现已保存的授权码，尝试用它换取 Token...");
@@ -1166,9 +1123,7 @@ const __scBgKeepAlive = (function() {
                             return apiResult;
                         }
                     }
-                    // 主路径（页面解析成功）以前只返回搜索配额，缺 readProgress/readMax，
-                    // 于是汇总日志里「阅读 x/30」永远回落成 state.readProgress = 0。
-                    // 这里补一次 App 通道（DAPI）查询，保证汇总里的阅读进度是真实值。
+                    // 补一次 DAPI 查询，保证汇总里的阅读进度是真实值（否则永远显示 0/30）
                     let readProgress = RewardsAuto.state.readProgress ?? 0;
                     let readMax = RewardsAuto.state.readMax ?? 30;
                     const readInfo = await this.getReadProgress();
@@ -1415,12 +1370,8 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
-        /* ==================== DAPI 权威任务状态（不依赖浏览器 Cookie） ====================
-         * 说明：网页通道（rewards.bing.com 的 Server Action / api/reportactivity）依赖浏览器
-         * Cookie 与 UA 指纹，在 Edge 与 Chrome/Firefox 之间表现不一致，且无法复核是否真的加分。
-         * 这里改为直接读取 BingSapphire App 的 DAPI 接口（Bearer Token 鉴权），
-         * 与浏览器无关，可精确读到每张卡片的 progress/max，用来「发现 + 复核」。
-         * ==================================================================== */
+        /* DAPI 权威任务状态：网页通道依赖 Cookie 与 UA 指纹，Edge 与 Chrome/Firefox 不一致且无法复核；
+         * 这里直接读 BingSapphire App 的 DAPI 接口（Bearer Token），可精确读到每张卡的 progress/max。 */
         _promoCache: null,
 
         async getAppPromotions(force = false) {
@@ -1489,8 +1440,7 @@ const __scBgKeepAlive = (function() {
             return item ? item.complete : null;
         },
 
-        // 通过 DAPI 发现「今日日常活动卡片」（3 张卡），完全不依赖页面 HTML / 浏览器 Cookie
-        // preMap 可传入已获取的 promotionMap，避免重复请求
+        // 通过 DAPI 发现「今日日常活动卡片」，不依赖页面 HTML / Cookie；preMap 可复用已获取的 map
         async discoverDailySetCards(preMap = null) {
             const todayStr = Utils.getTodayStr();
             const todayNum = String(Utils.getTodayNum());
@@ -1702,7 +1652,6 @@ const __scBgKeepAlive = (function() {
                 
                 const pushCard = (card) => {
                     if (!card || !card.offerId || !card.hash || card.points <= 0) return;
-                    // Quiz and puzzle cards are now automatically supported via Server Action
                     const key = `${card.offerId}:${card.hash}`;
                     if (seenCardKeys.has(key)) return;
                     seenCardKeys.add(key);
@@ -1842,8 +1791,7 @@ const __scBgKeepAlive = (function() {
             }
             
                 // --- [桌面奖励应用专属任务检测与解析] ---
-                // 注：此块原先写在 try 之外的 catch 后面，引用了 try 内的 html，必然抛
-                // ReferenceError 并被下面的 catch 静默吞掉，导致桌面周任务功能完全失效。
+                // 注意：此块必须留在 try 内，一旦引用 try 外的 html 会抛 ReferenceError 并被 catch 静默吞掉。
                 try {
                     if (!earnHtml) return cards;
                     const questMatch = earnHtml.match(/href="(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i)
@@ -1911,12 +1859,8 @@ const __scBgKeepAlive = (function() {
             return cached;
         },
 
-        // 统一入口：先 DAPI（跨浏览器一致）→ 再网页通道 → 最后一律用 DAPI 复核是否真的加分
-        /**
-         * 领取单张卡片（带重试阶梯）。
-         * 服务端有时要过 1~3 分钟才把上报记入 progress，单次失败并不等于真的失败；
-         * 这里做多轮：每轮「访问目的地 → DAPI 上报 → 复核」，第二轮起再叠加网页通道，
-         * 只要任意一轮服务端复核通过就立即返回成功。
+        /** 领取单张卡片（统一入口：先 DAPI → 再网页通道 → 一律用 DAPI 复核是否真的加分）。
+         *  服务端可能要 1~3 分钟才把上报记入 progress，单次失败不等于真失败，故做多轮重试。
          */
         async claimCard(card, opts = {}) {
             const offerId = card.offerId;
@@ -2007,8 +1951,7 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
-        // 网页通道（Edge 与 Chrome/Firefox 行为差异所在）：返回 true 仅表示「请求已被接受」，
-        // 真实加分一律由上层 claimCard() 通过 DAPI 复核。
+        // 网页通道（Edge 与 Chrome/Firefox 差异所在）：返回 true 仅表示请求被接受，真实加分由 claimCard() 用 DAPI 复核
         async claimCardWeb(card) {
             const url = card.url || "https://rewards.bing.com/earn";
             const referer = card.url || "https://rewards.bing.com/earn";
@@ -2412,11 +2355,7 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        /**
-         * 读取阅读任务进度并带重试。
-         * 后台运行时 DAPI 偶发失败，旧版一次失败就放弃整个阅读任务（readTimes++），
-         * 这里重试 3 次再判定失败。
-         */
+        /** 读取阅读任务进度并带重试：后台 DAPI 偶发失败，一次失败不应放弃整个阅读任务 */
         async readProgressWithRetry(attempts = 3) {
             for (let i = 1; i <= attempts; i++) {
                 const p = await API.getReadProgress();
@@ -2544,8 +2483,7 @@ const __scBgKeepAlive = (function() {
             const maxRounds = 3;
             let totalOk = 0, totalFail = 0, remain = -1;
 
-            // 服务端记账有延迟，且偶发限流/401，单轮容易「一张都没完成」；
-            // 这里做多轮，每轮重新发现 → 领取 → 服务端复核，直到全部完成或无卡可做。
+            // 服务端记账有延迟且偶发限流，单轮容易「一张没完成」，故多轮：发现 → 领取 → 复核
             for (let round = 1; round <= maxRounds; round++) {
                 Utils.log("📅", `第 ${round}/${maxRounds} 轮每日活动（服务端已确认 ${doneIds.size} 张）...`);
                 await Utils.randomDelay(2000, 5000);
@@ -2719,17 +2657,15 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟡", "任务正在运行中，请勿重复触发");
                 return;
             }
-            // 跨上下文互斥：后台常驻实例与已打开的 rewards 标签页会同时跑任务，
-            // 并发会重复上报、互相踢 Token，是「有时全完成、有时只完成一部分」的另一个主因。
+            // 跨上下文互斥：后台实例与 rewards 标签页会同时跑，并发会重复上报并互相踢 Token
             if (!Utils.acquireLock("Config.runLock", 45 * 60 * 1000)) {
                 Utils.log("⏳", "另一个上下文正在运行任务，本次跳过（避免并发重复上报）");
                 return;
             }
             this.running = true;
             try {
-                // 1.3.5：后台常驻实例会跨轮次复用，这几个「本轮重试次数」必须每轮归零。
-                // 旧版是 @crontab，每轮都由 ScriptCat 起一个新实例，天然是 0；改成常驻后若不归零，
-                // 累计到 3 次失败就会像被永久关掉一样再也不重试（签入/阅读/活动）。
+                // 后台常驻实例会跨轮次复用，这几个「本轮重试次数」必须每轮归零，
+                // 否则累计到 3 次失败后就再也不重试（旧版 @crontab 每轮新实例，天然为 0）。
                 this.signTimes = 0;
                 this.readTimes = 0;
                 this.promosTimes = 0;
@@ -2772,9 +2708,8 @@ const __scBgKeepAlive = (function() {
                 if (regionOK && isTokenOK) {
                     await withRetry(() => this.doSign(), "签到");
                     await Utils.randomDelay();
-                    // 阅读任务走 App/DAPI 通道（Bearer Token），与 PC 会话（浏览器 Cookie）无关。
-                    // 旧版用 RewardsAuto.state.pc401 把关，而后台 crontab / service_worker 里 PC 通道
-                    // 请求必然拿不到 Cookie 而 401，于是「阅读」在后台运行中永远被跳过。
+                    // 阅读走 App/DAPI 通道（Bearer Token），与 PC 会话 Cookie 无关：
+                    // 后台上下文里 PC 通道必然 401，不能用它来把关阅读任务。
                     if (RewardsAuto.state.pc401) {
                         Utils.log("🟡", "PC 会话不可用（只影响 PC 通道任务），阅读改用 App 通道继续执行");
                     }
@@ -2855,10 +2790,7 @@ const __scBgKeepAlive = (function() {
         }
     });
 
-    // 1.3.1 之前这里用的是裸 prompt + alert：
-    // ScriptCat 的后台脚本（@background）跑在 service_worker 里没有 prompt，点击会直接抛错，
-    // 于是「有时候能保存、有时候保存不了」。现在走 Utils.uiPrompt，后台上下文
-    // 会打开页面在页面里弹输入框；并且保存后立刻兑换 Token 并明确告知结果。
+    // 后台 service_worker 没有 prompt，统一走 Utils.uiPrompt（无 DOM 时打开页面弹输入框）
     GM_registerMenuCommand("📋 粘贴授权码", () => { Auth.pasteFlow().catch(e => Utils.log("🔴", `粘贴授权码失败：${e.message}`)); });
 
     GM_registerMenuCommand("📊 Token状态", () => {
@@ -2984,10 +2916,8 @@ const __scBgKeepAlive = (function() {
     const init = () => {
         TaskManager.init();
 
-        // 后台上下文里点「📋 粘贴授权码」时没有输入框，会置 Config.pendingPaste 并打开页面；
-        // 页面里的脚本加载后在这里把输入框弹出来（只在有 DOM 的上下文执行）。
-        // 另外监听一次 focus：GM_openInTab 若只是切到已打开的那个标签页（不重新加载），
-        // 也能在切过去时把输入框补上。
+        // 后台点「📋 粘贴授权码」时会置 Config.pendingPaste 并打开页面，
+        // 页面侧在加载 / 获得焦点时把输入框补弹出来。
         const consumePendingPaste = () => {
             if (!GM_getValue("Config.pendingPaste", false) || !Utils.hasDOM()) return false;
             GM_setValue("Config.pendingPaste", false);
@@ -3026,30 +2956,21 @@ const __scBgKeepAlive = (function() {
         setTimeout(() => TaskManager.runAll(), delay);
     };
 
-    // 说明：原实现在每次加载时执行 GM_cookie("delete", { url: "https://bing.com", name: "_EDGE_S" })，
-    // 这会删除 Edge 专属的积分标识 Cookie，且在缺少 GM_cookie 的脚本管理器里会直接抛错中断初始化。
-    // 该操作只影响 Edge，正是「Edge 完成不了、Chrome/Firefox 正常」的差异来源之一，故移除。
+    // 已移除删除 _EDGE_S Cookie 的逻辑：那是 Edge 专属积分标识，且缺少 GM_cookie 时会抛错中断初始化
 
     const isBingSearchPage = typeof location !== "undefined"
         && location.hostname
         && (location.hostname === "www.bing.com" || location.hostname === "cn.bing.com");
 
     if (IS_OAUTH_CALLBACK) {
-        // 授权回调页：捕获 code → 立刻换取 Token → 提示并关闭页面。
-        // 1.3.1 之前这里只把 location.href 存进 Config.code 就 return 了，
-        // 既不清旧 Token 也不兑换，导致「授权码: 有 / Token: 无」。
+        // 授权回调页：捕获 code → 立刻换 Token → 提示并关闭页面
         Auth.handleCallback().catch(e => Utils.log("🔴", `授权回调处理失败：${e.message}`));
         return;
     }
 
-    // ===== 1.3.5 后台常驻调度 =====
-    // 旧版是 @crontab */20 * * * *：定时脚本只在到点时由 ScriptCat 在 service_worker 里跑一次。
-    // 而 GM_registerMenuCommand 注册的菜单，只有在脚本「真正执行过」之后才会出现在扩展弹窗里，
-    // 这份菜单缓存又是会话级的 —— 浏览器一重启就清空，于是刚打开浏览器时弹窗里只剩「用户配置」，
-    // 必须手动点一次「运行脚本」才会有「🔑 手动授权」这些按钮。
-    // 改成 @background 后：ScriptCat 在「浏览器启动」时就会把脚本跑起来，菜单立刻注册，弹窗马上有按钮；
-    // 下面这段小调度器负责复刻原来 20 分钟一轮的节奏（含关浏览器太久后的补跑）。
-    // 页面上下文（有 DOM）不启用调度器，仍沿用「页面加载跑一次」的旧行为。
+    // ===== 后台常驻调度 =====
+    // @background 在浏览器启动时就执行脚本，菜单立即注册（@crontab 时菜单要等脚本真跑过一次才出现，
+    // 且该缓存是会话级的，重启浏览器就丢）。下面复刻原来 20 分钟一轮的节奏；有 DOM 的页面不启用调度器。
     const CRON_PERIOD = 20 * 60 * 1000;
     const CRON_CHECK_INTERVAL = 60 * 1000;
 
@@ -3070,11 +2991,8 @@ const __scBgKeepAlive = (function() {
     if (!Utils.hasDOM()) {
         setTimeout(runScheduled, 3000);
         setInterval(runScheduled, CRON_CHECK_INTERVAL);
-        // 1.3.6：后台常驻脚本必须让顶层返回一个「永不兑现」的 Promise。
-        // ScriptCat 以「脚本顶层返回的 Promise 是否已 settle」判定后台脚本是否还在跑：
-        // 同步代码一执行完它就发 SCRIPT_RUN_STATUS_COMPLETE，管理页随即显示「停止」，
-        // 可此时 setInterval 的调度器其实还在跑 —— 这正是「明明在运行却显示停止」的来源。
-        // 返回 pending Promise 后 runStatus 会一直保持 running，与真实运行状态一致。
+        // 必须让顶层返回一个永不兑现的 Promise：ScriptCat 以「顶层 Promise 是否 settle」
+        // 判定后台脚本是否还在跑，否则调度器还在转、管理页却显示「停止」。
         return new Promise(() => {});
     }
 
@@ -3085,12 +3003,8 @@ const __scBgKeepAlive = (function() {
     }
 })();
 
-// ===== 1.3.6：把后台常驻的 Promise 交还给脚本管理器 =====
-// ScriptCat 后台脚本的运行状态 = 「脚本顶层返回的 Promise 是否已 settle」：
-// 不返回 Promise（或返回已兑现的）→ 同步代码跑完即判定为「执行完毕」（complete），
-// 「已安装的脚本」页就把卡片显示成「停止」；而调度器仍在跑，于是状态与实际不符。
-// 这里把上面后台分支返回的 pending Promise 原样交给 ScriptCat，runStatus 保持 running。
-// 页面上下文（有 document）与授权回调返回的不是 Promise，不会触发下面的 return，行为完全不变。
+// 把后台分支的 pending Promise 原样返回给 ScriptCat，使 runStatus 保持 running。
+// 页面上下文与授权回调返回的不是 Promise，不会触发下面的 return。
 if (__scBgKeepAlive && typeof __scBgKeepAlive.then === "function") {
     return __scBgKeepAlive;
 }
