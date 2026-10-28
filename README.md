@@ -5,11 +5,12 @@
 ## 授权（首次必做）
 
 1. **🔑 手动授权**，在打开的微软页面登录账号。
-2. 登录后浏览器会跳转，**复制地址栏里的完整地址（授权码）**，形如`https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxxx&lc=2052`
+2. 登录后浏览器会跳转，**复制地址栏里的完整地址（授权码）**， 形如：
+`https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxxx&lc=2052`
 3.  **📋 粘贴授权码**，把整段地址粘进去，回车。
 4. 提示"授权成功"即可。之后用 Token 运行。
 
-**授权码长什么样**：就是上面地址里 `code=` 到 `&` 之间那一段，形如
+**授权码长什么样**：就是上面地址里包含 `code=M.` 的链接，形如
 
 ```
 https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxxx&lc=2052
