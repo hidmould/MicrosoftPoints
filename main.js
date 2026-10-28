@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.6
+// @version      1.3.8
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -2201,6 +2201,9 @@ const __scBgKeepAlive = (function() {
     const TaskManager = {
         signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
+        // running 只是本上下文的防重入标记；后台沙盒被冻结时 finally 可能跑不到，
+        // 所以配一个 runningSince，超过 RUN_STALE 就当作残留标记自动清理
+        running: false, runningSince: 0,
 
         init() {
             RewardsAuto.state.dateNowNum = Utils.getTodayNum();
@@ -2653,16 +2656,25 @@ const __scBgKeepAlive = (function() {
         },
 
         async runAll() {
-            if (this.running) {
+            if (this.running && Date.now() - (this.runningSince || 0) < RUN_STALE) {
                 Utils.log("🟡", "任务正在运行中，请勿重复触发");
                 return;
             }
+            if (this.running) {
+                // 上一轮在后台沙盒里被冻结，finally 没跑到，标记残留在内存里；
+                // 不清理的话之后每一轮都会在这里被挡掉，只能靠手动「立即运行」。
+                Utils.log("🟡", "上一轮的运行标记是残留的（上下文被冻结过），清理后继续");
+                this.running = false;
+            }
+            Utils.log("▶️", `本轮进入执行流程（${Utils.hasDOM() ? "页面" : "后台"}上下文）`);
             // 跨上下文互斥：后台实例与 rewards 标签页会同时跑，并发会重复上报并互相踢 Token
             if (!Utils.acquireLock("Config.runLock", 45 * 60 * 1000)) {
                 Utils.log("⏳", "另一个上下文正在运行任务，本次跳过（避免并发重复上报）");
                 return;
             }
             this.running = true;
+            this.runningSince = Date.now();
+            Sched.state("running");
             try {
                 // 后台常驻实例会跨轮次复用，这几个「本轮重试次数」必须每轮归零，
                 // 否则累计到 3 次失败后就再也不重试（旧版 @crontab 每轮新实例，天然为 0）。
@@ -2777,6 +2789,8 @@ const __scBgKeepAlive = (function() {
             } finally {
                 Utils.releaseLock("Config.runLock");
                 this.running = false;
+                this.runningSince = 0;
+                Sched.state("done");   // 拿到锁的那一轮才走到这里，可以放心把阶段标成结束
             }
         }
     };
@@ -2825,7 +2839,13 @@ const __scBgKeepAlive = (function() {
         );
     });
 
-    GM_registerMenuCommand("🚀 立即运行", () => TaskManager.runAll());
+    GM_registerMenuCommand("🚀 立即运行", () => {
+        Utils.log("🚀", "手动触发：立即运行一轮");
+        Promise.resolve()
+            .then(() => TaskManager.runAll())
+            .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
+            .finally(() => Sched.finish(true));   // 手动跑过的这一轮也算数，顺延到下一次计划
+    });
 
     GM_registerMenuCommand("🔔 配置通知接口", async () => {
         const configNames = [
@@ -2896,7 +2916,196 @@ const __scBgKeepAlive = (function() {
         Utils.uiAlert(status);
     });
 
-    const init = () => {
+    /* ===== 常驻调度 =====
+     * 之前用 setInterval 每 60 秒检查一次，但 @background 的脚本跑在 ScriptCat 的沙盒里：
+     * MV3 浏览器空闲约 30 秒就会回收 service worker / 冻结沙盒，里面的定时器跟着一起丢失，
+     * 于是「跑完第一轮就再也没有日志」。现在五件事一起做：
+     *   1) 心跳：每 20 秒做一次 GM 存储读写，持续给扩展续命，避免空闲回收；
+     *   2) 自校正：每次都按「计划时间」重算下一次触发，不用 setInterval，不漂移也不堆积；
+     *   3) 计划持久化：下次该跑的时间写进 Config.cronNextRun，任何新上下文（沙盒重建、
+     *      页面加载、脚本重载）读到后——过期就立刻补一轮，没过期就接着等，节奏仍是 20 分钟；
+     *   4) 认领 + 看门狗：触发时先记一个「认领」，真正跑起来（或整轮结束）才推进计划；
+     *      认领后 CRON_STALL 内没跑起来，说明那个上下文被打断了，立刻补跑，不会白等一轮；
+     *   5) 普通页面也参与调度，页面一刷新就能把停摆的调度救回来；真正的执行由
+     *      TaskManager 的 Config.runLock 互斥，多个上下文同时到点也只会跑一轮。
+     */
+    const CRON_PERIOD = 20 * 60 * 1000;        // 一轮的间隔：保持原来的 20 分钟
+    const CRON_HEARTBEAT = 20 * 1000;          // 心跳粒度，同时也是自校正的最大等待步长
+    const CRON_FIRST_DELAY = 5 * 1000;         // 没有任何历史计划时，启动后多久跑第一轮
+    const CRON_HEARTBEAT_LOG = 10 * 60 * 1000; // 心跳日志的最小间隔，避免刷屏
+    const CRON_STALL = 3 * 60 * 1000;          // 触发之后迟迟没真正开始执行，超过这个时间就判定「这次触发丢了」
+    const RUN_STALE = 40 * 60 * 1000;          // 运行标记超过这个时间还没释放，判定为残留（上下文被冻结过）
+
+    const Sched = {
+        timer: null,
+        started: false,
+        startedAt: 0,
+        lastHbLog: 0,
+        task: null,
+
+        fmt(ts) {
+            if (!ts) return "未知";
+            const d = new Date(ts);
+            const p = n => String(n).padStart(2, "0");
+            return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+        },
+
+        lastRun() { return Number(GM_getValue("Config.cronLastRun", 0)) || 0; },
+
+        // 下次该跑的时间：持久化的计划 > 上次运行时间 + 周期 > 启动后几秒
+        plan(now = Date.now()) {
+            const next = Number(GM_getValue("Config.cronNextRun", 0)) || 0;
+            if (next) return next;
+            const last = this.lastRun();
+            return last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
+        },
+
+        saveNext(ts) { GM_setValue("Config.cronNextRun", ts); },
+
+        ctxName() { return Utils.hasDOM() ? "页面" : "后台"; },
+
+        /* 触发先「认领」再执行，真正跑起来之前不推进计划。
+         * 以前是触发瞬间就把 cronNextRun 推到 20 分钟后，那个上下文一旦被打断
+         * （沙盒冻结、标签页被关），这一轮就白扔了，只能手动点「立即运行」。 */
+        getClaim() {
+            const c = GM_getValue("Config.cronClaim", null);
+            return c && typeof c === "object" ? c : null;
+        },
+        claim() { GM_setValue("Config.cronClaim", { at: Date.now(), ctx: this.ctxName(), id: Utils.lockId() }); },
+        clearClaim() { GM_setValue("Config.cronClaim", null); },
+
+        /* 运行阶段也持久化：claimed → waiting → running → done。
+         * 出问题时看日志或菜单就能分清是「没触发」「触发了但没跑起来」「正在跑」还是「跑完了」。 */
+        state(phase, extra) {
+            GM_setValue("Config.runState", Object.assign({ phase, at: Date.now(), ctx: this.ctxName() }, extra || {}));
+        },
+        getState() {
+            const s = GM_getValue("Config.runState", null);
+            return s && typeof s === "object" ? s : null;
+        },
+
+        // 是否真的有一轮在跑：以持久化的 running 阶段 + 超时为准，不用内存布尔值
+        isBusy(now = Date.now()) {
+            const s = this.getState();
+            return !!(s && s.phase === "running" && now - (s.at || 0) < RUN_STALE);
+        },
+
+        // 一轮结束：认领作废 + 推进计划（推进计划只在这里做）
+        finish(ok) {
+            const now = Date.now();
+            const claim = this.getClaim();
+            // 这次触发是别的上下文认领的（自己只是被锁挡下来的那一方）：
+            // 交给它那一轮结束时统一推进，别把节奏改乱
+            if (claim && claim.id && claim.id !== Utils.lockId()) return;
+            // 下一次按「这一轮被触发的时刻」往后推，保持原来 20 分钟一轮的节奏，
+            // 不会因为每轮跑多久就把节奏越拖越长；跑超时了就 1 分钟后重来
+            const base = (claim && claim.at) || now;
+            this.clearClaim();
+            GM_setValue("Config.cronLastRun", now);
+            const next = base + CRON_PERIOD;
+            this.saveNext(next > now + 60 * 1000 ? next : now + 60 * 1000);
+            this.state(ok ? "done" : "idle");
+            if (ok) Utils.log("🕒", `本轮结束，下一轮 ${this.fmt(this.plan(now))}`);
+        },
+
+        start(task) {
+            if (this.started) return;
+            this.started = true;
+            this.startedAt = Date.now();
+            this.task = task;
+
+            // 上一次留在（可能已经消失的）上下文里的认领，启动时直接作废并补跑；
+            // 新鲜的认领说明还有个活着的上下文正在处理，别去抢
+            const claim = this.getClaim();
+            if (claim && claim.at) {
+                const age = this.startedAt - claim.at;
+                if (age > CRON_STALL) {
+                    Utils.log("♻️", `上次触发（${claim.ctx || "未知"}）已过去 ${Math.round(age / 60000)} 分钟仍没跑完，重新补跑`);
+                    this.clearClaim();
+                }
+            }
+
+            const next = this.plan(this.startedAt);
+            if (next > this.startedAt) this.saveNext(next);
+            Utils.log("🕒", `常驻调度已启动（${this.ctxName()}上下文）：每 ${CRON_PERIOD / 60000} 分钟一轮，下一轮 ${this.fmt(next)}`);
+            this.arm(true);   // 计划已经过期的话，这一次直接补跑
+        },
+
+        /* 重排下一次检查：正常情况下按「离计划还有多久」算，最长 CRON_HEARTBEAT（顺带续命）。
+         * 计划已经过期时不能给 0 延时死等，否则 tick 会原地空转把 CPU 打满：
+         * 只有刚启动、确实该立刻补跑的那一次才用 0，其余按心跳步长轮询。 */
+        arm(immediate) {
+            if (this.timer) clearTimeout(this.timer);
+            const now = Date.now();
+            const next = this.plan(now);
+            let wait;
+            if (next > now) wait = Math.min(next - now, CRON_HEARTBEAT);
+            else if (immediate) wait = 0;
+            else wait = CRON_HEARTBEAT;
+            this.timer = setTimeout(() => this.tick(), wait);
+        },
+
+        /* 已经触发、却迟迟没真正开始执行（认领它的页面被关、沙盒被冻结、延时器丢了）：
+         * 把这次认领作废并立刻补跑，不让一轮 20 分钟白白浪费。 */
+        watchdog(now) {
+            const claim = this.getClaim();
+            if (!claim || !claim.at) return;
+            if (this.isBusy(now)) return;              // 真的在跑，别打扰
+            if (now - claim.at <= CRON_STALL) return;  // 还在容忍期内，再等等
+            Utils.log("♻️", `上次触发（${claim.ctx || "未知"}）${Math.round((now - claim.at) / 60000)} 分钟内没有真正开始执行，现在补跑`);
+            this.clearClaim();
+            this.fire(now);
+        },
+
+        tick() {
+            this.timer = null;
+            try {
+                const now = Date.now();
+                // 这一行 GM 读本身就是一次扩展调用，能重置 MV3 的空闲计时，沙盒就不会被回收
+                const next = this.plan(now);
+                this.watchdog(now);
+                if (now >= next && !this.getClaim()) {
+                    this.fire(now);
+                } else if (now - this.lastHbLog >= CRON_HEARTBEAT_LOG) {
+                    // 每 10 分钟留一条心跳日志，方便确认「还在持续检测」
+                    this.lastHbLog = now;
+                    GM_setValue("Config.heartbeatAt", now);
+                    const tip = this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
+                    Utils.log("💓", `常驻调度心跳：本次已运行 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
+                }
+            } catch (e) {
+                Utils.log("🔴", `常驻调度异常：${e && e.message ? e.message : e}`);
+            }
+            this.arm(false);
+        },
+
+        fire(now) {
+            if (this.isBusy(now)) {
+                // 真有一轮在跑：先排到 5 分钟后复查（别每 20 秒刷一条跳过日志），
+                // 等那一轮结束时 finish() 会把计划覆盖成正常节奏
+                this.saveNext(now + 5 * 60 * 1000);
+                Utils.log("🟡", "上一轮任务还在执行中，本次触发跳过");
+                return;
+            }
+            this.claim();
+            this.state("claimed");
+            Utils.log("⏰", `常驻调度：开始本轮任务（${this.ctxName()}上下文）`);
+            try {
+                this.task();
+            } catch (e) {
+                Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
+                this.clearClaim();
+                this.saveNext(now + CRON_PERIOD);   // 别在失败里空转，等下一轮
+            }
+        }
+    };
+
+    // 上下文启动动作（读偏好、处理待粘贴的授权码），只做一次；与「跑任务」解耦，
+    // 页面加载不再无条件跑一轮，什么时候跑交给下面的常驻调度决定。
+    let bootstrapped = false;
+    const bootstrap = () => {
+        if (bootstrapped) return;
+        bootstrapped = true;
         TaskManager.init();
 
         // 后台点「📋 粘贴授权码」时会置 Config.pendingPaste 并打开页面，
@@ -2918,6 +3127,10 @@ const __scBgKeepAlive = (function() {
                 setTimeout(() => consumePendingPaste(), 300);
             }, { once: false });
         }
+    };
+
+    const init = () => {
+        bootstrap();
 
         const isKeep = GM_getValue("Config.keep", true);
         const checkDone = (enabled, date) => !enabled || date === RewardsAuto.state.dateNowNum;
@@ -2932,11 +3145,21 @@ const __scBgKeepAlive = (function() {
                           dailySetDone;
         if (!isKeep && isAllDone) {
             Utils.log("💤", "今日任务已全部完成");
+            Sched.finish(false);   // 这一轮什么都没做也要推进计划，否则会每 20 秒重试一次
             return;
         }
-        const delay = Utils.randomRange(5000, 95000);
-        Utils.log("⏳", `${delay/1000}秒后启动...`);
-        setTimeout(() => TaskManager.runAll(), delay);
+        // 延时只用来错开多个上下文、别和人工操作撞车：越短越不容易被冻结/关页打断
+        const delay = Utils.randomRange(3000, 12000);
+        Utils.log("⏳", `${(delay / 1000).toFixed(1)} 秒后启动...`);
+        Sched.state("waiting", { runAt: Date.now() + delay });
+        setTimeout(() => {
+            // runAll 内部抛错会变成 unhandled rejection 直接逃出定时器回调，
+            // 之后就整轮没日志了，这里兜一下；结束时（成功/跳过/异常）统一推进到下一轮
+            Promise.resolve()
+                .then(() => TaskManager.runAll())
+                .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
+                .finally(() => Sched.finish(true));
+        }, delay);
     };
 
     // 已移除删除 _EDGE_S Cookie 的逻辑：那是 Edge 专属积分标识，且缺少 GM_cookie 时会抛错中断初始化
@@ -2951,37 +3174,45 @@ const __scBgKeepAlive = (function() {
         return;
     }
 
-    // ===== 后台常驻调度 =====
-    // @background 在浏览器启动时就执行脚本，菜单立即注册（@crontab 时菜单要等脚本真跑过一次才出现，
-    // 且该缓存是会话级的，重启浏览器就丢）。下面复刻原来 20 分钟一轮的节奏；有 DOM 的页面不启用调度器。
-    const CRON_PERIOD = 20 * 60 * 1000;
-    const CRON_CHECK_INTERVAL = 60 * 1000;
-
-    const runScheduled = () => {
-        try {
-            const now = Date.now();
-            const last = Number(GM_getValue("Config.cronLastRun", 0)) || 0;
-            // 留 1 分钟余量配合每分钟一次的检查，实际节奏约 19~20 分钟
-            if (last > 0 && now - last < CRON_PERIOD - CRON_CHECK_INTERVAL) return;
-            GM_setValue("Config.cronLastRun", now); // 先占位：多实例/快速重启时不会重复触发
-            Utils.log("⏰", "后台常驻调度：开始本轮任务");
-            init();
-        } catch (e) {
-            Utils.log("🔴", `后台常驻调度异常：${e.message}`);
-        }
-    };
-
-    if (!Utils.hasDOM()) {
-        setTimeout(runScheduled, 3000);
-        setInterval(runScheduled, CRON_CHECK_INTERVAL);
-        // 判定后台脚本是否还在跑，否则调度器还在转、管理页却显示「停止」。
-        return new Promise(() => {});
+    // Bing 搜索页是脚本自己打开的：既不初始化，也不参与调度，免得开出一堆标签页
+    if (isBingSearchPage) {
+        GM_log("⏭️ 当前为 Bing 搜索页，跳过脚本初始化（防止重复执行/打开多余页面）");
+        return;
     }
 
-    if (!isBingSearchPage) {
-        init();
-    } else {
-        GM_log("⏭️ 当前为 Bing 搜索页，跳过脚本初始化（防止重复执行/打开多余页面）");
+    // 先做一次启动动作（读偏好、处理待粘贴授权码，幂等），再交给常驻调度决定何时跑任务
+    bootstrap();
+    Sched.start(init);
+
+    GM_registerMenuCommand("🕒 查看调度状态", () => {
+        const now = Date.now();
+        const next = Sched.plan(now);
+        const last = Sched.lastRun();
+        const st = Sched.getState();
+        const claim = Sched.getClaim();
+        const phaseText = { claimed: "已触发，等待执行", waiting: "等待延时结束", running: "正在执行", done: "上一轮已完成", idle: "空闲" };
+        let text = "🕒 常驻调度状态\n\n";
+        text += `调度间隔：${CRON_PERIOD / 60000} 分钟\n`;
+        text += `最近结束：${Sched.fmt(last)}\n`;
+        text += `下次触发：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
+        text += `运行阶段：${st ? (phaseText[st.phase] || st.phase) : "未知"}${st && st.ctx ? `（${st.ctx}，${Sched.fmt(st.at)}）` : ""}\n`;
+        if (claim) text += `当前认领：${claim.ctx || "未知"}，${Sched.fmt(claim.at)}\n`;
+        text += `本次上下文：${Sched.ctxName()}（已运行 ${Math.round((now - Sched.startedAt) / 60000)} 分钟）\n\n`;
+        text += "「运行阶段」一直停在「已触发」或「等待延时结束」，说明触发它的上下文被打断了，\n调度会自动补跑；也可以打开任意 rewards.bing.com 页面立刻救一轮。";
+        Utils.uiAlert(text);
+    });
+
+    GM_registerMenuCommand("🧹 重置调度计划", () => {
+        Sched.clearClaim();
+        GM_setValue("Config.runState", null);
+        GM_setValue("Config.cronNextRun", null);
+        Utils.log("🧹", "调度计划已重置，下一轮将立刻开始");
+        Sched.arm(true);
+    });
+
+    if (!Utils.hasDOM()) {
+        // 判定后台脚本是否还在跑，否则调度器还在转、管理页却显示「停止」。
+        return new Promise(() => {});
     }
 })();
 
