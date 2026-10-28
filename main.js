@@ -226,7 +226,10 @@ const __scBgKeepAlive = (function() {
             "install the", "set bing as your default", "bing wallpaper",
             "punch card", "ancient coin", "sea of thieves", "rewards extension",
             "redemption goal", "order history", "claim your gift", "shop to earn",
-            "set goal", "Available tomorrow", "Offer is Locked", "Earn -1 points",
+            "set goal",
+            // 锁态文案（"Available tomorrow" / "Offer is Locked" / "Earn -1 points"）不再用字符串粗筛：
+            // 已解锁的 WW_Rewards_locked_level2_* 每日优惠卡也会带这类文案，粗筛会把它们一起误杀。
+            // 是否锁卡改由 CardLock 依据 isLocked / isUnlocked / unlockCriteria 判断（见下方 CardLock）。
             // 拼图 / quiz 不跳过
         ],
         skipHrefs: [
@@ -250,6 +253,82 @@ const __scBgKeepAlive = (function() {
             ip: "",
             ipInfo: "",
             startTime: 0,
+            // 本轮扫描到的真锁卡数量/分数（需在必应 App 完成），只用于汇总日志
+            lockedCount: 0,
+            lockedPoints: 0,
+        }
+    };
+
+    /* ===== 卡片锁态语义（从「微软积分商城签到（改进加强版）.user.js」迁移） =====
+     * 网页端下发的活动卡片带 isLocked / isUnlocked / unlockCriteria 三个字段，
+     * 只有它们确实表示「锁住」时才是真锁卡；只按 "Offer is Locked" / "Available tomorrow"
+     * 这类文案做字符串过滤，会把「已解锁、可以在网页完成」的卡一并误杀（原有漏卡原因之一）。
+     * 判定与 user.js 完全一致：
+     *   - isLocked === false 且 isUnlocked === true  → 已解锁，正常执行；
+     *   - isLocked === true / isUnlocked === false / unlockCriteria 有值（且非 $undefined）→ 真锁卡，跳过；
+     *   - offerId 含 Moreactivities_RewardsApp 或 unlockCriteria === "rewardsApp" → App 专属卡：
+     *     仍然可以尝试（本脚本的 DAPI 通道就是 App 通道），只是日志里单独标注，不计入锁卡。
+     * 没有锁态字段的来源（DOM 兜底）才退回文案判断，保证旧页面也不漏判。
+     */
+    const CardLock = {
+        fields(item) {
+            if (!item || typeof item !== "object") return {};
+            const pick = (...keys) => {
+                for (const k of keys) {
+                    if (item[k] !== undefined && item[k] !== null) return item[k];
+                }
+                return undefined;
+            };
+            const rawUnlock = pick("unlockCriteria", "unlockcriteria");
+            return {
+                isLocked: pick("isLocked", "islocked"),
+                isUnlocked: pick("isUnlocked", "isunlocked"),
+                unlockCriteria: rawUnlock === "$undefined" ? undefined : rawUnlock,
+                state: String(pick("state", "State") || ""),
+                offerId: String(pick("offerId", "offerid", "name") || ""),
+                title: String(pick("title", "name", "description") || "")
+            };
+        },
+
+        hasExplicitState(item) {
+            const f = this.fields(item);
+            return f.isLocked !== undefined || f.isUnlocked !== undefined || f.unlockCriteria !== undefined;
+        },
+
+        // 只给「没有任何锁态字段」的来源兜底：这类文案出现时基本就是锁住/未开放
+        textLocked(text) {
+            return /offer is locked|available tomorrow|earn -1 points/i.test(String(text || ""));
+        },
+
+        // → { locked, appExclusive, reason }；completed 由调用方按自己的字段判断
+        probe(item) {
+            const f = this.fields(item);
+            const appExclusive = /Moreactivities_RewardsApp/i.test(f.offerId)
+                || String(f.unlockCriteria || "").toLowerCase() === "rewardsapp";
+            if (!this.hasExplicitState(item)) {
+                if (this.textLocked(`${f.title} ${f.offerId} ${f.state}`)) {
+                    return { locked: true, appExclusive, reason: "仅有锁态文案" };
+                }
+                return { locked: false, appExclusive, reason: "" };
+            }
+            // isLocked:false 是运行时权威信号（网页上锁图标已经消失）；unlockCriteria 只是「解锁条件的名字」
+            // 这类元数据，卡解锁之后它仍会留在负载里 —— 不能再据此判锁，否则刚解锁的卡会被永久挡住。
+            if (f.isLocked === false) {
+                return { locked: false, appExclusive, reason: appExclusive ? "rewardsApp" : "" };
+            }
+            if (f.isLocked === true) return { locked: true, appExclusive, reason: "isLocked=true" };
+            if (f.isUnlocked === false) return { locked: true, appExclusive, reason: "isUnlocked=false" };
+            // App 专属卡（unlockCriteria=rewardsApp / Moreactivities_RewardsApp）在网页端始终显示为锁态，
+            // 但本脚本的 DAPI 通道就是 Rewards App 通道，能直接完成它 —— 所以只有 isLocked/isUnlocked
+            // 明确表示「App 里也还没解锁」时才跳过，其余情况放行交给 DAPI 领取。
+            if (appExclusive) return { locked: false, appExclusive: true, reason: "rewardsApp" };
+            if (f.unlockCriteria !== undefined && f.unlockCriteria !== "") {
+                return { locked: true, appExclusive, reason: `unlockCriteria=${f.unlockCriteria}` };
+            }
+            if (f.state && this.textLocked(f.state)) {
+                return { locked: true, appExclusive, reason: `state=${f.state}` };
+            }
+            return { locked: false, appExclusive, reason: "" };
         }
     };
 
@@ -578,6 +657,17 @@ const __scBgKeepAlive = (function() {
         getTodayStr() {
             const d = new Date();
             return `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;
+        },
+        /* Next.js Server Action 需要的 next-router-state-tree 头（从 user.js 迁移）。
+         * 缺这个头时，新版 earn/dashboard 的 action 端点会直接 500 —— 这也是「已解锁卡交卷失败」的原因之一。 */
+        routerStateTree(segment = "earn") {
+            const refreshFlag = 4096;
+            const tree = ["", {
+                children: ["(nav)", {
+                    children: [segment, { children: ["PAGE", {}, null, null, refreshFlag] }, null, null, refreshFlag]
+                }, null, null, refreshFlag]
+            }, null, null, refreshFlag + 16];
+            return encodeURIComponent(JSON.stringify(tree));
         },
         getRandomUUID() { return crypto.randomUUID().replace(/-/g, "").toUpperCase(); },
         isJSON(s) {
@@ -1916,6 +2006,10 @@ const __scBgKeepAlive = (function() {
                     type: a.type || "",
                     state: a.State || "",
                     dailySetDate: a.daily_set_date || "",
+                    // 锁态字段：真锁卡 / 已解锁卡的分流依据（与 user.js 一致）
+                    isLocked: a.isLocked ?? a.islocked,
+                    isUnlocked: a.isUnlocked ?? a.isunlocked,
+                    unlockCriteria: a.unlockCriteria ?? a.unlockcriteria,
                     hidden: String(a.hidden).toLowerCase() === "true"
                 });
             }
@@ -1937,6 +2031,7 @@ const __scBgKeepAlive = (function() {
             const map = preMap || await this.getPromotionMap(true);
             if (!map) return [];
             const cards = [];
+            let lockedCount = 0, lockedPoints = 0;
             for (const item of map.values()) {
                 const isDailySet = item.offerId.includes(RewardsAuto.appConfig.offerIds.dailySetPrefix)
                     || (item.type === "urlreward" && item.dailySetDate === todayStr);
@@ -1944,6 +2039,16 @@ const __scBgKeepAlive = (function() {
                 const scheduledToday = item.dailySetDate === todayStr || item.offerId.includes(todayNum);
                 if (!scheduledToday) continue;
                 if (item.complete) continue;
+                if (item.hidden) continue;
+                // 语义化的锁卡判定：真锁卡跳过并计数，已解锁（isLocked:false + isUnlocked:true）照常下发
+                const lock = CardLock.probe(item);
+                if (lock.locked) {
+                    // 用局部计数，最后取最大值写回 state：doDailySet 每轮都会重新发现一遍，直接累加会重复计分
+                    lockedCount++;
+                    lockedPoints += item.max || 0;
+                    Utils.log("🔒", `锁卡跳过（需在必应 App 完成）：${item.title || item.offerId} +${item.max || 0}p [${lock.reason}]`);
+                    continue;
+                }
                 cards.push({
                     title: item.title || item.offerId,
                     points: item.max || 10,
@@ -1954,6 +2059,10 @@ const __scBgKeepAlive = (function() {
                     destination: item.destination || "",
                     source: "dapi"
                 });
+            }
+            if (lockedCount > 0) {
+                RewardsAuto.state.lockedCount = Math.max(RewardsAuto.state.lockedCount, lockedCount);
+                RewardsAuto.state.lockedPoints = Math.max(RewardsAuto.state.lockedPoints, lockedPoints);
             }
             return cards;
         },
@@ -2160,6 +2269,17 @@ const __scBgKeepAlive = (function() {
             const cards = [];
             const seenCardKeys = new Set();
             let earnHtml = ""; // 提升到 try 外：桌面奖励任务解析块需要复用 earn 页 HTML
+            // 锁卡统计：单次扫描内汇总，扫描结束写进 state 供结算日志使用
+            const lockStat = { count: 0, points: 0, app: 0 };
+            const noteLock = (item, points = 0) => {
+                const lock = CardLock.probe(item);
+                if (!lock.locked) return false;
+                lockStat.count++;
+                lockStat.points += Number(points) || 0;
+                if (lock.appExclusive) lockStat.app++;
+                Utils.log("🔒", `跳过锁卡：${item.title || item.name || item.offerId || "活动卡片"} +${points}p${lock.appExclusive ? "（App 专属）" : "（需在必应 App 完成）"} [${lock.reason}]`);
+                return true;
+            };
             try {
                 const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                 if (!html) { Utils.log("🔴", "earn 页面返回空"); return cards; }
@@ -2198,6 +2318,16 @@ const __scBgKeepAlive = (function() {
                     const isCompleted = isCompletedMatch ? (isCompletedMatch[1] === "true" || isCompletedMatch[1] === "completed") : false;
                     if (isCompleted) return null;
                     const title = titleMatch ? titleMatch[1] : "";
+                    // 从原始对象里取锁态字段（老页面只下发文案时由 CardLock 走文案兜底）
+                    const isLockedMatch = obj.match(/"isLocked":(true|false)/i);
+                    const isUnlockedMatch = obj.match(/"isUnlocked":(true|false)/i);
+                    const unlockCriteriaMatch = obj.match(/"unlockCriteria":"([^"]*)"/i);
+                    if (noteLock({
+                        offerId, title,
+                        isLocked: isLockedMatch ? isLockedMatch[1] === "true" : undefined,
+                        isUnlocked: isUnlockedMatch ? isUnlockedMatch[1] === "true" : undefined,
+                        unlockCriteria: unlockCriteriaMatch ? unlockCriteriaMatch[1] : undefined
+                    }, points)) return null;
                     const skip = RewardsAuto.skipPatterns.some(p => title.toLowerCase().includes(p.toLowerCase()) || offerId.toLowerCase().includes(p.toLowerCase()));
                     if (skip) return null;
                     return { title, points, offerId, hash, kind: inferKind(offerId, title) };
@@ -2227,9 +2357,10 @@ const __scBgKeepAlive = (function() {
                             const doneCur = Number(item.pointProgress || 0);
                             const isCompleted = item.isCompleted || item.complete || (doneMax > 0 && doneCur >= doneMax);
                             if (!offerId || !hash || points <= 0 || isCompleted) return null;
+                            if (noteLock(item, points)) return null;
                             const skip = RewardsAuto.skipPatterns.some(p => title.toLowerCase().includes(p.toLowerCase()) || offerId.toLowerCase().includes(p.toLowerCase()));
                             if (skip) return null;
-                            return { title, points, offerId, hash, kind: kind || inferKind(offerId, title), source: "getuserinfo", url: item.destinationUrl || "https://rewards.bing.com/" };
+                            return { title, points, offerId, hash, kind: kind || inferKind(offerId, title), source: "getuserinfo", url: "https://rewards.bing.com/dashboard", destination: item.destinationUrl || "" };
                         };
 
                         const dailySetPromotions = dashboard.dailySetPromotions || {};
@@ -2267,7 +2398,10 @@ const __scBgKeepAlive = (function() {
                             const jsonStr = om[0].replace(/:\$undefined/g, ":null").replace(/:\$D[^\",}]+/g, ":null");
                             const item = JSON.parse(jsonStr);
                             if (!item.offerId || !item.hash) continue;
-                            if (item.isCompleted === true || item.isLocked === true) continue;
+                            if (item.isCompleted === true || item.hidden === true) continue;
+                            // isLocked 不再一刀切：先按 isLocked/isUnlocked/unlockCriteria 语义判定，
+                            // 已解锁卡（isLocked:false + isUnlocked:true）不会再被误判成锁卡
+                            if (noteLock(item, Number(item.points || 0))) continue;
                             const points = Number(item.points || 0);
                             if (points <= 0 && !item.offerId.includes("DailySet")) continue;
                             pushCard({
@@ -2332,7 +2466,8 @@ const __scBgKeepAlive = (function() {
                             while ((qo = qOfferRegex.exec(qText)) !== null) {
                                 try {
                                     const qItem = JSON.parse(qo[0].replace(/:\$undefined/g, ":null").replace(/:\$D[^\",}]+/g, ":null"));
-                                    if (qItem.offerId && qItem.hash && qItem.isLocked === false && qItem.isCompleted === false) {
+                                    const qLock = CardLock.probe(qItem);
+                                    if (qItem.offerId && qItem.hash && !qLock.locked && qItem.isCompleted !== true) {
                                         Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
                                         pushCard({
                                             title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
@@ -2351,6 +2486,12 @@ const __scBgKeepAlive = (function() {
                 } catch (eQuest) {
                     Utils.log("🟡", `桌面应用专属任务解析跳过: ${eQuest.message}`);
                 }
+
+            if (lockStat.count > 0) {
+                RewardsAuto.state.lockedCount = Math.max(RewardsAuto.state.lockedCount, lockStat.count);
+                RewardsAuto.state.lockedPoints = Math.max(RewardsAuto.state.lockedPoints, lockStat.points);
+                Utils.log("🔒", `锁卡汇总：${lockStat.count} 张（${lockStat.points} 分）已跳过${lockStat.app ? `，其中 App 专属 ${lockStat.app} 张` : ""}；这批卡需在必应 App 里满足解锁条件后才能完成`);
+            }
 
             return cards;
         },
@@ -2447,6 +2588,12 @@ const __scBgKeepAlive = (function() {
 
             if (skipWeb) return false;
 
+            // DAPI 发现出来的日常卡没有 hash（网页通道拿不到交卷标识），跳过网页通道，只靠 DAPI 复核
+            if (!card.hash) {
+                diag.push("web(无hash)");
+                return false;
+            }
+
             // 网页通道（Server Action / api/reportactivity / 目的地访问）
             let webAccepted = false;
             try {
@@ -2469,22 +2616,36 @@ const __scBgKeepAlive = (function() {
 
         // 网页通道（Edge 与 Chrome/Firefox 差异所在）：返回 true 仅表示请求被接受，真实加分由 claimCard() 用 DAPI 复核
         async claimCardWeb(card) {
-            const url = card.url || "https://rewards.bing.com/earn";
-            const referer = card.url || "https://rewards.bing.com/earn";
+            // Server Action 的 POST 目标必须是带 action 路由的页面：日常/连签卡在 dashboard，其余在 earn。
+            // 旧版直接用 card.url 当目标，而 getuserinfo 卡的 url 可能是 destinationUrl（指向 bing.com 搜索页），
+            // 往搜索页 POST action 一定 404/405 —— 这是「已解锁卡交卷失败」的另一半原因。
+            const isDash = card.kind === "daily" || card.kind === "streak" || card.source === "getuserinfo";
+            const pageUrl = card.kind === "desktop_app"
+                ? (card.url || "https://rewards.bing.com/earn")
+                : (isDash ? "https://rewards.bing.com/dashboard" : "https://rewards.bing.com/earn");
+            const referer = card.url || pageUrl;
+            const segment = isDash ? "dashboard" : "earn";
             let nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+
+            const buildHeaders = () => ({
+                "content-type": "text/plain;charset=UTF-8",
+                "next-action": nextAction,
+                "referer": referer,
+                // 显式覆盖 Origin：扩展/后台上下文发出的请求会自动带 Origin: chrome-extension://<id>，
+                // 风控账号的 server action 对非站点同源 Origin 直接抛 500（user.js 对照实验证实）。
+                // next-router-state-tree 同样不能缺，否则新版 action 端点会 500。
+                "origin": "https://rewards.bing.com",
+                "next-router-state-tree": Utils.routerStateTree(segment),
+                "user-agent": RewardsAuto.ua.pc,
+                "accept": "text/x-component",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                ...(card.kind === "desktop_app" ? RewardsAuto.desktopAppHeaders : {})
+            });
+            const payload = JSON.stringify([card.hash, 11, { offerid: card.offerId, isPromotional: "$undefined", timezoneOffset: "-480" }]);
 
             // 策略 1: Next.js Server Action (最稳妥、官方核心)
             try {
-                const res = await Utils.xhr({
-                    method: "POST", url,
-                    headers: {
-                        "content-type": "text/plain;charset=UTF-8",
-                        "next-action": nextAction,
-                        "referer": referer,
-                        ...(card.kind === "desktop_app" ? RewardsAuto.desktopAppHeaders : {})
-                    },
-                    data: JSON.stringify([card.hash, 11, { offerid: card.offerId, isPromotional: "$undefined", timezoneOffset: "-480" }])
-                });
+                const res = await Utils.xhr({ method: "POST", url: pageUrl, headers: buildHeaders(), data: payload });
                 if (res && (res.includes("true") || res.includes('"i":false') || res.includes('"a":'))) {
                     return true;
                 }
@@ -2494,11 +2655,7 @@ const __scBgKeepAlive = (function() {
                     try {
                         const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                         nextAction = await this.getNextActionHash(earnHtml);
-                        const retryRes = await Utils.xhr({
-                            method: "POST", url,
-                            headers: { "content-type": "text/plain;charset=UTF-8", "next-action": nextAction, referer },
-                            data: JSON.stringify([card.hash, 11, { offerid: card.offerId, isPromotional: "$undefined", timezoneOffset: "-480" }])
-                        });
+                        const retryRes = await Utils.xhr({ method: "POST", url: pageUrl, headers: buildHeaders(), data: payload });
                         if (retryRes) return true;
                     } catch (_) {}
                 }
@@ -3510,6 +3667,26 @@ const __scBgKeepAlive = (function() {
                     }
                 }
 
+                // DAPI 发现的日常卡没有 hash，走不了网页 Server Action；用网页侧解析补一次 hash，
+                // 这样 DAPI 交卷失败（已解锁卡最常见的失败场景）时还有网页通道兜底
+                if (round === 1 && cards.length > 0 && cards.some(c => !c.hash)) {
+                    try {
+                        const webCards = (await API.discoverCards()).filter(c => c.hash && (c.kind === "daily" || c.offerId.includes("DailySet")));
+                        if (webCards.length > 0) {
+                            const byId = new Map(webCards.map(c => [c.offerId, c]));
+                            cards = cards.map(c => {
+                                const w = byId.get(c.offerId);
+                                if (!w) return c;
+                                return { ...c, hash: w.hash, url: w.url || c.url };
+                            });
+                            const enriched = cards.filter(c => c.hash).length;
+                            if (enriched > 0) Utils.log("🧩", `已为 ${enriched} 张日常卡补上网页交卷标识（hash）`);
+                        }
+                    } catch (e) {
+                        Utils.log("🟡", `网页日常卡解析跳过: ${e.message}`);
+                    }
+                }
+
                 for (const card of cards) {
                     if (doneIds.has(card.offerId)) continue;
                     await RegionGuard.guard("每日活动领取");
@@ -3690,6 +3867,8 @@ const __scBgKeepAlive = (function() {
                 this.signTimes = 0;
                 this.readTimes = 0;
                 this.promosTimes = 0;
+                RewardsAuto.state.lockedCount = 0;
+                RewardsAuto.state.lockedPoints = 0;
                 RewardsAuto.state.startTime = Utils.getTimestamp();
                 Utils.log("🚀", "启动全能自动化任务...");
                 this.init();
@@ -3796,6 +3975,9 @@ const __scBgKeepAlive = (function() {
                     logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}${searchOk ? '' : `（每轮从 ${pacer.min}s 起步${pacer.last ? `，上轮 ${pacer.last.attempts} 搜/${pacer.last.credits} 记` : ''}）`}\n`;
                     logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
                     logMsg += `每日活动\t${dailySetRes ? '✅' : '❌'} ${this.dailySetSummary || ''}\n`;
+                    if (RewardsAuto.state.lockedCount > 0) {
+                        logMsg += `锁卡\t\t🔒 ${RewardsAuto.state.lockedCount} 张（${RewardsAuto.state.lockedPoints} 分，需在必应 App 完成）\n`;
+                    }
                     logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
                     const edge = EdgeStreak.summary();
                     if (edge) logMsg += `Edge连签\t${edge.done ? '✅' : edge.skipped ? '⏭️' : '⏳'} ${edge.text}\n`;
