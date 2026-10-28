@@ -73,10 +73,6 @@ Config:
         title: 授权码链接
         type: textarea
         description: 粘贴 login.live.com 跳转后的完整URL
-    autoAuth:
-        title: 自动授权（没有可用Token时自动打开微软授权页）
-        type: checkbox
-        default: true
 Tasks:
     sign:
         title: 每日签入
@@ -868,8 +864,10 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟢", "自动获取授权码成功（静默通道）");
                 return { code: viaXhr };
             }
+            // 「自动授权」的设置项已从配置面板移除，行为保持原样（默认开启：没有可用 Token 时自动打开授权页）。
+            // 需要临时关掉时用 GM_setValue("Config.autoAuth", false)，恢复用 true 或删除该键。
             if (!GM_getValue("Config.autoAuth", true)) {
-                Utils.log("🔴", "自动获取授权码失败（已关闭「自动授权」），请点菜单「🔑 手动授权」，登录后把跳转地址粘贴到「📋 粘贴授权码」。", true);
+                Utils.log("🔴", "自动获取授权码失败（「自动授权」已被关闭），请点菜单「🔑 手动授权」，登录后把跳转地址粘贴到「📋 粘贴授权码」。", true);
                 return {};
             }
             const since = Utils.getTimestamp();
@@ -3582,7 +3580,9 @@ const __scBgKeepAlive = (function() {
         );
     });
 
-    GM_registerMenuCommand("🌐 Edge 连签状态", () => {
+    // 原「🌐 Edge 连签状态」菜单已移除：不再注册菜单按钮、不再弹窗，逻辑照旧（仍会立刻推进一次上报），
+    // 需要看这段状态文本时在控制台调用 __MPDiagnostics.edgeStreak()。
+    const diagEdgeStreak = () => {
         const enabled = GM_getValue("Tasks.edge", true);
         const st = EdgeStreak.state();
         const total = st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
@@ -3597,12 +3597,14 @@ const __scBgKeepAlive = (function() {
         text += `活动激活：${st.activated ? "已尝试" : "未尝试"}${st.extra ? `（已重来 ${st.extra}/${EDGE.MAX_EXTRA_ROUNDS} 轮）` : ""}\n`;
         text += `客户端：${RewardsAuto.ua.edge}\n\n`;
         text += "现在立刻推进一次（不足一个计费窗口会自动跳过，不刷接口）。";
-        Utils.uiAlert(text);
         EdgePacer.nextAt = 0;
         EdgePacer.maybeReport().catch(e => Utils.log("🟡", `Edge 连签手动推进失败：${e.message}`));
-    });
+        return text;
+    };
 
-    GM_registerMenuCommand("🔍 PC 搜索诊断", async () => {
+    // 原「🔍 PC 搜索诊断」菜单已移除：不再注册菜单按钮、不再弹窗，逻辑照旧（仍会立刻单独跑一次 PC 搜索），
+    // 需要看这段状态文本时在控制台调用 __MPDiagnostics.pcSearch()。
+    const diagPcSearch = async () => {
         const pacer = SEARCH_PACER.summary();
         const restricted = Number(GM_getValue("Config.restrictedTimes", 0)) || 0;
         let text = "🔍 PC 搜索诊断\n\n";
@@ -3622,8 +3624,7 @@ const __scBgKeepAlive = (function() {
         const info = await API.getRewardsInfo();
         if (info) text += `服务端配额：PC ${info.pc.progress}/${info.pc.max}\n`;
         else text += "服务端配额：读取失败\n";
-        text += "\n关掉这个提示后会立刻单独跑一次 PC 搜索（日志里能看到每次是否真的记账）。";
-        Utils.uiAlert(text);
+        text += "\n调用后会立刻单独跑一次 PC 搜索（日志里能看到每次是否真的记账）。";
         // 和常驻调度共用一把锁，避免诊断和正式那一轮同时搜
         if (!Utils.acquireLock("Config.runLock", 45 * 60 * 1000)) {
             Utils.log("🟡", "已有一轮任务在跑，搜索诊断跳过");
@@ -3633,7 +3634,8 @@ const __scBgKeepAlive = (function() {
             .then(() => TaskManager.doSearch())
             .catch(e => Utils.log("🔴", `搜索异常：${e && e.message ? e.message : e}`))
             .finally(() => Utils.releaseLock("Config.runLock"));
-    });
+        return text;
+    };
 
     GM_registerMenuCommand("🚀 立即运行", () => {
         Utils.log("🚀", "手动触发：立即运行一轮");
@@ -3998,7 +4000,9 @@ const __scBgKeepAlive = (function() {
     bootstrap();
     Sched.start(init);
 
-    GM_registerMenuCommand("🕒 查看调度状态", () => {
+    // 原「🕒 查看调度状态」菜单已移除：不再注册菜单按钮、不再弹窗，
+    // 需要看这段状态文本时在控制台调用 __MPDiagnostics.schedule()。
+    const diagSchedStatus = () => {
         const now = Date.now();
         const next = Sched.plan(now);
         const last = Sched.lastRun();
@@ -4013,16 +4017,32 @@ const __scBgKeepAlive = (function() {
         if (claim) text += `当前认领：${claim.ctx || "未知"}，${Sched.fmt(claim.at)}\n`;
         text += `本次上下文：${Sched.ctxName()}（已运行 ${Math.round((now - Sched.startedAt) / 60000)} 分钟）\n\n`;
         text += "「运行阶段」一直停在「已触发」或「等待延时结束」，说明触发它的上下文被打断了，\n调度会自动补跑；也可以打开任意 rewards.bing.com 页面立刻救一轮。";
-        Utils.uiAlert(text);
-    });
+        return text;
+    };
 
-    GM_registerMenuCommand("🧹 重置调度计划", () => {
+    // 原「🧹 重置调度计划」菜单已移除：不再注册菜单按钮，
+    // 需要重置时在控制台调用 __MPDiagnostics.resetSchedule()。
+    const diagResetSchedule = () => {
         Sched.clearClaim();
         GM_setValue("Config.runState", null);
         GM_setValue("Config.cronNextRun", null);
         Utils.log("🧹", "调度计划已重置，下一轮将立刻开始");
         Sched.arm(true);
-    });
+    };
+
+    // 原四个诊断/操作菜单（Edge 连签状态、PC 搜索诊断、查看调度状态、重置调度计划）已从右键菜单移除。
+    // 逻辑原样保留在这里，不再弹出任何提示框：需要时在控制台（脚本管理器或 rewards.bing.com 页面）
+    // 调用 __MPDiagnostics.edgeStreak() / pcSearch() / schedule() / resetSchedule()，
+    // 前三个的返回值就是原来弹窗里的那段文本。
+    try {
+        const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : globalThis;
+        host.__MPDiagnostics = {
+            edgeStreak: diagEdgeStreak,
+            pcSearch: diagPcSearch,
+            schedule: diagSchedStatus,
+            resetSchedule: diagResetSchedule
+        };
+    } catch (_) {}
 
     if (!Utils.hasDOM()) {
         // 判定后台脚本是否还在跑，否则调度器还在转、管理页却显示「停止」。
