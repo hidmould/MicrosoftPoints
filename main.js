@@ -2994,14 +2994,21 @@ const __scBgKeepAlive = (function() {
             Utils.log("🧩", "扫描活动卡片...");
             const cards = await API.discoverCards();
             if (cards.length === 0) {
+                // 今天压根没有待办卡片（常见的全领完/当天没放卡）：这就是「已完成」，必须落日期。
+                // 否则 promosDate 一直停在昨天，keep=false 时 isAllDone 永远为假，会无限空转。
                 Utils.log("✅", "未发现待处理活动卡片");
+                this.promosDate = RewardsAuto.state.dateNowNum;
+                this.save();
                 return true;
             }
             Utils.log("🧩", `发现 ${cards.length} 个卡片`);
+            // 用户关掉 Quiz 时，Quiz 卡片本轮本来就不处理，判定「是否还有未完成」时也不该算它，
+            // 否则这类卡片会让当天永远无法判定完成。
+            const shouldSkip = (card) => card.kind === "quiz" && !GM_getValue("Tasks.quiz", true);
             let ok = 0, fail = 0;
             for (const card of cards) {
                 Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
-                if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
+                if (shouldSkip(card)) continue;
                 await Utils.randomDelay(3000, 8000);
                 const result = await API.claimCard(card, { attempts: 2 });
                 result ? ok++ : fail++;
@@ -3010,7 +3017,7 @@ const __scBgKeepAlive = (function() {
             let pending = 0;
             try {
                 const map = await API.getPromotionMap(true);
-                if (map) pending = cards.filter(c => map.has(c.offerId) && !map.get(c.offerId).complete).length;
+                if (map) pending = cards.filter(c => !shouldSkip(c) && map.has(c.offerId) && !map.get(c.offerId).complete).length;
             } catch (_) {}
             if (pending === 0) {
                 this.promosDate = RewardsAuto.state.dateNowNum;
@@ -3279,6 +3286,11 @@ const __scBgKeepAlive = (function() {
                 }
             }
 
+            // 服务端确认今天没有剩余卡片时落一个「今日已完成」标记：
+            // 卡片可能早就被别的设备领完了，此时 processed 是空的，只认 processed 会让 keep=false 永远停不下来。
+            if (remain === 0) GM_setValue("Config.dailySetDoneDate", today);
+            else if (remain > 0) GM_setValue("Config.dailySetDoneDate", 0);
+
             if (totalOk > 0 || totalFail > 0 || remain > 0) {
                 Utils.log(remain === 0 ? "🔵" : "🟡",
                     `每日活动完成: ${totalOk}成功/${totalFail}失败${remain > 0 ? `，仍剩 ${remain} 张未完成` : ""}（服务端已确认）`,
@@ -3294,6 +3306,9 @@ const __scBgKeepAlive = (function() {
             return remain === 0;
         },
 
+        /** 只是读一下 dashboard 上「可领取」的积分并提示手动领取：
+         *  纯读操作，不写任何任务日期，也不参与 isAllDone 的完成判定 ——
+         *  这些积分无论领没领，都不影响「今日任务已全部完成、停止检测」的判断。 */
         async doClaimPoints() {
             try {
                 const dashboardHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
@@ -3527,6 +3542,9 @@ const __scBgKeepAlive = (function() {
                 } else {
                     Utils.log("🎉", `任务执行完成！用时 ${totalTime} 秒`, true);
                 }
+                // 关掉「持续检测」时：这一轮结束如果已经全部完成就当场收工，
+                // 不必等 20 分钟后下一轮再来判定（否则会白跑一轮空任务）。
+                if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
             } finally {
                 Utils.releaseLock("Config.runLock");
                 this.running = false;
@@ -3731,6 +3749,7 @@ const __scBgKeepAlive = (function() {
     const CRON_HEARTBEAT = 20 * 1000;          // 心跳粒度，同时也是自校正的最大等待步长
     const CRON_FIRST_DELAY = 5 * 1000;         // 没有任何历史计划时，启动后多久跑第一轮
     const CRON_HEARTBEAT_LOG = 10 * 60 * 1000; // 心跳日志的最小间隔，避免刷屏
+    const CRON_HEARTBEAT_LOG_IDLE = 60 * 60 * 1000; // 今日已完成、检测已停止时的心跳日志间隔（只用来续命，1 小时一条足够）
     const CRON_STALL = 3 * 60 * 1000;          // 触发之后迟迟没真正开始执行，超过这个时间就判定「这次触发丢了」
     const RUN_STALE = 40 * 60 * 1000;          // 运行标记超过这个时间还没释放，判定为残留（上下文被冻结过）
 
@@ -3874,13 +3893,19 @@ const __scBgKeepAlive = (function() {
                 this.watchdog(now);
                 // Edge 连签节拍器：借这次心跳顺带推进（内部有「计费窗口未到就不发请求」的判断）
                 EdgePacer.maybeReport().catch(() => {});
-                if (now >= next && !this.getClaim()) {
+                // 关掉持续检测（keep=false）且今日已全部完成：不再触发新一轮，
+                // 只保留心跳（心跳本身是 MV3 续命用的 GM 读，跨到明天会自动恢复跑任务）。
+                const stopped = !GM_getValue("Config.keep", true)
+                    && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
+                if (!stopped && now >= next && !this.getClaim()) {
                     this.fire(now);
-                } else if (now - this.lastHbLog >= CRON_HEARTBEAT_LOG) {
-                    // 每 10 分钟留一条心跳日志，方便确认「还在持续检测」
+                } else if (now - this.lastHbLog >= (stopped ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
+                    // 平时每 10 分钟留一条心跳日志，方便确认「还在持续检测」；已停止检测时改成 1 小时一条，只用来续命
                     this.lastHbLog = now;
                     GM_setValue("Config.heartbeatAt", now);
-                    const tip = this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
+                    const tip = stopped
+                        ? "，今日任务已全部完成、检测已停止，明天自动恢复"
+                        : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
                     Utils.log("💓", `常驻调度心跳：本次已运行 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
                 }
             } catch (e) {
@@ -3939,28 +3964,49 @@ const __scBgKeepAlive = (function() {
         }
     };
 
-    const init = () => {
-        bootstrap();
-
-        const isKeep = GM_getValue("Config.keep", true);
-        const checkDone = (enabled, date) => !enabled || date === RewardsAuto.state.dateNowNum;
-        // 每日活动也纳入「今日是否全部完成」的判断，否则 keep=false 时可能因为其它任务都完成而跳过它
-        const dailySetProcessed = GM_getValue("Config.dailySetProcessed", []);
-        const dailySetDone = Array.isArray(dailySetProcessed) && dailySetProcessed.length > 0
-            && dailySetProcessed[0]?.date === RewardsAuto.state.dateNowNum;
+    /** 「今日任务是否全部完成」的唯一判定：keep=false 时用它决定是否彻底停止检测。
+     *  - 只看各任务自己落下的完成日期，以及服务端确认过的标记；
+     *  - 「🎁 可领取积分」只是读 dashboard 的提示，不参与判定（领不领都不影响停检测）；
+     *  - 每次都重新读一遍今天的日期和任务日期：后台上下文会跨零点常驻，不刷新就会拿昨天的日期比较。
+     */
+    const isDayComplete = () => {
+        TaskManager.init();
+        const today = RewardsAuto.state.dateNowNum;
+        const checkDone = (enabled, date) => !enabled || date === today;
+        // 每日活动两个来源都算完成：(1) 今日确实领过卡片（processed 非空）；
+        // (2) DAPI 复核确认「今天没有剩余卡片」时记下的 dailySetDoneDate ——
+        //     卡片早就在别的设备领完时 processed 是空的，只认 (1) 永远停不下来。
+        const processed = GM_getValue("Config.dailySetProcessed", []);
+        const dailySetDone = (Array.isArray(processed) && processed.length > 0 && processed[0]?.date === today)
+            || (Number(GM_getValue("Config.dailySetDoneDate", 0)) || 0) === today;
         // Edge 浏览连签要靠「分次上报」累计 30 分钟，没确认完成前不能算今日已完成，
         // 否则 keep=false 时其它任务一跑完调度就停，它永远凑不满
         const edgeDone = !GM_getValue("Tasks.edge", true)
             || !GM_getValue("Config.token", false)   // 没授权时它本来也跑不了，别让调度空转
             || (() => { const st = EdgeStreak.state(); return st.complete || st.giveUp; })();
-        const isAllDone = checkDone(GM_getValue("Tasks.sign"), TaskManager.signDate) &&
-                          checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
-                          checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
-                          checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
-                          dailySetDone &&
-                          edgeDone;
-        if (!isKeep && isAllDone) {
-            Utils.log("💤", "今日任务已全部完成");
+        return checkDone(GM_getValue("Tasks.sign"), TaskManager.signDate) &&
+               checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
+               checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
+               checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
+               dailySetDone &&
+               edgeDone;
+    };
+
+    /** 落「今日已完成」标记（Sched.tick 看到它就不再触发新一轮），只打一次日志，不刷屏 */
+    const markDayComplete = () => {
+        const today = RewardsAuto.state.dateNowNum;
+        const prev = Number(GM_getValue("Config.doneDate", 0)) || 0;
+        GM_setValue("Config.doneDate", today);
+        if (prev !== today) Utils.log("💤", "今日任务已全部完成，已停止检测（明天自动恢复）", true);
+    };
+
+    const init = () => {
+        bootstrap();
+
+        const isKeep = GM_getValue("Config.keep", true);
+        if (!isKeep && isDayComplete()) {
+            // 关掉持续检测后：今日任务全部完成就彻底停止跑任务，只留调度心跳跨到明天自动恢复。
+            markDayComplete();
             Sched.finish(false);   // 这一轮什么都没做也要推进计划，否则会每 20 秒重试一次
             return;
         }
