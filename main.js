@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.8
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务（全程后台运行，不打开多余标签页）
+// @version      1.4.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务、✅Edge 浏览连签（后台累计 30 分钟，UA 自动跟随浏览器版本）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -90,6 +90,10 @@ Tasks:
         title: PC搜索
         type: checkbox
         default: true
+    edge:
+        title: Edge 浏览连签（后台分次上报，累计 30 分钟）
+        type: checkbox
+        default: true
 Notice:
     bro:
         title: 浏览器通知（当前脚本）
@@ -130,11 +134,10 @@ const __scBgKeepAlive = (function() {
         && location.pathname === "/oauth20_desktop.srf";
 
     const RewardsAuto = {
-        ua: {
-            pc: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
-            mobile: "Mozilla/5.0 (Linux; Android 16; Redmi K20 Pro Build/BP4A.251205.006; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Mobile Safari/537.36 EdgA/131.0.0.0",
-            app: "Mozilla/5.0 (Linux; Android 16; Redmi K20 Pro Build/BP4A.251205.006; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Mobile Safari/537.36 BingSapphire/32.6.2110003560",
-        },
+        // UA 不再写死版本：旧版固定 "Chrome/131 ... Edg/131.0.0.0"，用户把 Edge 升到 15x
+        // 之后，脚本发出的请求特征反而变成「一年前的浏览器」，Edge 通道的请求也和真机对不上。
+        // 现在每次访问都按当前浏览器动态生成，见下面的 UA 模块。
+        get ua() { return UA.all(); },
         desktopAppHeaders: {
             "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) MSRewards/Desktop/1.4.56",
             "X-MSRewards-App": "1",
@@ -248,6 +251,84 @@ const __scBgKeepAlive = (function() {
             ipInfo: "",
             startTime: 0,
         }
+    };
+
+    /* ===== UA 自适应（适配新版 Edge） =====
+     * 旧版把 "Chrome/131 ... Edg/131.0.0.0" 写死在代码里，浏览器升级后脚本仍在冒充
+     * 一年前的 Edge —— 既是明显的「非真实客户端」特征，也让 Edge 通道的请求和真机对不上。
+     * 取值顺序：
+     *   1) 当前上下文的 navigator.userAgent 本来就有 Edg/：直接用它（版本永远跟浏览器同步，
+     *      以后 Edge 再升级也不用改脚本）；
+     *   2) 页面上下文拿到过的真实 Edge UA 存在 Config.uaEdge 里，给 UA 被裁剪成纯 Chrome 的
+     *      后台 service worker 复用；
+     *   3) 只有 Chrome：按 Chrome 的完整版本号合成同期 Edge UA（Edge 大版本与 Chromium 同步）；
+     *   4) 什么都没有（纯沙箱）：回退到内置的近期版本。
+     */
+    const UA = {
+        /* 内置兜底版本：只有拿不到 navigator 的环境才会用到（2026-10 的 Edge 稳定版是
+         * 156.0.4314.50）。它不影响正常浏览器里的请求，那里一律用真实 UA。 */
+        FALLBACK_CHROME: "156.0.0.0",
+        FALLBACK_EDGE: "156.0.4314.50",
+        DESKTOP: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
+        ANDROID: "Mozilla/5.0 (Linux; Android 16; Redmi K20 Pro Build/BP4A.251205.006; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Mobile Safari/537.36",
+        _cache: null,
+        _cacheAt: 0,
+
+        // navigator 在 service worker 里也存在；万一取不到就当空串
+        navigatorUA() {
+            try {
+                return (typeof navigator !== "undefined" && navigator && navigator.userAgent)
+                    ? String(navigator.userAgent) : "";
+            } catch (_) {
+                return "";
+            }
+        },
+
+        // 只有真的看到 Edg/ 才回写，避免把沙盒里被裁剪的 UA 覆盖掉页面上拿到的真值
+        remember(ua) {
+            if (!/Edg\/\d/.test(ua)) return;
+            try {
+                if (GM_getValue("Config.uaEdge", "") !== ua) GM_setValue("Config.uaEdge", ua);
+            } catch (_) { /* GM 存储不可用时忽略 */ }
+        },
+
+        all() {
+            const now = Date.now();
+            if (this._cache && now - this._cacheAt < 60000) return this._cache;
+            const real = this.navigatorUA();
+            this.remember(real);
+            const saved = String(GM_getValue("Config.uaEdge", "") || "");
+            const edgeUA = [real, saved].find(s => /Edg\/\d/.test(s))
+                || (() => {
+                    // 纯 Chrome/其它浏览器：用它的完整版本号（如 157.0.5123.9）合成同期 Edge UA
+                    //（Edge 主版本跟随 Chromium，这样版本串看起来就是「这个月装的」，不会被判成过期客户端）
+                    const ver = [real, saved]
+                        .map(s => (String(s).match(/Chrome\/([\d.]+)/) || [])[1])
+                        .find(Boolean);
+                    if (ver) return `${this.DESKTOP} Chrome/${ver} Safari/537.36 Edg/${ver}`;
+                    return `${this.DESKTOP} Chrome/${this.FALLBACK_CHROME} Safari/537.36 Edg/${this.FALLBACK_EDGE}`;
+                })();
+            this._cache = {
+                // PC 通道：真 Edge 用真 UA（与 TLS 指纹一致）；其它浏览器沿用内置 Edge UA，
+                // 与旧版行为保持一致，只是把版本从 131 提到了当前稳定版
+                pc: /Edg\//.test(real) ? real : edgeUA,
+                // Edge 专属通道（EdgeDesktop/EdgeHub）必须自称 Edge
+                edge: edgeUA,
+                mobile: `${this.ANDROID} EdgA/144.0.0.0`,
+                app: `${this.ANDROID} BingSapphire/32.6.2110003560`,
+            };
+            this._cacheAt = now;
+            return this._cache;
+        }
+    };
+
+    /* ===== Edge 浏览连签常量 ===== */
+    const EDGE = {
+        PROMO_NAME: "edge_browsing_streak_flight",   // 老版本的活动名（仍可用）
+        PROMO_PREFIX: /^edge_browsing_streak/i,      // 新版可能改名/加后缀，按前缀兜底匹配
+        ACTIVATION_OFFER: "edge_flight_1_ww_treatment_eligible",
+        TARGET_MINUTES: 30,                          // 累计满 30 分钟才记账
+        MAX_EXTRA_ROUNDS: 3,                         // 次数报够但服务端没确认时，整体重来的轮数上限
     };
 
     const Webhooks = [
@@ -1370,6 +1451,135 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
+        /* ===== Edge 通道（浏览连签 / Edge browsing streak） =====
+         * 微软给 Edge 用户的每日任务：在 Edge 里累计浏览满 30 分钟即记账，满 30 分钟后
+         * promotion.attributes.complete 翻成 true。这一项只存在于 Edge 通道下
+         * （channel=edge、appid=EdgeDesktop、partnerid=EdgeHub），SAAndroid/App 通道
+         * 看不到它，所以必须单独一套请求头，不能复用 appActivity。
+         * 计时由服务端按「每次上报覆盖 report_per_minutes 分钟」累加：分次上报才有效，
+         * 两次间隔小于 report_per_minutes 会被判重（response.isDuplicate=true，不计次）。
+         */
+        edgeRegion() {
+            if (GM_getValue("Config.lock", true)) return "cn";
+            const region = String(RewardsAuto.state.region || "us").toLowerCase();
+            return region || "us";
+        },
+
+        _edgeHeaders(region, token) {
+            const country = region || this.edgeRegion();
+            return {
+                "accept": "*/*",
+                "content-type": "application/json; charset=UTF-8",
+                "user-agent": RewardsAuto.ua.edge,
+                "authorization": `Bearer ${token}`,
+                "x-rewards-appid": "EdgeDesktop",
+                "x-rewards-partnerid": "EdgeHub",
+                "x-rewards-country": country,
+                "x-rewards-language": country === "cn" ? "zh-CN" : "en-US",
+            };
+        },
+
+        // Profile,Promotions：一次拿到账号档案 + 全部 promotion（含 Edge 连签那一项）
+        async getEdgeProfile(region) {
+            try {
+                const res = await this.withTokenRetry(token => Utils.xhr({
+                    url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=edge&options=Profile,Promotions",
+                    headers: this._edgeHeaders(region, token)
+                }));
+                if (!res || !Utils.isJSON(res)) {
+                    Utils.log("🟡", `Edge 通道返回非 JSON：${String(res).substring(0, 80)}`);
+                    return null;
+                }
+                const data = JSON.parse(res);
+                if (data.code !== 0 || !data.response) {
+                    Utils.log("🟡", `Edge 通道查询失败：code=${data.code}`);
+                    return null;
+                }
+                return data.response;
+            } catch (e) {
+                Utils.log("🟡", `Edge 通道查询异常: ${e.message}`);
+                return null;
+            }
+        },
+
+        // 上报一次浏览活动：服务端按 report_offer_type 记账，amount 固定 1
+        async reportEdgeActivity({ offerid, type, region }) {
+            try {
+                const res = await this.withTokenRetry(token => Utils.xhr({
+                    method: "POST",
+                    url: "https://prod.rewardsplatform.microsoft.com/dapi/me/activities",
+                    headers: this._edgeHeaders(region, token),
+                    data: JSON.stringify({
+                        amount: 1,
+                        attributes: { offerid },
+                        request_user_info: true,
+                        type
+                    })
+                }));
+                return (res && Utils.isJSON(res)) ? JSON.parse(res) : { code: -1, response: null };
+            } catch (e) {
+                Utils.log("🟡", `Edge 连签上报异常: ${e.message}`);
+                return { code: -1, response: null };
+            }
+        },
+
+        // 激活 Edge 连签活动：新账号/新周期要先在 earn 页「开启」一次，否则 promotion 不会出现
+        async activateEdgeBrowsing() {
+            const earnUrl = "https://rewards.bing.com/earn";
+            try {
+                let html = "";
+                try {
+                    html = await Utils.xhr({
+                        url: `${earnUrl}?section=streaks`,
+                        headers: { "user-agent": RewardsAuto.ua.pc, "referer": earnUrl }
+                    });
+                } catch (_) { /* 换 earn 首页再试 */ }
+                if (!html || !String(html).includes("edge_flight")) {
+                    try {
+                        html = await Utils.xhr({
+                            url: earnUrl,
+                            headers: { "user-agent": RewardsAuto.ua.pc, "referer": earnUrl }
+                        });
+                    } catch (_) { /* 下面统一判空 */ }
+                }
+                if (!html) return "failed";
+                const clean = String(html).replace(/\\"/g, '"');
+                // 新版 Edge 把活动 id 从 edge_flight_1_... 升到了 edge_flight_2_...，
+                // 所以按前缀取，已知的 1 号优先
+                const ids = [...clean.matchAll(/"activationOfferId":"(edge_flight[^"]*)"/g)].map(m => m[1]);
+                if (ids.length === 0) {
+                    // 页面上连 edge 的活动位都没有：账号/地区不支持，今天不用再试
+                    return /"partner":"edge"/.test(clean) ? "failed" : "absent";
+                }
+                const offerId = ids.includes(EDGE.ACTIVATION_OFFER) ? EDGE.ACTIVATION_OFFER : ids[0];
+                const idx = clean.indexOf(`"activationOfferId":"${offerId}"`);
+                const win = clean.substring(Math.max(0, idx - 600), idx + 500);
+                if (/"isEnabled":true/.test(win)) return "already";
+                const hashMatch = win.match(/"activationHash":"([^"]+)"/);
+                const typeMatch = win.match(/"activationActivityType":(\d+)/);
+                const hash = hashMatch ? hashMatch[1] : "";
+                const actType = typeMatch ? Number(typeMatch[1]) : 714;
+                if (!hash || hash === "$undefined") return "failed";
+                const nextAction = await this.getNextActionHash(html);
+                await Utils.xhr({
+                    method: "POST",
+                    url: earnUrl,
+                    headers: {
+                        "content-type": "text/plain;charset=UTF-8",
+                        "next-action": nextAction,
+                        "origin": "https://rewards.bing.com",
+                        "referer": earnUrl,
+                        "user-agent": RewardsAuto.ua.pc,
+                    },
+                    data: JSON.stringify([hash, actType, { offerid: offerId, isPromotional: "$undefined", timezoneOffset: "-480" }])
+                });
+                return "activated";
+            } catch (e) {
+                Utils.log("🟡", `Edge 连签激活失败: ${e.message}`);
+                return "failed";
+            }
+        },
+
         /* DAPI 权威任务状态：网页通道依赖 Cookie 与 UA 指纹，Edge 与 Chrome/Firefox 不一致且无法复核；
          * 这里直接读 BingSapphire App 的 DAPI 接口（Bearer Token），可精确读到每张卡的 progress/max。 */
         _promoCache: null,
@@ -2198,6 +2408,277 @@ const __scBgKeepAlive = (function() {
         }
     };
 
+    /* ===== Edge 浏览连签（状态机 + 节拍器） =====
+     * 迁移自老脚本的 taskEdgeBrowsing()，但按 main.js 的常驻调度重写过：
+     *  - 老脚本的 service worker 活不过 30 分钟，只能「每次 cron 报 1 次」，20 分钟一轮要凑 2 小时；
+     *  - main.js 的 Sched 每 20 秒做一次 GM 读写给 MV3 续命，所以这里做成节拍器：
+     *    状态全量持久化到 Config.edge，只要还有一个上下文活着，就按 report_per_minutes
+     *    的节奏接着报，30~40 分钟记满；上下文被打断也能从持久化状态续上。
+     *  - 判重靠服务端：isDuplicate=true 时不计次，但仍要记 last（否则会连发、被一路判重）。
+     *  - 完成与否以服务端 promotion.attributes.complete 为准，本地只做缓存和去重通知。
+     */
+    const EdgeStreak = {
+        _running: false,
+
+        state() {
+            const raw = GM_getValue("Config.edge", null);
+            const st = (raw && typeof raw === "object") ? raw : {};
+            const today = Utils.getTodayNum();
+            const base = {
+                date: today, count: 0, last: 0, complete: false, activated: false,
+                notified: false, extra: 0, total: 0, intervalMin: 5, offerid: "", type: "714", sync: 0,
+                giveUp: false
+            };
+            if (st.date !== today) return base;   // 跨日重置（连签是每天的任务）
+            return {
+                ...base,
+                count: Number(st.count) || 0,
+                last: Number(st.last) || 0,
+                complete: !!st.complete,
+                activated: !!st.activated,
+                notified: !!st.notified,
+                extra: Number(st.extra) || 0,
+                total: Number(st.total) || 0,
+                intervalMin: Number(st.intervalMin) || 5,
+                offerid: String(st.offerid || ""),
+                type: String(st.type || "714"),
+                sync: Number(st.sync) || 0,
+                giveUp: !!st.giveUp,
+            };
+        },
+
+        save(st) {
+            GM_setValue("Config.edge", st);
+        },
+
+        // 上报间隔（分钟）：服务端给的 report_per_minutes，异常值一律按 5 分钟
+        intervalOf(attr) {
+            const n = Number(attr && attr.report_per_minutes);
+            return (Number.isFinite(n) && n >= 1 && n <= 30) ? n : 5;
+        },
+
+        // 上报类型：服务端给的 report_offer_type，非纯数字一律按 714（浏览活动）
+        typeOf(attr) {
+            const t = String((attr && attr.report_offer_type) || "").trim();
+            return /^\d+$/.test(t) ? t : "714";
+        },
+
+        // 找 Edge 连签 promotion：老名字之外还要认新版变体，否则 Edge 一升级就永远找不到
+        findPromotion(profile) {
+            const list = (profile && Array.isArray(profile.promotions)) ? profile.promotions : [];
+            if (list.length === 0) return null;
+            const exact = list.find(p => p && p.name === EDGE.PROMO_NAME);
+            if (exact) return exact;
+            // 同名前缀的新变体（edge_browsing_streak_flight_v2 之类）：名字认得出就是它，
+            // 不要求 attributes，缺字段交给后面统一提示
+            const variant = list.find(p => p && EDGE.PROMO_PREFIX.test(String(p.name || "")));
+            if (variant) return variant;
+            // 名字完全改了：退回按 Edge 活动特征认（带 offerid + report_offer_type 的 edge 项）
+            return list.find(p => p && p.attributes
+                && /edge/i.test(String(p.name || ""))
+                && !!(p.attributes.offerid && p.attributes.report_offer_type)) || null;
+        },
+
+        notifyDone(st) {
+            if (st.notified) return;
+            st.notified = true;
+            this.save(st);
+            Utils.log("🌐", `Edge 浏览连签任务已完成！（今日 ${EDGE.TARGET_MINUTES} 分钟浏览已记账）`, true);
+        },
+
+        /* 推进一步：可能什么都不做（间隔没到 / 已完成）。
+         * 返回 { done, count, total, waitMs } 给节拍器排下一次。 */
+        async step() {
+            const st = this.state();
+            const totalOf = () => st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
+
+            // 今日已判定做不了（账号不支持 / 数据缺失 / 重来轮次用尽）：不再打扰服务端，
+            // 也不让常驻调度为了它空转一整天
+            if (st.giveUp) {
+                return { done: false, skipped: true, count: st.count, total: totalOf(), waitMs: 6 * 60 * 60 * 1000 };
+            }
+            // 已完成：每 2 小时跟服务端对一次账（防换账号继承了上一个账号的完成标记），平时不打扰
+            if (st.complete && Date.now() - st.sync < 2 * 60 * 60 * 1000) {
+                return { done: true, count: st.count || totalOf(), total: totalOf(), waitMs: 30 * 60 * 1000 };
+            }
+            // 还没到一个计费窗口：直接等，连查询都不发（别让 20 秒心跳把接口打成刷子）
+            if (!st.complete && st.count > 0 && st.last && Date.now() - st.last < st.intervalMin * 60 * 1000) {
+                return {
+                    done: false, count: st.count, total: totalOf(),
+                    waitMs: st.last + st.intervalMin * 60 * 1000 - Date.now()
+                };
+            }
+            if (!RewardsAuto.state.token) {
+                const ok = await API.renewToken();
+                if (!ok || !RewardsAuto.state.token) {
+                    Utils.log("🟡", "Edge 浏览连签：暂无可用 Token，跳过（先完成授权）");
+                    return { done: false, count: st.count, total: totalOf(), waitMs: 5 * 60 * 1000 };
+                }
+            }
+            const region = API.edgeRegion();
+            let profile = await API.getEdgeProfile(region);
+            if (!profile) return { done: false, count: st.count, total: totalOf(), waitMs: 5 * 60 * 1000 };
+            let promo = this.findPromotion(profile);
+
+            // 没找到活动项：多半是新账号/新周期还没激活，一天只尝试一次
+            if (!promo && !st.activated) {
+                st.activated = true;
+                this.save(st);
+                const res = await API.activateEdgeBrowsing();
+                if (res === "absent") {
+                    st.giveUp = true;
+                    this.save(st);
+                    Utils.log("🟡", "Edge 浏览连签：当前账号没有这个活动（地区/账号不支持），今日跳过");
+                    return { done: false, skipped: true, count: st.count, total: totalOf(), waitMs: 6 * 60 * 60 * 1000 };
+                }
+                Utils.log(res === "already" ? "🟢" : "🟡",
+                    `Edge 浏览连签：活动${res === "activated" ? "已激活" : res === "already" ? "此前已激活" : "激活失败"}（${res}）`);
+                await Utils.delay(Utils.randomRange(3000, 6000));
+                profile = await API.getEdgeProfile(region);
+                promo = profile ? this.findPromotion(profile) : null;
+            }
+            if (!promo) {
+                Utils.log("🟡", "Edge 浏览连签：暂未找到活动项，可先在 Edge 里打开 rewards.bing.com/earn?section=streaks 手动开启");
+                return { done: false, count: st.count, total: totalOf(), waitMs: 60 * 60 * 1000 };
+            }
+
+            const attr = promo.attributes || {};
+            st.intervalMin = this.intervalOf(attr);
+            st.total = Math.ceil(EDGE.TARGET_MINUTES / st.intervalMin);
+            st.offerid = String(attr.offerid || "").trim();
+            st.type = this.typeOf(attr);
+            const total = st.total;
+
+            if (String(attr.complete).toLowerCase() === "true") {
+                st.complete = true;
+                st.sync = Date.now();
+                st.count = total;
+                this.save(st);
+                this.notifyDone(st);
+                return { done: true, count: total, total, waitMs: 30 * 60 * 1000 };
+            }
+            // 本地记着完成、服务端却不认（换账号 / 服务端回滚）：清标记重新累计
+            if (st.complete) {
+                Utils.log("🟡", "Edge 浏览连签：本地标记已完成但服务端未确认，重新累计");
+                st.complete = false; st.count = 0; st.last = 0; st.extra = 0; st.notified = false;
+                this.save(st);
+            }
+            if (!st.offerid) {
+                st.giveUp = true;
+                this.save(st);
+                Utils.log("🟡", "Edge 浏览连签：活动项缺少 offerid，无法上报，今日跳过");
+                return { done: false, skipped: true, count: st.count, total, waitMs: 6 * 60 * 60 * 1000 };
+            }
+            if (st.count >= total) {
+                // 次数报够了但服务端还没确认：先给它落库时间，仍然不认就整体重来
+                if (Date.now() - st.last < 10 * 60 * 1000) {
+                    return { done: false, count: st.count, total, waitMs: 10 * 60 * 1000 };
+                }
+                if (st.extra >= EDGE.MAX_EXTRA_ROUNDS) {
+                    st.giveUp = true;
+                    this.save(st);
+                    Utils.log("🟡", `Edge 浏览连签：已上报 ${st.count}/${total} 次仍未确认完成，今日暂停（明日自动重试）`);
+                    return { done: false, skipped: true, count: st.count, total, waitMs: 6 * 60 * 60 * 1000 };
+                }
+                st.extra++;
+                st.count = 0;
+                st.last = 0;
+                this.save(st);
+                Utils.log("🟡", `Edge 浏览连签：服务端未确认完成，第 ${st.extra}/${EDGE.MAX_EXTRA_ROUNDS} 轮重新累计`);
+                return { done: false, count: 0, total, waitMs: 0 };
+            }
+
+            const res = await API.reportEdgeActivity({ offerid: st.offerid, type: st.type, region });
+            const code = (res && typeof res.code === "number") ? res.code : -1;
+            if (code !== 0) {
+                Utils.log("🟡", `Edge 浏览连签：第 ${Math.min(st.count + 1, total)}/${total} 次上报失败（code=${code}），稍后重试`);
+                return { done: false, count: st.count, total, waitMs: 5 * 60 * 1000 };
+            }
+            const dup = !!(res.response && res.response.isDuplicate === true);
+            st.last = Date.now();
+            st.sync = Date.now();
+            if (!dup) st.count = Math.min(st.count + 1, total);
+            this.save(st);
+            Utils.log(dup ? "🟡" : "🟢",
+                `Edge 浏览连签：第 ${st.count}/${total} 次上报${dup ? "（被判重，未记账）" : "已记账"}`);
+
+            // 上报后稍等再复核：累计满 30 分钟这一刻服务端才把 complete 翻成 true
+            await Utils.delay(Utils.randomRange(2000, 4000));
+            const after = await API.getEdgeProfile(region);
+            const afterPromo = after ? this.findPromotion(after) : null;
+            if (afterPromo && String((afterPromo.attributes || {}).complete).toLowerCase() === "true") {
+                st.complete = true;
+                st.sync = Date.now();
+                st.count = total;
+                this.save(st);
+                this.notifyDone(st);
+                return { done: true, count: total, total, waitMs: 30 * 60 * 1000 };
+            }
+            return {
+                done: false, count: st.count, total,
+                waitMs: dup ? Math.max(60 * 1000, st.intervalMin * 60 * 1000) : st.intervalMin * 60 * 1000
+            };
+        },
+
+        // 对外一步：加锁防多上下文重复上报（页面与后台会同时被调度/心跳唤醒）
+        async run() {
+            if (!GM_getValue("Tasks.edge", true)) return null;
+            if (!GM_getValue("Config.token", false)) return null;   // 没授权就不用试
+            if (this._running) return null;
+            if (!Utils.acquireLock("Config.edgeLock", 3 * 60 * 1000)) return null;
+            this._running = true;
+            try {
+                return await this.step();
+            } catch (e) {
+                Utils.log("🟡", `Edge 浏览连签异常: ${e.message}`);
+                return null;
+            } finally {
+                this._running = false;
+                Utils.releaseLock("Config.edgeLock");
+            }
+        },
+
+        // 汇总行数据：给 runAll 的日报用
+        summary() {
+            if (!GM_getValue("Tasks.edge", true)) return null;
+            const st = this.state();
+            const total = st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
+            const count = Math.min(st.count, total);
+            return { done: st.complete, skipped: st.giveUp && !st.complete, count, total, text: `${count}/${total}` };
+        }
+    };
+
+    /* Edge 连签节拍器：挂在常驻调度的心跳里（Sched.tick 每 ≤20 秒一次），
+     * 但只有「距上次上报满一个计费窗口」时才真的发请求，所以心跳不会把接口打爆。
+     * 这样 30 分钟的累计在 30~40 分钟内记完，而不是被 20 分钟一轮的 cron 拖成 2 小时。 */
+    const EDGE_PACE_TICK = 30 * 1000;   // 两次「是否需要上报」判断之间的最小间隔
+
+    const EdgePacer = {
+        busy: false,
+        nextAt: 0,
+
+        async maybeReport() {
+            if (this.busy) return null;
+            if (Date.now() < this.nextAt) return null;
+            this.busy = true;
+            try {
+                const r = await EdgeStreak.run();
+                if (!r) {
+                    this.nextAt = Date.now() + 5 * 60 * 1000;   // 未启用/失败：退避 5 分钟
+                } else {
+                    const wait = r.done ? 30 * 60 * 1000 : (r.waitMs || 0);
+                    this.nextAt = Date.now() + Math.max(EDGE_PACE_TICK, wait);
+                }
+                return r;
+            } catch (_) {
+                this.nextAt = Date.now() + 5 * 60 * 1000;
+                return null;
+            } finally {
+                this.busy = false;
+            }
+        }
+    };
+
     const TaskManager = {
         signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
@@ -2761,6 +3242,10 @@ const __scBgKeepAlive = (function() {
                 } else {
                     Utils.log("✅", "二次扫描：无新卡片");
                 }
+                // Edge 浏览连签：后台累计 30 分钟才记账，这里每轮至少推进一次
+                //（常驻调度的心跳里还有节拍器按 report_per_minutes 的节奏续报）
+                Utils.log("🌐", "检查 Edge 浏览连签进度...");
+                await EdgePacer.maybeReport();
                 const endTime = Utils.getTimestamp();
                 const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
                 const endBalance = await API.getBalance();
@@ -2779,6 +3264,8 @@ const __scBgKeepAlive = (function() {
                     logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
                     logMsg += `每日活动\t${dailySetRes ? '✅' : '❌'} ${this.dailySetSummary || ''}\n`;
                     logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
+                    const edge = EdgeStreak.summary();
+                    if (edge) logMsg += `Edge连签\t${edge.done ? '✅' : edge.skipped ? '⏭️' : '⏳'} ${edge.text}\n`;
                     logMsg += `今日获取\t+${earned}\n`;
                     logMsg += `总积分\t\t${info.balance || endBalance}`;
                     RewardsAuto.state.sendMSG = logMsg;
@@ -2837,6 +3324,26 @@ const __scBgKeepAlive = (function() {
             `已过: ${ageStr}\n` +
             `授权码: ${codeStr}`
         );
+    });
+
+    GM_registerMenuCommand("🌐 Edge 连签状态", () => {
+        const enabled = GM_getValue("Tasks.edge", true);
+        const st = EdgeStreak.state();
+        const total = st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
+        const waitMs = (!st.complete && st.count > 0 && st.last)
+            ? Math.max(0, st.last + st.intervalMin * 60000 - Date.now()) : 0;
+        let text = "🌐 Edge 浏览连签\n\n";
+        text += `任务开关：${enabled ? "开启" : "关闭"}\n`;
+        text += `上报进度：${Math.min(st.count, total)}/${total} 次（每次覆盖 ${st.intervalMin} 分钟，满 ${EDGE.TARGET_MINUTES} 分钟记账）\n`;
+        text += `服务端状态：${st.complete ? "✅ 已完成" : (st.giveUp ? "⏭️ 今日已跳过" : "⏳ 未完成")}\n`;
+        text += `上次上报：${st.last ? new Date(st.last).toLocaleString("zh-CN") : "无"}\n`;
+        if (waitMs > 0) text += `下次上报：约 ${Math.ceil(waitMs / 60000)} 分钟后\n`;
+        text += `活动激活：${st.activated ? "已尝试" : "未尝试"}${st.extra ? `（已重来 ${st.extra}/${EDGE.MAX_EXTRA_ROUNDS} 轮）` : ""}\n`;
+        text += `客户端：${RewardsAuto.ua.edge}\n\n`;
+        text += "现在立刻推进一次（不足一个计费窗口会自动跳过，不刷接口）。";
+        Utils.uiAlert(text);
+        EdgePacer.nextAt = 0;
+        EdgePacer.maybeReport().catch(e => Utils.log("🟡", `Edge 连签手动推进失败：${e.message}`));
     });
 
     GM_registerMenuCommand("🚀 立即运行", () => {
@@ -3064,6 +3571,8 @@ const __scBgKeepAlive = (function() {
                 // 这一行 GM 读本身就是一次扩展调用，能重置 MV3 的空闲计时，沙盒就不会被回收
                 const next = this.plan(now);
                 this.watchdog(now);
+                // Edge 连签节拍器：借这次心跳顺带推进（内部有「计费窗口未到就不发请求」的判断）
+                EdgePacer.maybeReport().catch(() => {});
                 if (now >= next && !this.getClaim()) {
                     this.fire(now);
                 } else if (now - this.lastHbLog >= CRON_HEARTBEAT_LOG) {
@@ -3138,11 +3647,17 @@ const __scBgKeepAlive = (function() {
         const dailySetProcessed = GM_getValue("Config.dailySetProcessed", []);
         const dailySetDone = Array.isArray(dailySetProcessed) && dailySetProcessed.length > 0
             && dailySetProcessed[0]?.date === RewardsAuto.state.dateNowNum;
+        // Edge 浏览连签要靠「分次上报」累计 30 分钟，没确认完成前不能算今日已完成，
+        // 否则 keep=false 时其它任务一跑完调度就停，它永远凑不满
+        const edgeDone = !GM_getValue("Tasks.edge", true)
+            || !GM_getValue("Config.token", false)   // 没授权时它本来也跑不了，别让调度空转
+            || (() => { const st = EdgeStreak.state(); return st.complete || st.giveUp; })();
         const isAllDone = checkDone(GM_getValue("Tasks.sign"), TaskManager.signDate) &&
                           checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
                           checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
                           checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
-                          dailySetDone;
+                          dailySetDone &&
+                          edgeDone;
         if (!isKeep && isAllDone) {
             Utils.log("💤", "今日任务已全部完成");
             Sched.finish(false);   // 这一轮什么都没做也要推进计划，否则会每 20 秒重试一次
