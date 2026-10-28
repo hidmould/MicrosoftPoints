@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.5
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务、✅Edge 浏览连签（后台累计 30 分钟，UA 自动跟随浏览器版本）（全程后台运行，不打开多余标签页）
+// @version      1.4.6
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务、✅Edge 浏览连签（后台累计 30 分钟，UA 自动跟随浏览器版本）、✅出口检测（VPN/代理/非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -14,6 +14,9 @@
 // @connect      hot.baiwumm.com
 // @connect      cnxiaobai.com
 // @connect      disp-qryapi.3g.qq.com
+// @connect      www.cloudflare.com
+// @connect      ipinfo.io
+// @connect      api.ip.sb
 // @connect      qyapi.weixin.qq.com
 // @connect      oapi.dingtalk.com
 // @connect      open.feishu.cn
@@ -57,13 +60,6 @@ Config:
         min: 30
         max: 180
         unit: 秒
-    searchMinutes:
-        title: 单轮搜索最长时间（分钟）
-        type: number
-        default: 20
-        min: 3
-        max: 60
-        unit: 分钟
     api:
         title: 搜索词接口（offline为随机搜索词）
         type: select
@@ -546,7 +542,8 @@ const __scBgKeepAlive = (function() {
                 GM_xmlhttpRequest({
                     anonymous: false,
                     ...options,
-                    timeout: 15000,
+                    // 允许调用方自带超时（出口探测要短超时），没传就还是 15 秒
+                    timeout: Number(options && options.timeout) || 15000,
                     onload: (res) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
                         if (res.status >= 200 && res.status < 300) {
@@ -661,6 +658,283 @@ const __scBgKeepAlive = (function() {
         releaseLock(key) {
             const holder = GM_getValue(key, null);
             if (!holder || holder.id === Utils.lockId()) GM_setValue(key, null);
+        }
+    };
+
+    /* ===== 网络出口守卫（非大陆 / 机房 / 代理，均由「锁定国区」一个开关控制） =====
+     * 旧实现只读 bing.com 首页的 Region/RevIpCC，于是「开着梯子也永远是中国」，原因有三：
+     *   1) Utils.xhr 默认 anonymous:false，会带上 cc=Cn、SRCHHPGUSR 之类的大陆 Cookie，
+     *      Bing 按 Cookie 优先回 CN，跟真实出口 IP 无关；
+     *   2) 大陆出口访问 www.bing.com 会被 302 到 cn.bing.com，那一页的 Region 恒为 CN；
+     *   3) 真正花积分的是 prod.rewardsplatform.microsoft.com / rewards.bing.com / login.live.com，
+     *      分流规则把 bing.com 走直连、把这几个微软接口走代理时，只看 bing 首页根本发现不了。
+     * 现在改成「多路独立探测 + 结论缓存 + 全流程闸门」：
+     *   - bing.com：不带 Cookie + 时间戳，Bing 只能按出口 IP 回 RevIpCC；
+     *   - Cloudflare cdn-cgi/trace、ipinfo.io、api.ip.sb：第三方视角的出口国家/ASN；
+     *   - 腾讯 disp-qryapi：国内服务看到的出口（境内「中国 …」，境外「美国 …」）。
+     * 任一路看到非 CN、出口是机房/云厂商 ASN、或走了 WARP，一律判为「不能继续」。
+     */
+    class RegionBlockedError extends Error {
+        constructor(message) {
+            super(message);
+            this.name = "RegionBlockedError";
+            this.regionBlocked = true;
+        }
+    }
+
+    const RegionGuard = {
+        _cache: null,          // 上一次结论（含 ok/reasons/signals/ip），全流程闸门复用
+        _inflight: null,       // 并发合并：搜索循环里可能同时有多处调用
+        _lastState: "",        // "ok" / "block"，只在状态翻转时打日志
+        _lastNotifyAt: 0,      // 推送节流
+        TTL_OK: 120 * 1000,    // 通过后 2 分钟内复用（中途开梯子最多 2 分钟被发现）
+        TTL_BLOCK: 45 * 1000,  // 拦截后 45 秒重新确认（关掉梯子能尽快恢复）
+        PROBE_TIMEOUT: 8000,
+        NOTIFY_GAP: 10 * 60 * 1000,
+
+        enabled() {
+            return !!GM_getValue("Config.lock", true);
+        },
+
+        // 机房 / VPS / 公共代理的 ASN 关键词：家宽运营商（电信/联通/移动/Comcast…）不会命中
+        HOSTING_RE: /cloudflare|digitalocean|vultr|linode|akamai|fastly|amazon|aws|google\s*cloud|azure|alibaba|aliyun|alicloud|tencent\s*cloud|qcloud|huawei\s*cloud|hetzner|ovh|leaseweb|contabo|hostwinds|hostinger|racknerd|colocrossing|sharktech|psychz|choopa|m247|datacamp|zenlayer|layerstack|gcore|oracle\s*cloud|\bvpn\b|\bproxy\b|tor\s*exit|ipvanish|nordvpn|expressvpn|surfshark|mullvad/i,
+
+        /* 微软侧：不带 Cookie，问 Bing「你看到的我是哪国」。
+         * 大陆出口会被 302 到 cn.bing.com，那一页没有 RevIpCC，但有只在 cn.bing.com 出现的标记
+         * （「国内版 / 国际版」切换、京ICP备号），据此也能确定「微软看到的我是 CN」。 */
+        async _probeBing() {
+            const html = await Utils.xhr({
+                url: `https://www.bing.com/?_=${Date.now()}`,
+                anonymous: true,   // 关键：不带 Cookie，否则 cc=Cn 会被 Bing 沿用
+                timeout: this.PROBE_TIMEOUT,
+                headers: { "accept-language": "zh-CN,zh;q=0.9", "cache-control": "no-cache" }
+            });
+            const text = String(html || "");
+            const flat = text.replace(/\s/g, "");
+            const ipcc = flat.match(/RevIpCC:"([A-Za-z]{2})"/);
+            const region = flat.match(/Region:"([A-Za-z]{2})"/);
+            let cc = ipcc ? ipcc[1] : (region ? region[1] : "");
+            if (!cc && this.CN_PAGE_RE.test(text)) cc = "CN";
+            if (!cc) throw new Error("首页未返回地区标记");
+            return { src: "bing", cc: cc.toUpperCase(), ip: "", org: "" };
+        },
+
+        // 只在 cn.bing.com 首页出现的特征：看到它就能断定「微软把我当大陆」。
+        // 注意：这里刻意用整个 HTML 而非去空白版，中文标记不能被 \s 吃掉。
+        CN_PAGE_RE: /cn\.bing\.com|京ICP备|beian\.miit\.gov\.cn|国内版<\/a>|国内版/,
+
+        async _probeCloudflare() {
+            const txt = await Utils.xhr({
+                url: `https://www.cloudflare.com/cdn-cgi/trace?_=${Date.now()}`,
+                anonymous: true,
+                timeout: this.PROBE_TIMEOUT
+            });
+            const kv = {};
+            String(txt || "").split("\n").forEach(line => {
+                const i = line.indexOf("=");
+                if (i > 0) kv[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+            });
+            if (!kv.loc) throw new Error("trace 格式异常");
+            return {
+                src: "cloudflare",
+                cc: String(kv.loc).toUpperCase(),
+                ip: kv.ip || "",
+                org: "",
+                warp: kv.warp === "on"
+            };
+        },
+
+        async _probeIpinfo() {
+            const txt = await Utils.xhr({
+                url: `https://ipinfo.io/json?_=${Date.now()}`,
+                anonymous: true,
+                timeout: this.PROBE_TIMEOUT
+            });
+            const d = JSON.parse(txt);
+            if (!d || !d.country) throw new Error(String((d && (d.error || d.message)) || "无 country 字段"));
+            return { src: "ipinfo", cc: String(d.country).toUpperCase(), ip: d.ip || "", org: d.org || "" };
+        },
+
+        async _probeIpSb() {
+            const txt = await Utils.xhr({
+                url: `https://api.ip.sb/geoip?_=${Date.now()}`,
+                anonymous: true,
+                timeout: this.PROBE_TIMEOUT
+            });
+            const d = JSON.parse(txt);
+            if (!d || !d.country_code) throw new Error("无 country_code 字段");
+            return {
+                src: "ip.sb",
+                cc: String(d.country_code).toUpperCase(),
+                ip: d.ip || "",
+                org: [d.isp, d.organization, d.asn_organization].filter(Boolean).join(" ")
+            };
+        },
+
+        /* 腾讯 IP 库：境内出口一定以「中国」开头，境外是「美国 加利福尼亚 …」这种 */
+        async _probeTencent() {
+            const txt = await Utils.xhr({
+                url: "https://disp-qryapi.3g.qq.com/v1/dispatch",
+                headers: { referer: "https://3g.qq.com/" },
+                timeout: this.PROBE_TIMEOUT
+            });
+            const d = JSON.parse(txt);
+            if (!d || d.code != 0) throw new Error("dispatch 返回异常");
+            return {
+                src: "tencent",
+                cc: "",
+                ip: (d.extra && d.extra.ip) || "",
+                org: "",
+                cnText: String(d.ipInfo || "").replace(/[#*]+/g, " ").trim()
+            };
+        },
+
+        async _probeAll() {
+            const jobs = [
+                ["bing", () => this._probeBing()],
+                ["cloudflare", () => this._probeCloudflare()],
+                ["ipinfo", () => this._probeIpinfo()],
+                ["ip.sb", () => this._probeIpSb()],
+                ["tencent", () => this._probeTencent()]
+            ];
+            return await Promise.all(jobs.map(async ([src, fn]) => {
+                try {
+                    return await fn();
+                } catch (e) {
+                    return { src, error: e instanceof Error ? e : new Error(String(e)), cc: "", ip: "", org: "" };
+                }
+            }));
+        },
+
+        // 同一路探测重试后可能有多条结果：成功的一票为准
+        _merge(list) {
+            const map = new Map();
+            for (const r of list) {
+                if (!r) continue;
+                const score = (r.error ? 0 : 2) + (r.cc ? 1 : 0);
+                const cur = map.get(r.src);
+                const curScore = cur ? (cur.error ? 0 : 2) + (cur.cc ? 1 : 0) : -1;
+                if (score > curScore) map.set(r.src, r);
+            }
+            return [...map.values()];
+        },
+
+        _judge(raw) {
+            const probes = this._merge(raw);
+            const ok = probes.filter(p => !p.error);
+            const coded = ok.filter(p => p.cc);
+            const foreign = coded.filter(p => p.cc !== "CN");
+            const tencent = ok.find(p => p.src === "tencent");
+            const cnText = (tencent && tencent.cnText) || "";
+            const tencentCN = /中国/.test(cnText);
+            const tencentOverseas = !!(cnText && !tencentCN && !/局域网|内网|本地|保留|未知/.test(cnText));
+            const warp = ok.find(p => p.warp);
+            const hosting = ok.find(p => p.org && this.HOSTING_RE.test(p.org));
+
+            const reasons = [];
+            if (foreign.length > 0) {
+                reasons.push(`出口非大陆：${foreign.map(p => `${p.src}=${p.cc}${p.ip ? `(${p.ip})` : ""}`).join("、")}`);
+            }
+            if (tencentOverseas) {
+                reasons.push(`国内服务看到的出口在境外：${cnText}`);
+            }
+            if (warp) reasons.push("Cloudflare WARP 正在接管流量（代理特征）");
+            if (hosting) reasons.push(`出口是机房/代理 IP：${hosting.org}`);
+
+            const signals = probes.map(p => {
+                if (p.error) return `${p.src}=✗`;
+                if (p.src === "tencent") {
+                    return `tencent=${tencentCN ? "CN" : tencentOverseas ? "海外" : "?"}${p.ip ? `(${p.ip})` : ""}`;
+                }
+                return `${p.src}=${p.cc}${p.ip ? `(${p.ip})` : ""}`;
+            });
+
+            const ipHolder = (tencent && tencent.ip) ? tencent : ok.find(p => p.ip);
+            return {
+                ok: reasons.length === 0,
+                reasons,
+                signals,
+                ip: (ipHolder && ipHolder.ip) || "",
+                ipInfo: cnText ? `🌏所在地区：${cnText}` : "",
+                coded: coded.length,
+                known: coded.length + (cnText ? 1 : 0),   // 拿到结论的路数（国家票 + 腾讯文本）
+                probes: probes.length,
+                failed: probes.filter(p => p.error).map(p => `${p.src}: ${p.error.message}`)
+            };
+        },
+
+        /* 主动探测一次（有缓存）。返回 { ok, reasons, signals, ip, ipInfo, skipped } */
+        async check({ fresh = false, quiet = false } = {}) {
+            if (!this.enabled()) {
+                return { ok: true, skipped: true, reasons: [], signals: [], ip: "", ipInfo: "", coded: 0, known: 0, probes: 0, failed: [] };
+            }
+            const now = Date.now();
+            if (!fresh && this._cache && (now - this._cache.at) < (this._cache.ok ? this.TTL_OK : this.TTL_BLOCK)) {
+                return this._cache;
+            }
+            if (this._inflight) return this._inflight;
+
+            this._inflight = (async () => {
+                let raw = await this._probeAll();
+                let verdict = this._judge(raw);
+                // 一路都没结论：可能刚好在切换网络/梯子启停/刚从睡眠唤醒，退避后再确认两次，
+                // 连续三次全都探测失败才按「出口不明」处理（fail-safe，宁停不放）
+                for (const wait of [2000, 5000]) {
+                    if (verdict.known > 0) break;
+                    if (!quiet) Utils.log("🟡", `出口检测没拿到任何结果，${wait / 1000} 秒后再试一次`);
+                    await Utils.delay(wait);
+                    raw = raw.concat(await this._probeAll());
+                    verdict = this._judge(raw);
+                }
+                // 全都失败时不能放行：宁可停一轮，也别在出口不明的情况下上报
+                if (verdict.known === 0) {
+                    verdict.ok = false;
+                    verdict.reasons.unshift("无法确认出口地区（所有探测都失败）");
+                }
+                verdict.at = Date.now();
+                this._cache = verdict;
+
+                if (verdict.ok) {
+                    RewardsAuto.state.region = "CN";
+                    if (verdict.ip) RewardsAuto.state.ip = verdict.ip;
+                    if (this._lastState !== "ok" || fresh) {
+                        Utils.log("🟢", `出口检测通过（CN）｜${verdict.signals.join("  ")}`);
+                    }
+                    this._lastState = "ok";
+                } else {
+                    if (verdict.ip) RewardsAuto.state.ip = verdict.ip;
+                    if (verdict.ipInfo) RewardsAuto.state.ipInfo = verdict.ipInfo;
+                    const stateChanged = this._lastState !== "block";
+                    const push = stateChanged || (Date.now() - this._lastNotifyAt > this.NOTIFY_GAP);
+                    if (stateChanged || fresh) {
+                        Utils.log(push ? "🔴" : "🟡",
+                            `检测到代理/VPN 或非大陆出口，已暂停上报\n${verdict.reasons.join("\n")}\n出口 IP：${verdict.ip || "未知"}\n${verdict.ipInfo || ""}`,
+                            push);
+                    }
+                    if (push) this._lastNotifyAt = Date.now();
+                    this._lastState = "block";
+                }
+                return verdict;
+            })();
+
+            try {
+                return await this._inflight;
+            } finally {
+                this._inflight = null;
+            }
+        },
+
+        /* 闸门（抛异常版）：拦截时让这一轮立刻收手，一个微软请求都不再发 */
+        async guard(where = "任务") {
+            const v = await this.check();
+            if (!v.ok) throw new RegionBlockedError(`出口异常（${where}）：${v.reasons[0] || "未知原因"}`);
+            return v;
+        },
+
+        /* 闸门（布尔版）：心跳这种「跳过一次就够」的地方用，安静返回 */
+        async allow() {
+            const v = await this.check();
+            return v.ok;
         }
     };
 
@@ -2330,46 +2604,15 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async checkRegion(retryCount = 0) {
-            if (!GM_getValue("Config.lock", true)) return true;
-            try {
-                const html = await Utils.xhr({ url: `https://${RewardsAuto.state.host}/` });
-                if (!html) {
-                    if (retryCount < 2) {
-                        Utils.log("🟡", `地区检测返回空，第${retryCount + 1}次重试...`);
-                        await Utils.randomDelay(3000, 8000);
-                        return await this.checkRegion(retryCount + 1);
-                    }
-                    Utils.log("🔴", "地区检测失败（无响应）");
-                    return false;
-                }
-                const match = html.replace(/\s/g, "").match(/Region:"(.*?)"(.*?)RevIpCC:"(.*?)"/);
-                if (match) {
-                    RewardsAuto.state.region = match[3].toUpperCase();
-                    if (RewardsAuto.state.region !== "CN") {
-                        await this.getIPInfo();
-                        Utils.log("🔴", `IP非大陆(${RewardsAuto.state.region})，已停止\n${RewardsAuto.state.ipInfo}`, true);
-                        return false;
-                    }
-                    Utils.log("🟢", `地区检测通过: ${RewardsAuto.state.region}`);
-                    return true;
-                }
-                if (retryCount < 2) {
-                    Utils.log("🟡", `地区检测格式异常，第${retryCount + 1}次重试...`);
-                    await Utils.randomDelay(3000, 8000);
-                    return await this.checkRegion(retryCount + 1);
-                }
-                Utils.log("🔴", "地区检测失败（格式不匹配）");
-                return false;
-            } catch (e) {
-                if (retryCount < 2) {
-                    Utils.log("🟡", `地区检测异常: ${e.message}，第${retryCount + 1}次重试...`);
-                    await Utils.randomDelay(3000, 8000);
-                    return await this.checkRegion(retryCount + 1);
-                }
-                Utils.log("🔴", `地区检测失败: ${e.message}`);
-                return false;
-            }
+        /* 地区闸门：真正的判断在 RegionGuard（多路探测 + 缓存），这里只做「能不能继续」的收敛。
+         * 保留旧名字，runAll / 诊断脚本都不用改调用方式。 */
+        async checkRegion() {
+            if (!RegionGuard.enabled()) return true;
+            const v = await RegionGuard.check({ fresh: true });
+            if (v.ok) return true;
+            // 拦截时补一份国内视角的 IP 归属，日志/通知里能直接看出「出口在哪」
+            if (!v.ipInfo) await this.getIPInfo();
+            return false;
         },
 
         async getIPInfo() {
@@ -2713,6 +2956,11 @@ const __scBgKeepAlive = (function() {
         async maybeReport() {
             if (this.busy) return null;
             if (Date.now() < this.nextAt) return null;
+            // 出口闸门：心跳每 20 秒跑一次，这里是唯一会在「一轮任务之外」发微软请求的入口
+            if (!(await RegionGuard.allow())) {
+                this.nextAt = Date.now() + 5 * 60 * 1000;   // 出口异常：退避 5 分钟再试
+                return null;
+            }
             this.busy = true;
             try {
                 const r = await EdgeStreak.run();
@@ -2845,6 +3093,7 @@ const __scBgKeepAlive = (function() {
                 Utils.log("✅", `签入已完成(${this.signPoint}积分)`);
                 return;
             }
+            await RegionGuard.guard("签入");
             await Utils.randomDelay();
             let totalPoint = 0;
             let signOk = false;
@@ -2917,6 +3166,7 @@ const __scBgKeepAlive = (function() {
             let successCount = 0;
             let stagnant = 0;
             for (let i = 0; i < target; i++) {
+                await RegionGuard.guard("阅读");
                 const result = await API.doRead();
                 await Utils.randomDelay(3000, 8000);
                 // 任务已满时该接口依然返回 200 + p:0 + isDuplicate:false，
@@ -3007,6 +3257,7 @@ const __scBgKeepAlive = (function() {
             const shouldSkip = (card) => card.kind === "quiz" && !GM_getValue("Tasks.quiz", true);
             let ok = 0, fail = 0;
             for (const card of cards) {
+                await RegionGuard.guard("活动卡片");
                 Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
                 if (shouldSkip(card)) continue;
                 await Utils.randomDelay(3000, 8000);
@@ -3065,7 +3316,9 @@ const __scBgKeepAlive = (function() {
                 return;
             }
 
-            const budgetMin = Math.max(3, Math.min(60, Number(GM_getValue("Config.searchMinutes", 20)) || 20));
+            // 单轮搜索预算固定 20 分钟：原来的「单轮搜索最长时间（分钟）」调整框已从设置里移除，
+            // 值不再可调，但预算、软/硬截止时间的计算与之前保持一致。
+            const budgetMin = 20;
             const startedAt = Date.now();
             // 预算内正常搜；预算用完时只要还在持续记账就继续把这轮补满，最多熬到 hardDeadline。
             // 目的是「一轮尽量做满」，而不是到点就交班。
@@ -3092,6 +3345,9 @@ const __scBgKeepAlive = (function() {
                 Utils.refreshLock("Config.runLock");
                 try { Sched.state("running"); } catch (_) {}
 
+                // 出口闸门：单轮可能跑十几分钟，中途开梯子要能被拦下（有缓存，不会每次都真探测）
+                await RegionGuard.guard("PC 搜索");
+
                 attempts++;
                 const iterStart = Date.now();
                 let query;
@@ -3112,6 +3368,7 @@ const __scBgKeepAlive = (function() {
                     const html = await API.getSearchPage(query, false);
                     if (html) await API.reportSearch(html, query, false);
                 } catch (e) {
+                    if (e && e.regionBlocked) throw e;
                     Utils.log("🟡", `搜索失败: ${e.message}`);
                 }
 
@@ -3228,6 +3485,7 @@ const __scBgKeepAlive = (function() {
 
             // 服务端记账有延迟且偶发限流，单轮容易「一张没完成」，故多轮：发现 → 领取 → 复核
             for (let round = 1; round <= maxRounds; round++) {
+                await RegionGuard.guard("每日活动");
                 Utils.log("📅", `第 ${round}/${maxRounds} 轮每日活动（服务端已确认 ${doneIds.size} 张）...`);
                 await Utils.randomDelay(2000, 5000);
 
@@ -3254,6 +3512,7 @@ const __scBgKeepAlive = (function() {
 
                 for (const card of cards) {
                     if (doneIds.has(card.offerId)) continue;
+                    await RegionGuard.guard("每日活动领取");
                     Utils.log("📅", `领取每日活动: ${card.title} +${card.points}p`);
                     await Utils.randomDelay(3000, 6000);
                     const res = await API.claimCard(card, round === 1 ? { attempts: 2 } : {});
@@ -3310,6 +3569,7 @@ const __scBgKeepAlive = (function() {
          *  纯读操作，不写任何任务日期，也不参与 isAllDone 的完成判定 ——
          *  这些积分无论领没领，都不影响「今日任务已全部完成、停止检测」的判断。 */
         async doClaimPoints() {
+            await RegionGuard.guard("领取积分");
             try {
                 const dashboardHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
                 if (!dashboardHtml) {
@@ -3333,6 +3593,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doStreak() {
+            await RegionGuard.guard("连签检测");
             Utils.log("📅", "开始检测连签任务...");
             // 先用 DAPI 读取权威状态（不依赖页面 DOM / 浏览器 Cookie）
             try {
@@ -3432,17 +3693,16 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.startTime = Utils.getTimestamp();
                 Utils.log("🚀", "启动全能自动化任务...");
                 this.init();
-                const startBalance = await API.getBalance();
-                Utils.log("📊", `初始积分: ${startBalance}`);
-                const regionOK = await API.checkRegion();
-                let isTokenOK = false;
-                if (regionOK) {
-                    isTokenOK = await API.renewToken();
-                    if (!isTokenOK) Utils.log("🟡", "Token失败，跳过签入/阅读", true);
-                } else {
-                    Utils.log("🔴", "IP非国内，已暂停全部任务", true);
+                // 先验出口、再碰任何微软接口：原来先 getBalance 再 checkRegion，
+                // 等于「出口还没确认就先给 rewards 打了一枪」，正好是最该避免的那一下。
+                if (!(await API.checkRegion())) {
+                    Utils.log("🛑", "出口检测未通过：本轮不发任何微软请求，关掉 VPN/梯子（或恢复直连）后会自动恢复");
                     return;
                 }
+                const startBalance = await API.getBalance();
+                Utils.log("📊", `初始积分: ${startBalance}`);
+                let isTokenOK = await API.renewToken();
+                if (!isTokenOK) Utils.log("🟡", "Token失败，跳过签入/阅读", true);
                 const retryDelay = 60000;
                 const maxRetries = 2;
                 const withRetry = async (taskFn, taskName, retries = 0) => {
@@ -3456,6 +3716,8 @@ const __scBgKeepAlive = (function() {
                         }
                         return result;
                     } catch (e) {
+                        // 出口被拦截：整轮立刻收手，重试只会多发几次请求
+                        if (e && e.regionBlocked) throw e;
                         if (retries < maxRetries) {
                             Utils.log("🟡", `${taskName} 异常: ${e.message}，${retryDelay/1000}秒后重试`);
                             await Utils.delay(retryDelay);
@@ -3465,7 +3727,7 @@ const __scBgKeepAlive = (function() {
                         return false;
                     }
                 };
-                if (regionOK && isTokenOK) {
+                if (isTokenOK) {
                     await withRetry(() => this.doSign(), "签到");
                     await Utils.randomDelay();
                     // 阅读走 App/DAPI 通道（Bearer Token），与 PC 会话 Cookie 无关：
@@ -3475,7 +3737,7 @@ const __scBgKeepAlive = (function() {
                     }
                     await withRetry(() => this.doRead(), "阅读");
                     await Utils.randomDelay();
-                } else if (regionOK) {
+                } else {
                     await withRetry(() => this.doSign(), "签到");
                     await Utils.randomDelay();
                 }
@@ -3490,6 +3752,7 @@ const __scBgKeepAlive = (function() {
                 try {
                     await this.doClaimPoints();
                 } catch (e) {
+                    if (e && e.regionBlocked) throw e;
                     Utils.log("🟡", `领取积分执行异常: ${e.message}`);
                 }
                 Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
@@ -3499,6 +3762,7 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
                     let ok = 0, fail = 0;
                     for (const card of newCards) {
+                        await RegionGuard.guard("二次扫描");
                         Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
                         if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
                         await Utils.randomDelay(3000, 8000);
@@ -3545,6 +3809,13 @@ const __scBgKeepAlive = (function() {
                 // 关掉「持续检测」时：这一轮结束如果已经全部完成就当场收工，
                 // 不必等 20 分钟后下一轮再来判定（否则会白跑一轮空任务）。
                 if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
+            } catch (e) {
+                if (e && e.regionBlocked) {
+                    // 出口被拦截：本轮已发的请求到此为止，20 分钟后再看一次出口
+                    Utils.log("🛑", `本轮已中止：${e.message}`);
+                } else {
+                    Utils.log("🔴", `本轮任务异常终止: ${e.message}`);
+                }
             } finally {
                 Utils.releaseLock("Config.runLock");
                 this.running = false;
@@ -3635,7 +3906,7 @@ const __scBgKeepAlive = (function() {
         } else {
             text += `上一轮：还没有记录\n`;
         }
-        text += `单轮预算：${Math.max(3, Number(GM_getValue("Config.searchMinutes", 20)) || 20)} 分钟\n`;
+        text += `单轮预算：20 分钟（固定，不可调）\n`;
         text += `提前续做：${pacer.pending ? "已排程（本轮没搜满）" : "无"}\n`;
         text += `限流计数：${restricted}/3\n`;
         text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
@@ -3731,6 +4002,38 @@ const __scBgKeepAlive = (function() {
         status += `Bark: ${bark ? "✅ 已配置" : "❌ 未配置"}\n`;
         Utils.uiAlert(status);
     });
+
+    // 「🌍 网络出口检测」菜单已移除：不再注册菜单按钮、不再弹窗，检测逻辑照旧（每个任务/心跳都会走闸门）。
+    // 需要看这段状态文本时在控制台调用 __MPDiagnostics.region()。
+    const diagRegion = async () => {
+        const v = await RegionGuard.check({ fresh: true });
+        let text = "🌍 网络出口检测\n\n";
+        if (v.skipped) {
+            text += "「锁定国区」已关闭：不做出口限制，也不拦代理。\n\n";
+        } else {
+            text += `结论：${v.ok ? "✅ 出口在大陆，可以继续" : "⛔ 已拦截，任务不会上报"}\n`;
+            if (v.reasons.length) text += `原因：${v.reasons.join("；")}\n`;
+        }
+        text += `出口 IP：${v.ip || "未知"}\n`;
+        if (v.ipInfo) text += `${v.ipInfo}\n`;
+        // 分组显示：真正要紧的是「微软看到的出口」，第三方只是旁证
+        const msSignals = v.signals.filter(s => /^bing=/.test(s));
+        const otherSignals = v.signals.filter(s => !/^bing=/.test(s));
+        text += `\n各路信号：\n`;
+        text += `  微软侧（bing.com）：${msSignals.length ? msSignals.join(" ") : "（无）"}\n`;
+        text += `  第三方/国内视角：${otherSignals.length ? otherSignals.join(" ") : "（无）"}\n`;
+        if (v.failed && v.failed.length) text += `\n探测失败：\n${v.failed.map(s => `  ${s}`).join("\n")}\n`;
+        text += "\n探测源：bing.com（不带 Cookie）/ cloudflare / ipinfo.io / api.ip.sb / 腾讯 IP 库\n";
+        text += `结论缓存：通过 ${RegionGuard.TTL_OK / 1000} 秒、拦截 ${RegionGuard.TTL_BLOCK / 1000} 秒\n`;
+        text += `「锁定国区」：${RegionGuard.enabled() ? "开启（非大陆出口、机房/代理 IP、WARP 都会停）" : "关闭"}`;
+        if (!v.skipped && v.ok) {
+            text += "\n\n规则模式提示：只有「微软侧」才是风控依据。bing.com 判定为 CN 就代表微软把你看成大陆；"
+                + "若第三方也全 CN，说明梯子的规则没接管微软域名 —— 这正是最安全的用法。"
+                + "想确认业务域名有没有漏走代理，去客户端「连接/日志」里搜 "
+                + "rewards.bing.com、prod.rewardsplatform.microsoft.com、login.live.com，应显示 DIRECT。";
+        }
+        return text;
+    };
 
     /* ===== 常驻调度 =====
      * 之前用 setInterval 每 60 秒检查一次，但 @background 的脚本跑在 ScriptCat 的沙盒里：
@@ -4076,15 +4379,16 @@ const __scBgKeepAlive = (function() {
         Sched.arm(true);
     };
 
-    // 原四个诊断/操作菜单（Edge 连签状态、PC 搜索诊断、查看调度状态、重置调度计划）已从右键菜单移除。
-    // 逻辑原样保留在这里，不再弹出任何提示框：需要时在控制台（脚本管理器或 rewards.bing.com 页面）
-    // 调用 __MPDiagnostics.edgeStreak() / pcSearch() / schedule() / resetSchedule()，
-    // 前三个的返回值就是原来弹窗里的那段文本。
+    // 原五个诊断/操作菜单（Edge 连签状态、PC 搜索诊断、查看调度状态、重置调度计划、网络出口检测）
+    // 已从右键菜单移除。逻辑原样保留在这里，不再弹出任何提示框：需要时在控制台（脚本管理器或
+    // rewards.bing.com 页面）调用 __MPDiagnostics.edgeStreak() / pcSearch() / region() / schedule() /
+    // resetSchedule()，前四个的返回值就是原来弹窗里的那段文本。
     try {
         const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : globalThis;
         host.__MPDiagnostics = {
             edgeStreak: diagEdgeStreak,
             pcSearch: diagPcSearch,
+            region: diagRegion,
             schedule: diagSchedStatus,
             resetSchedule: diagResetSchedule
         };
