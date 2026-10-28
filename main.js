@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.0
+// @version      1.4.5
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务、✅Edge 浏览连签（后台累计 30 分钟，UA 自动跟随浏览器版本）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -51,11 +51,19 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 搜索间隔（秒）
+        title: 搜索最小间隔（秒，脚本只会更慢不会更快）
         type: number
         default: 30
         min: 30
-        unit: ±15秒
+        max: 180
+        unit: 秒
+    searchMinutes:
+        title: 单轮搜索最长时间（分钟）
+        type: number
+        default: 20
+        min: 3
+        max: 60
+        unit: 分钟
     api:
         title: 搜索词接口（offline为随机搜索词）
         type: select
@@ -1694,7 +1702,7 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
-        async getSearchQuotaFromUserInfo() {
+        async getSearchQuotaFromUserInfo(light = false) {
             try {
                 const res = await Utils.xhr({
                     url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
@@ -1722,12 +1730,17 @@ const __scBgKeepAlive = (function() {
                 const pc = sumCounter(counters.pcSearch);
                 if (pc.max === 0) return false;
                 const balance = Number(userStatus.availablePoints || dashboard.availablePoints || 0);
-                let readProgress = 0, readMax = 30;
-                try {
-                    const readInfo = await API.getReadProgress();
-                    if (readInfo) { readProgress = readInfo.progress; readMax = readInfo.max; }
-                } catch (e) {}
-                Utils.log("📊", `getuserinfo查询: PC ${pc.progress}/${pc.max}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+                let readProgress = RewardsAuto.state.readProgress ?? 0;
+                let readMax = RewardsAuto.state.readMax ?? 30;
+                /* light=true：只取搜索配额。搜索节拍器每次搜索后都要核对一次记账，
+                 * 这里省掉额外的阅读进度请求和日志，免得 20 次搜索刷 20 行 + 20 个请求。 */
+                if (!light) {
+                    try {
+                        const readInfo = await API.getReadProgress();
+                        if (readInfo) { readProgress = readInfo.progress; readMax = readInfo.max; }
+                    } catch (e) {}
+                    Utils.log("📊", `getuserinfo查询: PC ${pc.progress}/${pc.max}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+                }
                 return {
                     balance, pc, readProgress, readMax, dailyOffer: 0,
                     todayDetails: pc.max > 0 ? [{ title: "必应搜索", points: pc.progress, max: pc.max }] : [],
@@ -1741,7 +1754,7 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async getSearchQuotaFromAPI() {
+        async getSearchQuotaFromAPI(light = false) {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613",
@@ -1768,18 +1781,39 @@ const __scBgKeepAlive = (function() {
                     }
                     if (pcMax === 0) return false;
                     const balance = response.balance || response.userStatus?.availablePoints || 0;
-                    let readProgress = 0, readMax = 30;
-                    try {
-                        const readInfo = await API.getReadProgress();
-                        if (readInfo) { readProgress = readInfo.progress; readMax = readInfo.max; }
-                    } catch (e) {}
-                    Utils.log("📊", `DAPI查询: PC ${pcCur}/${pcMax}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+                    let readProgress = RewardsAuto.state.readProgress ?? 0;
+                    let readMax = RewardsAuto.state.readMax ?? 30;
+                    if (!light) {
+                        try {
+                            const readInfo = await API.getReadProgress();
+                            if (readInfo) { readProgress = readInfo.progress; readMax = readInfo.max; }
+                        } catch (e) {}
+                        Utils.log("📊", `DAPI查询: PC ${pcCur}/${pcMax}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+                    }
                     return { balance, pc: { progress: pcCur, max: pcMax }, readProgress, readMax, dailyOffer: 0, todayDetails: [], history: null };
                 }
             } catch (e) {
-                Utils.log("🟡", `DAPI查询失败: ${e.message}`);
+                if (!light) Utils.log("🟡", `DAPI查询失败: ${e.message}`);
             }
             return false;
+        },
+
+        /* ===== 搜索记账核对 =====
+         * PC 搜索的积分是「服务端记账」，本地 +3 只是猜测：被限流时搜索照发但一分不给。
+         * 所以每搜一次就核对一次真实进度，节拍器才知道该加速还是该退让。
+         * 优先用 getuserinfo（轻量 GET，带 PC 会话 Cookie），拿不到再走 App 通道的 DAPI。 */
+        async getPcQuota() {
+            try {
+                const ui = await this.getSearchQuotaFromUserInfo(true);
+                if (ui && ui.pc && ui.pc.max > 0) return { progress: ui.pc.progress, max: ui.pc.max };
+            } catch (_) {}
+            try {
+                if (RewardsAuto.state.token) {
+                    const dapi = await this.getSearchQuotaFromAPI(true);
+                    if (dapi && dapi.pc && dapi.pc.max > 0) return { progress: dapi.pc.progress, max: dapi.pc.max };
+                }
+            } catch (_) {}
+            return null;
         },
 
         async getBalance() {
@@ -2234,6 +2268,24 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
+        /* 从搜索结果页里取服务器给这次搜索分配的 IG（交互 ID）。
+         * 真实浏览器是拿着 SERP 里的 IG 去上报的；以前一直用本地随机 UUID，
+         * 服务端认不出这是哪一次搜索，记账就时有时无（这是「第一轮给得多、
+         * 之后每轮只给一点」的疑点之一）。取不到才退回随机值。 */
+        extractIG(html) {
+            if (!html) return "";
+            const patterns = [
+                /IG:"([0-9A-F]{16,40})"/i,
+                /"IG"\s*:\s*"([0-9A-F]{16,40})"/i,
+                /[?&]IG=([0-9A-F]{16,40})/i,
+            ];
+            for (const re of patterns) {
+                const m = html.match(re);
+                if (m && m[1]) return m[1].toUpperCase();
+            }
+            return "";
+        },
+
         async getSearchPage(query, isMobile = false) {
             const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
             const deviceType = isMobile ? "m" : "d";
@@ -2242,14 +2294,17 @@ const __scBgKeepAlive = (function() {
                 headers: {
                     "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
                     "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`,
-                    "referer": `https://${RewardsAuto.state.host}/?form=QBLH`
+                    "referer": `https://${RewardsAuto.state.host}/?form=QBLH`,
+                    // 一次搜索必须真的打到服务器：命中缓存的话服务端根本看不到这次搜索
+                    "cache-control": "no-cache",
+                    "pragma": "no-cache"
                 }
             });
         },
 
         async reportSearch(html, query, isMobile = false) {
             try {
-                const ig = Utils.getRandomUUID();
+                const ig = this.extractIG(html) || Utils.getRandomUUID();
                 const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
                 const params = `q=${encodeURIComponent(query)}&form=QBLH${mkt}`;
                 const deviceType = isMobile ? "m" : "d";
@@ -2679,6 +2734,86 @@ const __scBgKeepAlive = (function() {
         }
     };
 
+    /* ===== PC 搜索节拍器 =====
+     * 现象：第一轮还能拿几分，之后每轮只拿一点，几十轮才凑满。
+     * 两层原因：
+     *   1) 服务端记账是「窗口式」的：短时间连着搜，只有前几次真给分，剩下的要等下一个窗口。
+     *      这是服务端的策略，脚本改不了，只能顺着它攒；
+     *   2) 脚本把「没记账」一律当成「该更慢了」，节拍一路放大到 5 分钟，还持久化给下一轮，
+     *      于是一轮 20 分钟只搜得到四五次 —— 后面每一轮自然就只拿一点。这一层是可以修的。
+     * 现在：
+     *   1) 每轮都从用户设的最小间隔（Config.span）起步，不继承上一轮被放大的节拍；
+     *   2) 记账成功立刻回到最小间隔；没记账才按倍数放慢，软上限 3 分钟
+     *      （再慢不如结束本轮交给调度，别在一轮里干等）；
+     *   3) 不再「连续 6 次没记账就收手」：改成「连续 10 分钟一次都没记账」才收手，
+     *      这样能把「服务端记账延迟几十秒」和「真的被限流」分开；
+     *   4) 一轮内一直搜到配额满或预算用完，尝试次数按剩余配额动态算，不再固定 40。
+     */
+    const SEARCH_PACER = {
+        MIN_MS: 30 * 1000,          // 绝对下限：再顺也不会比 Config.span 更快（默认 30 秒）
+        MAX_MS: 3 * 60 * 1000,      // 没记账时最多退到这个节拍，再慢就交给下一轮
+        OBSERVE_MIN: 8 * 1000,      // 搜索后留给服务端记账的观察窗（随机，避免固定秒数）
+        OBSERVE_MAX: 16 * 1000,
+        MAX_ATTEMPTS: 60,           // 一轮内的尝试上限（兜底）
+        NO_CREDIT_LIMIT: 10 * 60 * 1000,  // 连续这么久一次都没记账 → 本轮收手
+        RECENT_CREDIT: 5 * 60 * 1000,     // 预算用完后，最近这么久还有记账就继续把这轮补满
+        MIN_ATTEMPTS_BEFORE_GIVEUP: 8,    // 但至少先试够这么多次，别被两次记账延迟骗了
+        GROW: 1.5,                  // 没记账：节拍放大倍数
+        RETRY_GAP: 5 * 60 * 1000,   // 搜索没满时，下一轮提前多少毫秒续做
+
+        // 下限 = 用户设的最小间隔（Config.span）；脚本只会比它慢，绝不会比它快
+        minMs() {
+            const span = Number(GM_getValue("Config.span", 30)) || 30;
+            return Math.min(this.MAX_MS, Math.max(this.MIN_MS, Math.max(30, span) * 1000));
+        },
+        /* 每轮的起始节拍：永远是用户设的最小间隔。
+         * 上一轮被限流学到的大节拍只留作日志，不再拖住下一轮 —— 限流窗口是分钟级的，
+         * 拿一整天的节奏去还债，正是「后面每轮只拿一点」的由来。 */
+        startGap() { return this.minMs(); },
+        /* 只在 Config.span 之上加，绝不往下减：用户设 30 秒，就一定不会快于 30 秒。
+         * 额外加 0~35% 随机量，间隔不会总落在整秒整分上，看起来不像定时器。 */
+        jitter(ms) {
+            const v = ms * (1 + Math.random() * 0.35);
+            return Math.max(5 * 1000, Math.round(v / 1000) * 1000);
+        },
+        // 只存「上一轮最高节拍」用于诊断；跨天自动失效
+        saveGap(ms) {
+            GM_setValue("Config.searchGap", { date: Utils.getTodayNum(), ms: Math.round(ms) });
+        },
+        loadGapPeak() {
+            const saved = GM_getValue("Config.searchGap", null);
+            if (!saved || typeof saved !== "object" || saved.date !== Utils.getTodayNum()) return 0;
+            const ms = Number(saved.ms) || 0;
+            return (ms <= 0 || ms > this.MAX_MS) ? 0 : ms;
+        },
+        // 上一轮的统计（尝试几次/记账几次/最高节拍）；落盘保存，刷新页面后诊断菜单还看得到
+        setLast(stat) {
+            GM_setValue("Config.searchLast", stat ? { date: Utils.getTodayNum(), ...stat } : null);
+        },
+        getLast() {
+            const l = GM_getValue("Config.searchLast", null);
+            if (!l || typeof l !== "object" || l.date !== Utils.getTodayNum()) return null;
+            return { attempts: Number(l.attempts) || 0, credits: Number(l.credits) || 0, peak: Number(l.peak) || 0, at: Number(l.at) || 0 };
+        },
+        // 「本轮没搜满」标记：带日期，跨天自动失效，不会让昨天的残留把今天的轮次一直拉快
+        setPending(v) {
+            GM_setValue("Config.searchPending", v ? { date: Utils.getTodayNum() } : null);
+        },
+        isPending() {
+            const p = GM_getValue("Config.searchPending", null);
+            return !!(p && typeof p === "object" && p.date === Utils.getTodayNum());
+        },
+        summary() {
+            const min = Math.round(this.minMs() / 1000);
+            return {
+                gap: min, min,
+                peak: Math.round(this.loadGapPeak() / 1000),
+                pending: this.isPending(),
+                last: this.getLast()
+            };
+        }
+    };
+
     const TaskManager = {
         signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
@@ -2893,65 +3028,184 @@ const __scBgKeepAlive = (function() {
             if (!GM_getValue("Tasks.search", true)) return;
             const info = await API.getRewardsInfo();
             if (!info) { Utils.log("🔴", "无法获取积分信息"); return; }
-            RewardsAuto.state.pcProgress = info.pc.progress;
-            RewardsAuto.state.pcMax = info.pc.max;
-            Utils.log("🔍", `搜索配额: PC ${info.pc.progress}/${info.pc.max}`);
-            const pcDone = info.pc.progress >= info.pc.max;
-            if (pcDone) {
+            let progress = info.pc.progress;
+            let max = info.pc.max;
+            RewardsAuto.state.pcProgress = progress;
+            RewardsAuto.state.pcMax = max;
+            Utils.log("🔍", `搜索配额: PC ${progress}/${max}`);
+
+            const markDone = () => {
                 this.searchDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("✅", `搜索配额已满 PC: ${info.pc.progress}/${info.pc.max}`);
+                SEARCH_PACER.setPending(false);
+                RewardsAuto.state.restrictedTimes = 0;
+                GM_setValue("Config.restrictedTimes", 0);
+                GM_setValue("Config.lastSearchProgress", -1);
+            };
+
+            if (progress >= max) {
+                markDone();
+                Utils.log("✅", `搜索配额已满 PC: ${progress}/${max}`);
                 return;
             }
             if (this.searchDate === RewardsAuto.state.dateNowNum) {
                 Utils.log("🟡", "搜索配额未满，继续执行搜索任务");
                 this.searchDate = 0;
             }
-            const isRestricted = await API.checkSearchRestricted();
-            if (isRestricted) {
+            if (await API.checkSearchRestricted()) {
+                // 被判定受限：只打上今天已处理，别清受限计数，否则下一轮又从 0 开始数
                 this.searchDate = RewardsAuto.state.dateNowNum;
                 this.save();
+                SEARCH_PACER.setPending(false);
                 return;
             }
-            const limit = Utils.randomRange(4, 7);
-            for (let i = 0; i < limit; i++) {
-                if (RewardsAuto.state.pcProgress >= RewardsAuto.state.pcMax) break;
+
+            const budgetMin = Math.max(3, Math.min(60, Number(GM_getValue("Config.searchMinutes", 20)) || 20));
+            const startedAt = Date.now();
+            // 预算内正常搜；预算用完时只要还在持续记账就继续把这轮补满，最多熬到 hardDeadline。
+            // 目的是「一轮尽量做满」，而不是到点就交班。
+            const softDeadline = startedAt + budgetMin * 60 * 1000;
+            const hardMin = Math.max(budgetMin, Math.min(45, budgetMin * 2 + 10));
+            const hardDeadline = startedAt + hardMin * 60 * 1000;
+            // 每轮都从最小间隔起步，绝不继承上一轮被放大的节拍
+            let gap = SEARCH_PACER.startGap();
+            let peakGap = gap;
+            // 还差多少分、按每次 3 分估算还要搜几次，留一倍余量（记账会漏，得补搜）
+            const needed = Math.max(1, Math.ceil((max - progress) / 3));
+            const attemptCap = Math.min(SEARCH_PACER.MAX_ATTEMPTS, Math.max(12, needed * 2));
+            let attempts = 0, credits = 0, sinceCredit = 0, verifyFails = 0;
+            // 最近一次「真正记账」的时刻：判限流用它，而不是用连续未记账的次数
+            let lastCreditAt = startedAt;
+            // 本轮用过的搜索词，避免重复词被服务端忽略
+            const usedQueries = new Set();
+            const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
+
+            Utils.log("🔍", `单轮预算 ${budgetMin} 分钟（还在记账就最多延到 ${Math.round(hardMin)} 分钟），起始节拍 ${Math.round(gap / 1000)} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
+
+            while (attempts < attemptCap && Date.now() < hardDeadline) {
+                // 单轮可能跑十几分钟，顺手给运行锁和运行阶段续约，避免被别的上下文判成「已经挂了」
+                Utils.refreshLock("Config.runLock");
+                try { Sched.state("running"); } catch (_) {}
+
+                attempts++;
+                const iterStart = Date.now();
                 let query;
-                if (RewardsAuto.apiConfig.mode !== "offline") {
-                    query = await API.getHotSearchWord();
-                } else {
-                    query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
+                try {
+                    query = RewardsAuto.apiConfig.mode !== "offline"
+                        ? await API.getHotSearchWord()
+                        : "";
+                } catch (_) {
+                    query = "";
                 }
-                Utils.log("🔍", `[PC] 搜索 ${i+1}/${limit}: ${query}`);
+                if (!query) query = pickPoolWord();
+                // 同一轮里尽量不复用同一个搜索词：重复词服务端大概率不记账，白白拉长节拍
+                for (let i = 0; i < 5 && query && usedQueries.has(query); i++) query = pickPoolWord();
+                if (query) usedQueries.add(query);
+                Utils.log("🔍", `[PC] 第 ${attempts} 次搜索（记账 ${progress}/${max}，节拍 ${Math.round(gap / 1000)}s）：${query}`);
+
                 try {
                     const html = await API.getSearchPage(query, false);
-                    if (html) {
-                        await API.reportSearch(html, query, false);
-                        RewardsAuto.state.pcProgress += 3;
-                    }
+                    if (html) await API.reportSearch(html, query, false);
                 } catch (e) {
                     Utils.log("🟡", `搜索失败: ${e.message}`);
                 }
-                const span = Number(GM_getValue("Config.span", 30));
-                const wait = Utils.randomRange((span-15)*1000, (span+15)*1000);
-                Utils.log("⏳", `等待 ${wait/1000}秒`);
+
+                // 观察窗：先给服务端记账的时间，再用轻量接口核对真实进度
+                // 观察窗长度也随机，别每次都精确 12 秒
+                await Utils.delay(Utils.randomRange(SEARCH_PACER.OBSERVE_MIN, SEARCH_PACER.OBSERVE_MAX));
+                const before = progress;
+                let quota = await API.getPcQuota();
+                // 记账常常有几秒延迟：第一次没变化再看一眼，别把「延迟」误判成「没记账」白退让
+                if (quota && quota.progress <= before) {
+                    await Utils.delay(Utils.randomRange(8000, 14000));
+                    const again = await API.getPcQuota();
+                    if (again) quota = again;
+                }
+                if (quota) {
+                    verifyFails = 0;
+                    if (quota.max > 0) max = quota.max;
+                    if (quota.progress > before) {
+                        progress = quota.progress;
+                        credits++;
+                        sinceCredit = 0;
+                        lastCreditAt = Date.now();
+                        // 记账顺利就直接回到用户设的最小间隔，不再一级一级衰减
+                        gap = SEARCH_PACER.minMs();
+                        Utils.log("✅", `记账成功 +${progress - before}（${progress}/${max}），节拍回到 ${Math.round(gap / 1000)} 秒`);
+                    } else {
+                        progress = Math.max(progress, quota.progress);
+                        sinceCredit++;
+                        gap = Math.min(SEARCH_PACER.MAX_MS, Math.round(gap * SEARCH_PACER.GROW));
+                        peakGap = Math.max(peakGap, gap);
+                        Utils.log("🟡", `本次未记账（${progress}/${max}，连续 ${sinceCredit} 次），节拍放慢到 ${Math.round(gap / 1000)} 秒`);
+                    }
+                } else {
+                    // 核对接口不可用：按每搜 3 分乐观推进，避免原地死循环；后续核对成功会自动校正回来
+                    verifyFails++;
+                    sinceCredit++;
+                    progress = Math.min(max, progress + 3);
+                    gap = Math.min(SEARCH_PACER.MAX_MS, Math.round(gap * SEARCH_PACER.GROW));
+                    peakGap = Math.max(peakGap, gap);
+                }
+                RewardsAuto.state.pcProgress = progress;
+
+                if (progress >= max) break;
+                /* 判定限流只看「多久没有真正记账」，不看连续几次没记账：
+                 * 服务端记账延迟几十秒很常见，按次数判会把每轮都判成限流。 */
+                const noCreditMs = Date.now() - lastCreditAt;
+                if (noCreditMs >= SEARCH_PACER.NO_CREDIT_LIMIT && attempts >= SEARCH_PACER.MIN_ATTEMPTS_BEFORE_GIVEUP) {
+                    Utils.log("🟡", `连续 ${Math.round(noCreditMs / 60000)} 分钟没有任何记账（本轮 ${attempts} 次搜索），判定被限流，本轮收手（已记 ${progress}/${max}）`);
+                    break;
+                }
+                if (verifyFails >= 6) {
+                    Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮按乐观估计结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
+                    break;
+                }
+                if (Date.now() + gap > hardDeadline) {
+                    Utils.log("🟡", `已到本轮硬上限（${Math.round(hardMin)} 分钟），剩下的 ${Math.max(0, max - progress)} 分交给下一轮`);
+                    break;
+                }
+                // 预算用完之后，只有「最近还在持续记账」才继续熬，否则交班，别白耗
+                if (Date.now() + gap > softDeadline && Date.now() - lastCreditAt > SEARCH_PACER.RECENT_CREDIT) {
+                    Utils.log("🟡", `本轮预算（${budgetMin} 分钟）已用完且最近 ${Math.round(SEARCH_PACER.RECENT_CREDIT / 60000)} 分钟没有新记账，剩下的 ${Math.max(0, max - progress)} 分交给下一轮`);
+                    break;
+                }
+                // 节拍按「这一次搜索 → 下一次搜索」算：搜索本身、观察窗、二次核对花掉的时间
+                // 都已经算在 gap 里了，所以日志里的「等待 N 秒」可能很短（7 秒也正常），
+                // 真正两次搜索之间仍然隔着 gap 那么久，不会更密
+                const cycle = SEARCH_PACER.jitter(gap);
+                let wait = Math.max(5000, cycle - (Date.now() - iterStart));
+                if (attempts % 5 === 0) wait += Utils.randomRange(20000, 60000);
+                // 偶尔停下来「看一会儿结果」，整段时间里别只有等间隔的搜索
+                else if (Math.random() < 0.08) wait += Utils.randomRange(60000, 150000);
+                const aparts = Math.round((Date.now() - iterStart + wait) / 1000);
+                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（两次搜索相隔约 ${aparts} 秒，含观察与核对）`);
                 await Utils.delay(wait);
             }
+
+            SEARCH_PACER.setLast({ attempts, credits, peak: Math.round(peakGap / 1000), at: Date.now() });
+            SEARCH_PACER.saveGap(peakGap);
+            const elapsed = Math.round((Date.now() - startedAt) / 1000);
             const finalInfo = await API.getRewardsInfo();
             if (finalInfo) {
-                const pcDone2 = finalInfo.pc.progress >= finalInfo.pc.max;
-                if (pcDone2) {
-                    this.searchDate = RewardsAuto.state.dateNowNum;
-                    this.save();
-                    RewardsAuto.state.restrictedTimes = 0;
-                    GM_setValue("Config.restrictedTimes", 0);
-                    GM_setValue("Config.lastSearchProgress", -1);
-                    Utils.log("🔵", `🔍 搜索任务完成！PC: ${finalInfo.pc.progress}/${finalInfo.pc.max}`, true);
-                } else {
-                    Utils.log("🟡", `搜索已执行，配额未满 PC: ${finalInfo.pc.progress}/${finalInfo.pc.max}`);
-                }
+                progress = finalInfo.pc.progress;
+                max = finalInfo.pc.max || max;
+                RewardsAuto.state.pcProgress = progress;
+                RewardsAuto.state.pcMax = max;
+            }
+            const hitRate = attempts > 0 ? Math.round((credits / attempts) * 100) : 0;
+            // 只有拿到服务端最终确认才算完成；核对接口全挂时按乐观估计算出的「满」不算数，
+            // 留给下一轮用真实进度校正，免得把没记上的分当成已完成再也不搜
+            if (finalInfo && progress >= max) {
+                markDone();
+                Utils.log("🔵",
+                    `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最高节拍 ${Math.round(peakGap / 1000)}s）`, true);
             } else {
-                Utils.log("🟡", "搜索已执行，但无法获取最终配额状态");
+                // 没满就把「提前续做」的标记立起来，调度下一轮 5 分钟后就来，不再干等 20 分钟
+                SEARCH_PACER.setPending(true);
+                Utils.log("🟡",
+                    `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最高节拍 ${Math.round(peakGap / 1000)}s，已安排提前续做`);
+                this.save();
             }
         },
 
@@ -3260,7 +3514,9 @@ const __scBgKeepAlive = (function() {
                     const readProg = info.readProgress ?? RewardsAuto.state.readProgress ?? 0;
                     const readMaxProg = info.readMax ?? RewardsAuto.state.readMax ?? 30;
                     logMsg += `阅读\t\t${readOk ? '✅' : '❌'} ${readProg}/${readMaxProg}\n`;
-                    logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}\n`;
+                    // 搜索没跑满时把「当前节拍」一起报出来，方便判断是被限流还是单纯没搜完
+                    const pacer = SEARCH_PACER.summary();
+                    logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}${searchOk ? '' : `（每轮从 ${pacer.min}s 起步${pacer.last ? `，上轮 ${pacer.last.attempts} 搜/${pacer.last.credits} 记` : ''}）`}\n`;
                     logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
                     logMsg += `每日活动\t${dailySetRes ? '✅' : '❌'} ${this.dailySetSummary || ''}\n`;
                     logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
@@ -3344,6 +3600,39 @@ const __scBgKeepAlive = (function() {
         Utils.uiAlert(text);
         EdgePacer.nextAt = 0;
         EdgePacer.maybeReport().catch(e => Utils.log("🟡", `Edge 连签手动推进失败：${e.message}`));
+    });
+
+    GM_registerMenuCommand("🔍 PC 搜索诊断", async () => {
+        const pacer = SEARCH_PACER.summary();
+        const restricted = Number(GM_getValue("Config.restrictedTimes", 0)) || 0;
+        let text = "🔍 PC 搜索诊断\n\n";
+        text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
+        text += `最小间隔：${pacer.min} 秒（Config.span，两次搜索之间不会快于它，只会更慢）\n`;
+        text += `每轮起始节拍：${pacer.min} 秒（每轮重置，不继承上一轮被放大的节拍）\n`;
+        text += `单轮内退让上限：${SEARCH_PACER.MAX_MS / 1000} 秒；连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手\n`;
+        if (pacer.last) {
+            text += `上一轮：${pacer.last.attempts} 次搜索 / 记账 ${pacer.last.credits} 次（最高节拍 ${pacer.last.peak} 秒）\n`;
+        } else {
+            text += `上一轮：还没有记录\n`;
+        }
+        text += `单轮预算：${Math.max(3, Number(GM_getValue("Config.searchMinutes", 20)) || 20)} 分钟\n`;
+        text += `提前续做：${pacer.pending ? "已排程（本轮没搜满）" : "无"}\n`;
+        text += `限流计数：${restricted}/3\n`;
+        text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
+        const info = await API.getRewardsInfo();
+        if (info) text += `服务端配额：PC ${info.pc.progress}/${info.pc.max}\n`;
+        else text += "服务端配额：读取失败\n";
+        text += "\n关掉这个提示后会立刻单独跑一次 PC 搜索（日志里能看到每次是否真的记账）。";
+        Utils.uiAlert(text);
+        // 和常驻调度共用一把锁，避免诊断和正式那一轮同时搜
+        if (!Utils.acquireLock("Config.runLock", 45 * 60 * 1000)) {
+            Utils.log("🟡", "已有一轮任务在跑，搜索诊断跳过");
+            return;
+        }
+        Promise.resolve()
+            .then(() => TaskManager.doSearch())
+            .catch(e => Utils.log("🔴", `搜索异常：${e && e.message ? e.message : e}`))
+            .finally(() => Utils.releaseLock("Config.runLock"));
     });
 
     GM_registerMenuCommand("🚀 立即运行", () => {
@@ -3510,7 +3799,17 @@ const __scBgKeepAlive = (function() {
             this.clearClaim();
             GM_setValue("Config.cronLastRun", now);
             const next = base + CRON_PERIOD;
-            this.saveNext(next > now + 60 * 1000 ? next : now + 60 * 1000);
+            let plan = next > now + 60 * 1000 ? next : now + 60 * 1000;
+            // PC 搜索是唯一「一次只能记一点」的任务：没跑满就别干等 20 分钟，
+            // 提前 5 分钟回来续做（搜索跑满后 doSearch 会把这个标记清掉）
+            if (GM_getValue("Tasks.search", true) && SEARCH_PACER.isPending()) {
+                const sooner = now + SEARCH_PACER.RETRY_GAP;
+                if (sooner < plan) {
+                    plan = sooner;
+                    Utils.log("🔍", `PC 搜索未满，${Math.round(SEARCH_PACER.RETRY_GAP / 60000)} 分钟后提前续做`);
+                }
+            }
+            this.saveNext(plan);
             this.state(ok ? "done" : "idle");
             if (ok) Utils.log("🕒", `本轮结束，下一轮 ${this.fmt(this.plan(now))}`);
         },
