@@ -836,7 +836,7 @@ const __scBgKeepAlive = (function() {
             let raw = input;
             if (raw == null) {
                 raw = await Utils.uiPrompt(
-                    "粘贴授权页跳转后的完整地址（也可以只粘贴 code= 后面那一段）：\n" +
+                    "粘贴授权页跳转后的完整地址：\n" +
                     "形如 https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY...&lc=2052"
                 );
                 if (raw == null) return false;
@@ -850,8 +850,8 @@ const __scBgKeepAlive = (function() {
             Utils.log("🟢", `授权码已保存（${this.preview(code)}），立即换取 Token...`);
             const ok = await this.exchange(code);
             Utils.uiAlert(ok
-                ? "✅ 授权成功，Token 已保存。\n\n授权码也已保留（可在「📊 Token状态」里查看）。授权码本身只能用一次，\n后续续期走 refresh_token，无需你再操作。"
-                : "⚠️ 授权码已保存，但换取 Token 失败。\n\n最常见原因：授权码已过期（有效期约 10 分钟）或已被使用过。\n请重新点「🔑 手动授权」，登录后立刻复制跳转地址再粘贴。\n\n具体原因见脚本日志。");
+                ? "✅ 授权成功，Token 已保存。\n\n授权码也已保留（可在「📊 Token状态」里查看）。授权码本身只能用一次，\n后续使用的是token，无需你再操作。"
+                : "⚠️ 授权码已保存，但换取 Token 失败。\n\n最常见原因：授权码已过期或已被使用过。\n请重新点「🔑 手动授权」，登录后立刻复制跳转地址再粘贴。");
             return ok;
         },
     };
@@ -2974,7 +2974,6 @@ const __scBgKeepAlive = (function() {
     if (!Utils.hasDOM()) {
         setTimeout(runScheduled, 3000);
         setInterval(runScheduled, CRON_CHECK_INTERVAL);
-        // 必须让顶层返回一个永不兑现的 Promise：ScriptCat 以「顶层 Promise 是否 settle」
         // 判定后台脚本是否还在跑，否则调度器还在转、管理页却显示「停止」。
         return new Promise(() => {});
     }
