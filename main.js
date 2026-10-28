@@ -2,7 +2,7 @@
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
 // @version      1.0.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(DAPI 通道，跨浏览器一致)、✅桌面应用每周专属任务、✅Edge 浏览连签（后台累计 30 分钟，UA 自动跟随浏览器版本）、✅出口检测（VPN/代理/非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报(网页 Server Action 优先、失败回退 DAPI，无 Cookie 时纯 DAPI）、✅桌面应用每周专属任务、✅Edge 浏览连签（后台累计 30 分钟，UA 自动跟随浏览器版本）、✅出口检测（VPN/代理/非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -256,6 +256,8 @@ const __scBgKeepAlive = (function() {
             // 本轮扫描到的真锁卡数量/分数（需在必应 App 完成），只用于汇总日志
             lockedCount: 0,
             lockedPoints: 0,
+            // 网页通道确认「未登录/无 Cookie」后置真：当轮剩余卡片直接走 DAPI，避免白发请求
+            webNoAuth: false,
         }
     };
 
@@ -2516,7 +2518,7 @@ const __scBgKeepAlive = (function() {
             return cached;
         },
 
-        /** 领取单张卡片（统一入口：先 DAPI → 再网页通道 → 一律用 DAPI 复核是否真的加分）。
+        /** 领取单张卡片（统一入口：先网页通道 → 网页完成不了再换 DAPI → 一律用服务端状态复核是否真的加分）。
          *  服务端可能要 1~3 分钟才把上报记入 progress，单次失败不等于真失败，故做多轮重试。
          */
         async claimCard(card, opts = {}) {
@@ -2538,7 +2540,7 @@ const __scBgKeepAlive = (function() {
                     Utils.log("⏳", `等待 ${Math.round(lo / 1000)}~${Math.round(hi / 1000)} 秒后重试（第 ${i + 1}/${attempts} 次）：${name}`);
                     await Utils.randomDelay(lo, hi);
                 }
-                const ok = await this._claimCardOnce(card, { skipWeb: i === 0, diag });
+                const ok = await this._claimCardOnce(card, { diag });
                 if (ok) return true;
             }
 
@@ -2546,7 +2548,10 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
-        // 单次领取尝试：访问目的地（urlreward 产生进度的真实机制）→ DAPI 上报 → 服务端复核
+        // 单次领取尝试：访问目的地（urlreward 产生进度的真实机制）→ 网页通道 → DAPI 兜底 → 服务端复核
+        // 通道顺序与 user.js 对齐：网页 Server Action 优先，网页确实完成不了才换 DAPI。
+        // 没有 Cookie/未登录时网页通道必然失败（见 claimCardWeb 的 401 快退），会立刻落到 DAPI：
+        // DAPI 用 Bearer Token 鉴权，不依赖浏览器 Cookie，所以「没 Cookie 也能完成」。
         async _claimCardOnce(card, { skipWeb = false, diag = [] } = {}) {
             const offerId = card.offerId;
             const name = card.title || offerId;
@@ -2569,7 +2574,38 @@ const __scBgKeepAlive = (function() {
                 await Utils.randomDelay(1500, 3000);
             }
 
-            // 首选 DAPI 通道（Bearer Token 鉴权，不使用浏览器 Cookie，跨浏览器一致）
+            // ---------- 1) 网页通道（优先） ----------
+            if (!skipWeb && card.hash && !RewardsAuto.state.webNoAuth) {
+                let webAccepted = false;
+                try {
+                    webAccepted = await this.claimCardWeb(card);
+                } catch (e) {
+                    diag.push(`web(${e.message})`);
+                    // 401/403 = 网页通道登录态不可用（典型情况就是没有 Cookie）。
+                    // 记下来，后续卡片不再白发网页请求，直接走 DAPI。
+                    if (/\b(401|403)\b/.test(String(e.message)) && !RewardsAuto.state.webNoAuth) {
+                        RewardsAuto.state.webNoAuth = true;
+                        Utils.log("🟡", `网页通道未登录或无权限（${e.message}），后续卡片改用 DAPI 通道`);
+                    }
+                }
+                if (webAccepted) {
+                    await Utils.randomDelay(2000, 4000);
+                    if (await this.isOfferComplete(offerId, true) === true) {
+                        Utils.log("🟢", `网页通道领取成功：${name}`);
+                        return true;
+                    }
+                    diag.push("web(已发出但服务端未生效)");
+                } else {
+                    diag.push("web(请求未被接受)");
+                }
+            } else if (!skipWeb && !card.hash) {
+                // DAPI 发现的日常卡没有 hash（网页通道拿不到交卷标识），直接走 DAPI
+                diag.push("web(无hash)");
+            } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
+                diag.push("web(未登录跳过)");
+            }
+
+            // ---------- 2) DAPI 兜底（Bearer Token 鉴权，不使用浏览器 Cookie，跨浏览器一致） ----------
             const appRes = await this.appActivity(101, offerId);
             if (appRes) {
                 diag.push(`dapi(p=${appRes.points}${appRes.isDuplicate ? ",dup" : ""})`);
@@ -2584,32 +2620,6 @@ const __scBgKeepAlive = (function() {
             if (await this.isOfferComplete(offerId, true) === true) {
                 Utils.log("🟢", `DAPI 上报已生效：${name}`);
                 return true;
-            }
-
-            if (skipWeb) return false;
-
-            // DAPI 发现出来的日常卡没有 hash（网页通道拿不到交卷标识），跳过网页通道，只靠 DAPI 复核
-            if (!card.hash) {
-                diag.push("web(无hash)");
-                return false;
-            }
-
-            // 网页通道（Server Action / api/reportactivity / 目的地访问）
-            let webAccepted = false;
-            try {
-                webAccepted = await this.claimCardWeb(card);
-            } catch (e) {
-                diag.push(`web(${e.message})`);
-            }
-            if (webAccepted) {
-                await Utils.randomDelay(2500, 5000);
-                if (await this.isOfferComplete(offerId, true) === true) {
-                    Utils.log("🟢", `网页通道领取成功：${name}`);
-                    return true;
-                }
-                diag.push("web(已发出但服务端未生效)");
-            } else {
-                diag.push("web(请求未被接受)");
             }
             return false;
         },
@@ -2650,6 +2660,15 @@ const __scBgKeepAlive = (function() {
                     return true;
                 }
             } catch (e2) {
+                // 未登录 / 无 Cookie：网页通道再怎么重试也不会成功，当轮直接把机会让给 DAPI
+                // （DAPI 用 Bearer Token 鉴权，不依赖 Cookie，所以没 Cookie 也能把卡做完）
+                if (/\b(401|403)\b/.test(String(e2.message))) {
+                    if (!RewardsAuto.state.webNoAuth) {
+                        RewardsAuto.state.webNoAuth = true;
+                        Utils.log("🟡", `网页通道未登录或无权限（${e2.message}），后续卡片改用 DAPI 通道`);
+                    }
+                    return false;
+                }
                 if (e2.message.includes("404")) {
                     Utils.log("🟡", "Server Action ID 可能已更新，尝试动态探测...");
                     try {
@@ -3869,6 +3888,7 @@ const __scBgKeepAlive = (function() {
                 this.promosTimes = 0;
                 RewardsAuto.state.lockedCount = 0;
                 RewardsAuto.state.lockedPoints = 0;
+                RewardsAuto.state.webNoAuth = false;
                 RewardsAuto.state.startTime = Utils.getTimestamp();
                 Utils.log("🚀", "启动全能自动化任务...");
                 this.init();
