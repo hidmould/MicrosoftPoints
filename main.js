@@ -154,6 +154,14 @@ const __scBgKeepAlive = (function() {
                 streakCounter: "Gamification_Streak_Counter_Promotion",
             }
         },
+        /* 请求头里该带哪个地区：锁定国区时恒为 cn，未锁定时用出口检测出来的地区。
+         * 以前这行判断在 5 个请求里各写一遍，口径一改就得改 5 处。 */
+        region(fallback = "us") {
+            if (GM_getValue("Config.lock", true)) return "cn";
+            const r = String(this.state.region || "").toLowerCase().trim();
+            return r || fallback;
+        },
+
         searchPool: [
             "what is the weather forecast tomorrow",
             "how do I make sourdough bread at home",
@@ -422,80 +430,36 @@ const __scBgKeepAlive = (function() {
         MAX_EXTRA_ROUNDS: 3,                         // 次数报够但服务端没确认时，整体重来的轮数上限
     };
 
-    const Webhooks = [
-        {
-            name: "企业微信",
-            url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
-            key: GM_getValue("Notice.wework", false),
-            msg: {
-                "msgtype": "text",
-                "text": {
-                    get content() {
-                        return `> ${new Date().toLocaleString()}\n\n ## ${GM_info.script.name}\n ${RewardsAuto.state.sendMSG}`
-                    }
-                },
-            },
-        },
-        {
-            name: "钉钉",
-            url: "https://oapi.dingtalk.com/robot/send?access_token=",
-            key: GM_getValue("Notice.dingding", false),
-            msg: {
-                "msgtype": "markdown",
-                "markdown": {
-                    "title": GM_info.script.name,
-                    get text() {
-                        return `> ${new Date().toLocaleString()}\n ### ${GM_info.script.name}\n ${RewardsAuto.state.sendMSG}`
-                    }
-                },
-            },
-        },
-        {
-            name: "飞书",
-            url: "https://open.feishu.cn/open-apis/bot/v2/hook/",
-            key: GM_getValue("Notice.feishu", false),
-            msg: {
+    /* 5 个推送平台的差异只有：名字、Webhook 地址、开关键名、请求体结构。
+     * 以前是 5 段几乎逐字相同的对象（各带 getter），加一个平台要抄 15 行；
+     * 这里只留「平台定义 + body 模板」，msg 改成取值时才拼的 getter，
+     * 语义与原来的 getter 完全一致（每次序列化都读最新的时间与结算文本）。 */
+    const WEBHOOK_PLATFORMS = [
+        { name: "企业微信", url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=", config: "Notice.wework",
+            body: (time, text) => ({ "msgtype": "text", "text": { "content": `> ${time}\n\n ## ${GM_info.script.name}\n ${text}` } }) },
+        { name: "钉钉", url: "https://oapi.dingtalk.com/robot/send?access_token=", config: "Notice.dingding",
+            body: (time, text) => ({ "msgtype": "markdown", "markdown": { "title": GM_info.script.name, "text": `> ${time}\n ### ${GM_info.script.name}\n ${text}` } }) },
+        { name: "飞书", url: "https://open.feishu.cn/open-apis/bot/v2/hook/", config: "Notice.feishu",
+            body: (time, text) => ({
                 "msg_type": "interactive",
                 "card": {
                     "schema": "2.0",
-                    "header": {
-                        "title": { "tag": "plain_text", "content": GM_info.script.name },
-                        "template": "orange"
-                    },
-                    "body": {
-                        "elements": [{
-                            "tag": "markdown",
-                            "text_align": "center",
-                            get content() {
-                                return `#### ${new Date().toLocaleString()}\n ${RewardsAuto.state.sendMSG}`
-                            }
-                        }]
-                    }
+                    "header": { "title": { "tag": "plain_text", "content": GM_info.script.name }, "template": "orange" },
+                    "body": { "elements": [{ "tag": "markdown", "text_align": "center", "content": `#### ${time}\n ${text}` }] }
                 }
-            },
-        },
-        {
-            name: "PushMe",
-            url: "https://push.i-i.me/?push_key=",
-            key: GM_getValue("Notice.pushme", false),
-            msg: {
-                "type": "markdown",
-                "title": `${GM_info.script.name}[#rewards!https://rewards.bing.com/rewards.png]`,
-                get content() { return `\n ${RewardsAuto.state.sendMSG}` }
-            },
-        },
-        {
-            name: "Bark",
-            url: "https://api.day.app/",
-            key: GM_getValue("Notice.bark", false),
-            msg: {
-                "group": "rewards",
-                "icon": "https://rewards.bing.com/rewards.png",
-                "title": GM_info.script.name,
-                get markdown() { return `\n ${RewardsAuto.state.sendMSG}` }
-            },
-        },
+            }) },
+        { name: "PushMe", url: "https://push.i-i.me/?push_key=", config: "Notice.pushme",
+            body: (time, text) => ({ "type": "markdown", "title": `${GM_info.script.name}[#rewards!https://rewards.bing.com/rewards.png]`, "content": `\n ${text}` }) },
+        { name: "Bark", url: "https://api.day.app/", config: "Notice.bark",
+            body: (time, text) => ({ "group": "rewards", "icon": "https://rewards.bing.com/rewards.png", "title": GM_info.script.name, "markdown": `\n ${text}` }) },
     ];
+
+    const Webhooks = WEBHOOK_PLATFORMS.map(p => ({
+        name: p.name,
+        url: p.url,
+        key: GM_getValue(p.config, false),
+        get msg() { return p.body(new Date().toLocaleString(), RewardsAuto.state.sendMSG); }
+    }));
 
     const Utils = {
         log(icon, msg, push = false) {
@@ -686,6 +650,43 @@ const __scBgKeepAlive = (function() {
             try { const j = JSON.parse(s); return Array.isArray(j) || (typeof j === "object" && j !== null); }
             catch { return false; }
         },
+
+        /* 解析 JSON 字符串，非 JSON / null / 标量一律 null。
+         * 以前全脚本 15 处都是「先 isJSON 再 JSON.parse」，同一个判断写两遍。 */
+        parseJSON(s) {
+            if (typeof s !== "string" || !s) return null;
+            try {
+                const j = JSON.parse(s);
+                return (typeof j === "object" && j !== null) ? j : null;
+            } catch { return null; }
+        },
+
+        /* DAPI 请求头（App 通道 / Edge 通道）。
+         * 以前这套头在 7 个请求里逐字复制，字段一改要改 7 遍才不出错。
+         * kind="app"：BingSapphire App 通道；kind="edge"：Edge 桌面通道（appid/partnerid 与语言都不同）。
+         * extra 用来追加/覆盖个别请求的额外头（signApp 的 partnerid、flights）。 */
+        appHeaders(token, { kind = "app", country, extra } = {}) {
+            const cc = country || RewardsAuto.region();
+            const base = kind === "edge" ? {
+                "accept": "*/*",
+                "content-type": "application/json; charset=UTF-8",
+                "user-agent": RewardsAuto.ua.edge,
+                "authorization": `Bearer ${token}`,
+                "x-rewards-appid": "EdgeDesktop",
+                "x-rewards-partnerid": "EdgeHub",
+                "x-rewards-country": cc,
+                "x-rewards-language": cc === "cn" ? "zh-CN" : "en-US",
+            } : {
+                "content-type": "application/json; charset=UTF-8",
+                "user-agent": RewardsAuto.ua.app,
+                "authorization": `Bearer ${token}`,
+                "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
+                "x-rewards-ismobile": "true",
+                "x-rewards-country": cc,
+                "x-rewards-language": "zh",
+            };
+            return extra ? Object.assign(base, extra) : base;
+        },
         delay(ms) { return new Promise(r => setTimeout(r, ms)); },
         randomDelay(min = 3000, max = 8000) { return this.delay(this.randomRange(min, max)); },
         waitForElement(selector, timeout = 30000) {
@@ -801,109 +802,96 @@ const __scBgKeepAlive = (function() {
         // 机房 / VPS / 公共代理的 ASN 关键词：家宽运营商（电信/联通/移动/Comcast…）不会命中
         HOSTING_RE: /cloudflare|digitalocean|vultr|linode|akamai|fastly|amazon|aws|google\s*cloud|azure|alibaba|aliyun|alicloud|tencent\s*cloud|qcloud|huawei\s*cloud|hetzner|ovh|leaseweb|contabo|hostwinds|hostinger|racknerd|colocrossing|sharktech|psychz|choopa|m247|datacamp|zenlayer|layerstack|gcore|oracle\s*cloud|\bvpn\b|\bproxy\b|tor\s*exit|ipvanish|nordvpn|expressvpn|surfshark|mullvad/i,
 
-        /* 微软侧：不带 Cookie，问 Bing「你看到的我是哪国」。
-         * 大陆出口会被 302 到 cn.bing.com，那一页没有 RevIpCC，但有只在 cn.bing.com 出现的标记
-         * （「国内版 / 国际版」切换、京ICP备号），据此也能确定「微软看到的我是 CN」。 */
-        async _probeBing() {
-            const html = await Utils.xhr({
-                url: `https://www.bing.com/?_=${Date.now()}`,
-                anonymous: true,   // 关键：不带 Cookie，否则 cc=Cn 会被 Bing 沿用
-                timeout: this.PROBE_TIMEOUT,
-                headers: { "accept-language": "zh-CN,zh;q=0.9", "cache-control": "no-cache" }
-            });
-            const text = String(html || "");
-            const flat = text.replace(/\s/g, "");
-            const ipcc = flat.match(/RevIpCC:"([A-Za-z]{2})"/);
-            const region = flat.match(/Region:"([A-Za-z]{2})"/);
-            let cc = ipcc ? ipcc[1] : (region ? region[1] : "");
-            if (!cc && this.CN_PAGE_RE.test(text)) cc = "CN";
-            if (!cc) throw new Error("首页未返回地区标记");
-            return { src: "bing", cc: cc.toUpperCase(), ip: "", org: "" };
-        },
-
         // 只在 cn.bing.com 首页出现的特征：看到它就能断定「微软把我当大陆」。
         // 注意：这里刻意用整个 HTML 而非去空白版，中文标记不能被 \s 吃掉。
         CN_PAGE_RE: /cn\.bing\.com|京ICP备|beian\.miit\.gov\.cn|国内版<\/a>|国内版/,
 
-        async _probeCloudflare() {
-            const txt = await Utils.xhr({
-                url: `https://www.cloudflare.com/cdn-cgi/trace?_=${Date.now()}`,
-                anonymous: true,
-                timeout: this.PROBE_TIMEOUT
-            });
-            const kv = {};
-            String(txt || "").split("\n").forEach(line => {
-                const i = line.indexOf("=");
-                if (i > 0) kv[line.slice(0, i).trim()] = line.slice(i + 1).trim();
-            });
-            if (!kv.loc) throw new Error("trace 格式异常");
-            return {
+        /* 5 路探测：微软侧 + 第三方 IP 库。差异只有「地址、请求头、怎么解析」，
+         * 骨架统一在 _probeAll（匿名取数、超时、失败兜底），再加一路只要往这里加一条。 */
+        PROBES: [
+            {   // 微软侧：不带 Cookie，问 Bing「你看到的我是哪国」。大陆出口会被 302 到 cn.bing.com，
+                // 那一页没有 RevIpCC，但有只在 cn.bing.com 出现的标记（版本切换、京ICP备号）
+                src: "bing",
+                url: () => `https://www.bing.com/?_=${Date.now()}`,
+                headers: { "accept-language": "zh-CN,zh;q=0.9", "cache-control": "no-cache" },
+                parse: (txt, g) => {
+                    const text = String(txt || "");
+                    const flat = text.replace(/\s/g, "");
+                    const ipcc = flat.match(/RevIpCC:"([A-Za-z]{2})"/);
+                    const region = flat.match(/Region:"([A-Za-z]{2})"/);
+                    let cc = ipcc ? ipcc[1] : (region ? region[1] : "");
+                    if (!cc && g.CN_PAGE_RE.test(text)) cc = "CN";
+                    if (!cc) throw new Error("首页未返回地区标记");
+                    return { cc: cc.toUpperCase(), ip: "", org: "" };
+                }
+            },
+            {
                 src: "cloudflare",
-                cc: String(kv.loc).toUpperCase(),
-                ip: kv.ip || "",
-                org: "",
-                warp: kv.warp === "on"
-            };
-        },
-
-        async _probeIpinfo() {
-            const txt = await Utils.xhr({
-                url: `https://ipinfo.io/json?_=${Date.now()}`,
-                anonymous: true,
-                timeout: this.PROBE_TIMEOUT
-            });
-            const d = JSON.parse(txt);
-            if (!d || !d.country) throw new Error(String((d && (d.error || d.message)) || "无 country 字段"));
-            return { src: "ipinfo", cc: String(d.country).toUpperCase(), ip: d.ip || "", org: d.org || "" };
-        },
-
-        async _probeIpSb() {
-            const txt = await Utils.xhr({
-                url: `https://api.ip.sb/geoip?_=${Date.now()}`,
-                anonymous: true,
-                timeout: this.PROBE_TIMEOUT
-            });
-            const d = JSON.parse(txt);
-            if (!d || !d.country_code) throw new Error("无 country_code 字段");
-            return {
+                url: () => `https://www.cloudflare.com/cdn-cgi/trace?_=${Date.now()}`,
+                parse: txt => {
+                    const kv = {};
+                    String(txt || "").split("\n").forEach(line => {
+                        const i = line.indexOf("=");
+                        if (i > 0) kv[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+                    });
+                    if (!kv.loc) throw new Error("trace 格式异常");
+                    return { cc: String(kv.loc).toUpperCase(), ip: kv.ip || "", org: "", warp: kv.warp === "on" };
+                }
+            },
+            {
+                src: "ipinfo",
+                url: () => `https://ipinfo.io/json?_=${Date.now()}`,
+                parse: txt => {
+                    const d = JSON.parse(txt);
+                    if (!d || !d.country) throw new Error(String((d && (d.error || d.message)) || "无 country 字段"));
+                    return { cc: String(d.country).toUpperCase(), ip: d.ip || "", org: d.org || "" };
+                }
+            },
+            {
                 src: "ip.sb",
-                cc: String(d.country_code).toUpperCase(),
-                ip: d.ip || "",
-                org: [d.isp, d.organization, d.asn_organization].filter(Boolean).join(" ")
-            };
-        },
-
-        /* 腾讯 IP 库：境内出口一定以「中国」开头，境外是「美国 加利福尼亚 …」这种 */
-        async _probeTencent() {
-            const txt = await Utils.xhr({
-                url: "https://disp-qryapi.3g.qq.com/v1/dispatch",
-                headers: { referer: "https://3g.qq.com/" },
-                timeout: this.PROBE_TIMEOUT
-            });
-            const d = JSON.parse(txt);
-            if (!d || d.code != 0) throw new Error("dispatch 返回异常");
-            return {
+                url: () => `https://api.ip.sb/geoip?_=${Date.now()}`,
+                parse: txt => {
+                    const d = JSON.parse(txt);
+                    if (!d || !d.country_code) throw new Error("无 country_code 字段");
+                    return {
+                        cc: String(d.country_code).toUpperCase(),
+                        ip: d.ip || "",
+                        org: [d.isp, d.organization, d.asn_organization].filter(Boolean).join(" ")
+                    };
+                }
+            },
+            {   // 腾讯 IP 库：境内出口一定以「中国」开头，境外是「美国 加利福尼亚 …」这种。
+                // 这一路历来不匿名（带 Cookie），与上面几路不同，保持原样
                 src: "tencent",
-                cc: "",
-                ip: (d.extra && d.extra.ip) || "",
-                org: "",
-                cnText: String(d.ipInfo || "").replace(/[#*]+/g, " ").trim()
-            };
-        },
+                url: () => "https://disp-qryapi.3g.qq.com/v1/dispatch",
+                headers: { referer: "https://3g.qq.com/" },
+                anonymous: false,
+                parse: txt => {
+                    const d = JSON.parse(txt);
+                    if (!d || d.code != 0) throw new Error("dispatch 返回异常");
+                    return {
+                        cc: "",
+                        ip: (d.extra && d.extra.ip) || "",
+                        org: "",
+                        cnText: String(d.ipInfo || "").replace(/[#*]+/g, " ").trim()
+                    };
+                }
+            },
+        ],
 
         async _probeAll() {
-            const jobs = [
-                ["bing", () => this._probeBing()],
-                ["cloudflare", () => this._probeCloudflare()],
-                ["ipinfo", () => this._probeIpinfo()],
-                ["ip.sb", () => this._probeIpSb()],
-                ["tencent", () => this._probeTencent()]
-            ];
-            return await Promise.all(jobs.map(async ([src, fn]) => {
+            return await Promise.all(this.PROBES.map(async p => {
                 try {
-                    return await fn();
+                    const txt = await Utils.xhr({
+                        url: p.url(),
+                        headers: p.headers,
+                        // 关键：默认不带 Cookie，否则 cc=Cn 会被 Bing 沿用
+                        anonymous: p.anonymous !== false,
+                        timeout: this.PROBE_TIMEOUT
+                    });
+                    return Object.assign({ src: p.src, cc: "", ip: "", org: "" }, p.parse(txt, this));
                 } catch (e) {
-                    return { src, error: e instanceof Error ? e : new Error(String(e)), cc: "", ip: "", org: "" };
+                    return { src: p.src, error: e instanceof Error ? e : new Error(String(e)), cc: "", ip: "", org: "" };
                 }
             }));
         },
@@ -1609,22 +1597,15 @@ const __scBgKeepAlive = (function() {
         },
 
         async signApp() {
-            const region = GM_getValue("Config.lock", true) ? "cn" : RewardsAuto.state.region.toLowerCase();
+            const region = RewardsAuto.region();
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     method: "POST",
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me/activities",
-                    headers: {
-                        "content-type": "application/json; charset=UTF-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": region,
-                        "x-rewards-language": "zh",
-                        "x-rewards-partnerid": "startapp",
-                        "x-rewards-flights": "rwgobig"
-                    },
+                    headers: Utils.appHeaders(token, {
+                        country: region,
+                        extra: { "x-rewards-partnerid": "startapp", "x-rewards-flights": "rwgobig" }
+                    }),
                     data: JSON.stringify({
                         amount: 1, id: Utils.getRandomUUID().replace(/-/g, '') + Utils.getRandomUUID().replace(/-/g, '').slice(0, 24),
                         type: 103, country: region, channel: RewardsAuto.appConfig.channel
@@ -1762,7 +1743,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async appActivity(type, offerid) {
-            const region = GM_getValue("Config.lock", true) ? "cn" : RewardsAuto.state.region.toLowerCase();
+            const region = RewardsAuto.region();
             const body = {
                 amount: 1, country: region,
                 id: Utils.getRandomUUID().replace(/-/g, '') + Utils.getRandomUUID().replace(/-/g, '').slice(0, 24),
@@ -1773,15 +1754,7 @@ const __scBgKeepAlive = (function() {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     method: "POST",
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me/activities",
-                    headers: {
-                        "content-type": "application/json; charset=utf-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": region,
-                        "x-rewards-language": "zh"
-                    },
+                    headers: Utils.appHeaders(token, { country: region }),
                     data: JSON.stringify(body)
                 }));
                 if (Utils.isJSON(res)) {
@@ -1802,15 +1775,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613",
-                    headers: {
-                        "content-type": "application/json; charset=UTF-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": "cn",
-                        "x-rewards-language": "zh"
-                    }
+                    headers: Utils.appHeaders(token, { country: "cn" })
                 }));
                 if (Utils.isJSON(res)) {
                     const promos = JSON.parse(res).response?.promotions || [];
@@ -1842,23 +1807,12 @@ const __scBgKeepAlive = (function() {
          * 两次间隔小于 report_per_minutes 会被判重（response.isDuplicate=true，不计次）。
          */
         edgeRegion() {
-            if (GM_getValue("Config.lock", true)) return "cn";
-            const region = String(RewardsAuto.state.region || "us").toLowerCase();
-            return region || "us";
+            return RewardsAuto.region("us");
         },
 
+        // 薄封装：Edge 专用头统一由 Utils.appHeaders(kind:"edge") 拼装
         _edgeHeaders(region, token) {
-            const country = region || this.edgeRegion();
-            return {
-                "accept": "*/*",
-                "content-type": "application/json; charset=UTF-8",
-                "user-agent": RewardsAuto.ua.edge,
-                "authorization": `Bearer ${token}`,
-                "x-rewards-appid": "EdgeDesktop",
-                "x-rewards-partnerid": "EdgeHub",
-                "x-rewards-country": country,
-                "x-rewards-language": country === "cn" ? "zh-CN" : "en-US",
-            };
+            return Utils.appHeaders(token, { kind: "edge", country: region || this.edgeRegion() });
         },
 
         // Profile,Promotions：一次拿到账号档案 + 全部 promotion（含 Edge 连签那一项）
@@ -1972,15 +1926,8 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: RewardsAuto.appConfig.dapiMeUrl,
-                    headers: {
-                        "content-type": "application/json; charset=UTF-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": GM_getValue("Config.lock", true) ? "cn" : "us",
-                        "x-rewards-language": "zh"
-                    }
+                    // 这里一直固定按站点默认区（未解锁时 cn，解锁后 us）取，和别的请求用真实出口地区不同，保持原样
+                    headers: Utils.appHeaders(token, { country: GM_getValue("Config.lock", true) ? "cn" : "us" })
                 }));
                 if (Utils.isJSON(res)) {
                     const list = JSON.parse(res).response?.promotions || [];
@@ -2151,15 +2098,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613",
-                    headers: {
-                        "content-type": "application/json; charset=UTF-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": "cn",
-                        "x-rewards-language": "zh"
-                    }
+                    headers: Utils.appHeaders(token, { country: "cn" })
                 }));
                 if (Utils.isJSON(res)) {
                     const data = JSON.parse(res);
@@ -2213,15 +2152,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=105",
-                    headers: {
-                        "content-type": "application/json; charset=UTF-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": "cn",
-                        "x-rewards-language": "zh"
-                    }
+                    headers: Utils.appHeaders(token, { country: "cn" })
                 }));
                 if (Utils.isJSON(res)) {
                     const data = JSON.parse(res);
@@ -2246,21 +2177,13 @@ const __scBgKeepAlive = (function() {
         },
 
         async doRead() {
-            const region = GM_getValue("Config.lock", true) ? "cn" : RewardsAuto.state.region.toLowerCase();
+            const region = RewardsAuto.region();
             try {
                 const id = Utils.getRandomUUID().replace(/-/g, '') + Utils.getRandomUUID().replace(/-/g, '').slice(0, 24);
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     method: "POST",
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me/activities",
-                    headers: {
-                        "content-type": "application/json; charset=utf-8",
-                        "user-agent": RewardsAuto.ua.app,
-                        "authorization": `Bearer ${token}`,
-                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                        "x-rewards-ismobile": "true",
-                        "x-rewards-country": region,
-                        "x-rewards-language": "zh"
-                    },
+                    headers: Utils.appHeaders(token, { country: region }),
                     data: JSON.stringify({
                         amount: 1, country: region, id: id, type: 101,
                         attributes: { offerid: RewardsAuto.appConfig.offerIds.readArticle }
@@ -2275,6 +2198,32 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔴", `阅读请求失败: ${e.message}`);
                 return false;
             }
+        },
+
+        /* Next.js RSC 的 flight 数据：页面把 props 切成若干 __next_f.push([n,"…"]) 片段，
+         * 拼起来才是完整文本；没有片段时退化成去掉转义的整页 HTML。 */
+        _flightText(html) {
+            const chunks = [];
+            const pushRegex = /self\.__next_f\.push\(\[\d+,\s*"(.*?)"\]\)/gs;
+            let m;
+            while ((m = pushRegex.exec(html)) !== null) {
+                try { chunks.push(JSON.parse(`"${m[1]}"`)); } catch (_) {}
+            }
+            return chunks.length > 0 ? chunks.join("") : String(html).replace(/\\"/g, '"');
+        },
+
+        /* flight 文本里逐个抓 offerId 对象：$undefined / $D… 是 flight 的占位符，
+         * 不是合法 JSON，先替换成 null 才能 parse。 */
+        _flightItems(text, idPattern = "[^\"]+") {
+            const items = [];
+            const re = new RegExp('\\{[^{}]*?"offerId"\\s*:\\s*"' + idPattern + '"[^{}]*?\\}', "g");
+            let m;
+            while ((m = re.exec(text)) !== null) {
+                try {
+                    items.push(JSON.parse(m[0].replace(/:\$undefined/g, ":null").replace(/:\$D[^\",}]+/g, ":null")));
+                } catch (_) {}
+            }
+            return items;
         },
 
         async discoverCards() {
@@ -2393,39 +2342,23 @@ const __scBgKeepAlive = (function() {
 
                 // --- [Next.js Flight Chunks & DAPI parsing] ---
                 try {
-                    const chunks = [];
-                    const pushRegex = /self\.__next_f\.push\(\[\d+,\s*"(.*?)"\]\)/gs;
-                    let mFlight;
-                    while ((mFlight = pushRegex.exec(html)) !== null) {
-                        try {
-                            const unescaped = JSON.parse(`"${mFlight[1]}"`);
-                            chunks.push(unescaped);
-                        } catch (_) {}
-                    }
-                    const fullFlightText = chunks.length > 0 ? chunks.join("") : html.replace(/\\"/g, '"');
-                    const offerObjRegex = /\{[^{}]*?"offerId"\s*:\s*"([^"]+)"[^{}]*?\}/g;
-                    let om;
-                    while ((om = offerObjRegex.exec(fullFlightText)) !== null) {
-                        try {
-                            const jsonStr = om[0].replace(/:\$undefined/g, ":null").replace(/:\$D[^\",}]+/g, ":null");
-                            const item = JSON.parse(jsonStr);
-                            if (!item.offerId || !item.hash) continue;
-                            if (item.isCompleted === true || item.hidden === true) continue;
-                            // isLocked 不再一刀切：先按 isLocked/isUnlocked/unlockCriteria 语义判定，
-                            // 已解锁卡（isLocked:false + isUnlocked:true）不会再被误判成锁卡
-                            if (noteLock(item, Number(item.points || 0))) continue;
-                            const points = Number(item.points || 0);
-                            if (points <= 0 && !item.offerId.includes("DailySet")) continue;
-                            pushCard({
-                                title: item.title || item.name || item.offerId,
-                                points: points || 10,
-                                offerId: item.offerId,
-                                hash: item.hash,
-                                kind: inferKind(item.offerId, item.title || ""),
-                                destination: item.destination || item.destinationUrl || "",
-                                url: "https://rewards.bing.com/earn"
-                            });
-                        } catch (_) {}
+                    for (const item of this._flightItems(this._flightText(html))) {
+                        if (!item.offerId || !item.hash) continue;
+                        if (item.isCompleted === true || item.hidden === true) continue;
+                        // isLocked 不再一刀切：先按 isLocked/isUnlocked/unlockCriteria 语义判定，
+                        // 已解锁卡（isLocked:false + isUnlocked:true）不会再被误判成锁卡
+                        if (noteLock(item, Number(item.points || 0))) continue;
+                        const points = Number(item.points || 0);
+                        if (points <= 0 && !item.offerId.includes("DailySet")) continue;
+                        pushCard({
+                            title: item.title || item.name || item.offerId,
+                            points: points || 10,
+                            offerId: item.offerId,
+                            hash: item.hash,
+                            kind: inferKind(item.offerId, item.title || ""),
+                            destination: item.destination || item.destinationUrl || "",
+                            url: "https://rewards.bing.com/earn"
+                        });
                     }
                 } catch (e) {
                     Utils.log("🟡", `Flight 数据解析异常: ${e.message}`);
@@ -2466,32 +2399,20 @@ const __scBgKeepAlive = (function() {
                             headers: RewardsAuto.desktopAppHeaders
                         });
                         if (questHtml) {
-                            const qChunks = [];
-                            const qPushRegex = /self\.__next_f\.push\(\[\d+,\s*"(.*?)"\]\)/gs;
-                            let qm;
-                            while ((qm = qPushRegex.exec(questHtml)) !== null) {
-                                try { qChunks.push(JSON.parse(`"${qm[1]}"`)); } catch (_) {}
-                            }
-                            const qText = qChunks.length > 0 ? qChunks.join("") : questHtml.replace(/\\"/g, '"');
-                            const qOfferRegex = /\{[^{}]*?"offerId"\s*:\s*"(WW_pcchild\d+[^"]+)"[^{}]*?\}/g;
-                            let qo;
-                            while ((qo = qOfferRegex.exec(qText)) !== null) {
-                                try {
-                                    const qItem = JSON.parse(qo[0].replace(/:\$undefined/g, ":null").replace(/:\$D[^\",}]+/g, ":null"));
-                                    const qLock = CardLock.probe(qItem);
-                                    if (qItem.offerId && qItem.hash && !qLock.locked && qItem.isCompleted !== true) {
-                                        Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
-                                        pushCard({
-                                            title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
-                                            points: 10,
-                                            offerId: qItem.offerId,
-                                            hash: qItem.hash,
-                                            kind: "desktop_app",
-                                            destination: qItem.destination || qItem.href || "",
-                                            url: "https://rewards.bing.com/earn"
-                                        });
-                                    }
-                                } catch (_) {}
+                            for (const qItem of this._flightItems(this._flightText(questHtml), "WW_pcchild\\d+[^\"]+")) {
+                                const qLock = CardLock.probe(qItem);
+                                if (qItem.offerId && qItem.hash && !qLock.locked && qItem.isCompleted !== true) {
+                                    Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
+                                    pushCard({
+                                        title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
+                                        points: 10,
+                                        offerId: qItem.offerId,
+                                        hash: qItem.hash,
+                                        kind: "desktop_app",
+                                        destination: qItem.destination || qItem.href || "",
+                                        url: "https://rewards.bing.com/earn"
+                                    });
+                                }
                             }
                         }
                     }
@@ -4051,18 +3972,15 @@ const __scBgKeepAlive = (function() {
                         return false;
                     }
                 };
+                await withRetry(() => this.doSign(), "签到");
+                await Utils.randomDelay();
                 if (isTokenOK) {
-                    await withRetry(() => this.doSign(), "签到");
-                    await Utils.randomDelay();
                     // 阅读走 App/DAPI 通道（Bearer Token），与 PC 会话 Cookie 无关：
                     // 后台上下文里 PC 通道必然 401，不能用它来把关阅读任务。
                     if (RewardsAuto.state.pc401) {
                         Utils.log("🟡", "PC 会话不可用（只影响 PC 通道任务），阅读改用 App 通道继续执行");
                     }
                     await withRetry(() => this.doRead(roundDeadline), "阅读");
-                    await Utils.randomDelay();
-                } else {
-                    await withRetry(() => this.doSign(), "签到");
                     await Utils.randomDelay();
                 }
                 await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
@@ -4754,6 +4672,16 @@ const __scBgKeepAlive = (function() {
             resetSchedule: diagResetSchedule
         };
     } catch (_) {}
+
+    /* 测试挂钩：Node 回归测试加载本文件时会先在作用域里注入 __MP_TEST_HOOK__（见 tests/harness.mjs），
+     * 借此对内部纯函数（请求头拼装、出口判定、节拍器等）做单元断言。
+     * 浏览器/扩展里没有这个全局变量，typeof 判断直接跳过，不影响任何运行时行为。 */
+    if (typeof __MP_TEST_HOOK__ === "function") {
+        try {
+            __MP_TEST_HOOK__({ Utils, API, RewardsAuto, RegionGuard, Webhooks, Sched, TaskManager, Auth,
+                CardLock, SEARCH_PACER, EdgeStreak, EdgePacer, UA, EDGE });
+        } catch (_) {}
+    }
 
     if (!Utils.hasDOM()) {
         // 判定后台脚本是否还在跑，否则调度器还在转、管理页却显示「停止」。
