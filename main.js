@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.1.1
+// @version      1.1.2
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -69,6 +69,10 @@ Config:
         title: 授权码链接
         type: textarea
         description: 粘贴 login.live.com 跳转后的完整URL
+    autoAuth:
+        title: 自动检测授权码(手动运行一次，token状态无则手动授权)
+        type: checkbox
+        default: true
 Tasks:
     sign:
         title: 每日签入
@@ -132,6 +136,62 @@ const __scBgKeepAlive = (function() {
     // 授权回调页：此处只做标记，真正的「捕获授权码 → 换 Token」在脚本末尾的 Auth.handleCallback()
     const IS_OAUTH_CALLBACK = location.hostname === "login.live.com"
         && location.pathname === "/oauth20_desktop.srf";
+
+    /* ===== 授权码「早鸟快照」=====
+     * 微软现在的授权回调分成两跳：
+     *   ① GET /oauth20_desktop.srf?code=M.C5xx…&lc=2052   →  302（不是文档，脚本不会在这里执行）
+     *   ② GET /oauth20_desktop.srf?removed=true           ←  code 只留在这一跳的 Referer 请求头里
+     * 能加载脚本的只有第 ② 跳，而它的地址栏已经被换成 removed=true —— 这就是「自动捕获老是
+     * 捕不到」的根因：code 不在 location 里，只在 document.referrer（同主机所以 Referer 带完整
+     * query）。于是在 document-start 的最早时刻，把所有可能残留 code 的位置抄一份；再给
+     * history.pushState/replaceState 挂钩，页面若用 JS 洗地址也能留下痕迹。 */
+    const OAUTH_WITNESS = (() => {
+        const snapshot = { at: Date.now(), href: "", referrer: "", name: "", urls: [] };
+        const seen = new Set();
+        const maybeRecord = url => {
+            if (!url) return;
+            const s = String(url);
+            if (!/code=/i.test(s) || seen.has(s)) return;
+            seen.add(s);
+            snapshot.urls.push(s);
+            if (snapshot.urls.length > 12) snapshot.urls.shift();   // 只留最近 12 条，别把存储撑大
+        };
+        try {
+            snapshot.href = String(location.href || "");
+            maybeRecord(snapshot.href);
+        } catch (_) {}
+        try {
+            snapshot.referrer = String((typeof document !== "undefined" && document && document.referrer) || "");
+            maybeRecord(snapshot.referrer);
+        } catch (_) {}
+        try {
+            snapshot.name = String((typeof window !== "undefined" && window && window.name) || "");
+            maybeRecord(snapshot.name);
+        } catch (_) {}
+        // 挂钩子只在 login.live.com 上做，rewards/bing 页面一点多余动作都没有
+        try {
+            const host = (typeof unsafeWindow !== "undefined" && unsafeWindow)
+                ? unsafeWindow
+                : (typeof window !== "undefined" ? window : null);
+            if (host && host.location && host.location.hostname === "login.live.com" && host.history) {
+                ["pushState", "replaceState"].forEach(fnName => {
+                    const orig = host.history[fnName];
+                    if (typeof orig !== "function" || orig.__mpWitness) return;
+                    const wrapped = function (state, title, url) {
+                        try {
+                            maybeRecord(url ? new URL(String(url), host.location.href).href : host.location.href);
+                        } catch (_) {
+                            maybeRecord(url);
+                        }
+                        return orig.apply(this, arguments);
+                    };
+                    wrapped.__mpWitness = true;
+                    try { host.history[fnName] = wrapped; } catch (_) {}
+                });
+            }
+        } catch (_) {}
+        return snapshot;
+    })();
 
     const RewardsAuto = {
         // UA 不再写死版本：旧版固定 "Chrome/131 ... Edg/131.0.0.0"，用户把 Edge 升到 15x
@@ -1084,6 +1144,79 @@ const __scBgKeepAlive = (function() {
             return `${code.slice(0, 12)}…${code.slice(-6)}（${code.length} 字符）`;
         },
 
+        /** 从一串候选字符串里找 code，返回 { code, source, raw }；找不到返回 null */
+        pick(list) {
+            for (const item of list) {
+                if (!item || !item.value) continue;
+                const code = this.parseCode(item.value);
+                if (code) return { code, source: item.source, raw: String(item.value) };
+            }
+            return null;
+        },
+
+        /** 列出「可能残留 code」的所有位置，顺序即优先级：地址栏 > document.referrer > 启动快照。
+         *  deep=true 时才翻页面内容和 sessionStorage/localStorage（开销大，只在没辙时用）。
+         *  —— 之所以要这么多处：微软把 code 从地址栏抹成 ?removed=true 后，它只剩在
+         *  document.referrer（302 那一跳的 Referer）里，极少数情况下还会被内联进页面/存储。 */
+        candidates(deep) {
+            const list = [];
+            const add = (source, value) => { if (value) list.push({ source, value: String(value) }); };
+            try { add("地址栏", location.href); } catch (_) {}
+            try { add("地址栏参数", `${location.search || ""}${location.hash || ""}`); } catch (_) {}
+            /* 关键通道：302 到 ?removed=true 之后，原始跳转地址只剩在 document.referrer 里 */
+            try { add("document.referrer", typeof document !== "undefined" && document ? document.referrer : ""); } catch (_) {}
+            try {
+                const nav = (typeof performance !== "undefined" && performance.getEntriesByType)
+                    ? performance.getEntriesByType("navigation") : null;
+                if (nav && nav[0] && nav[0].name) add("navigation", nav[0].name);
+            } catch (_) {}
+            try { add("window.name", typeof window !== "undefined" ? window.name : ""); } catch (_) {}
+            if (OAUTH_WITNESS) {
+                add("启动快照(地址栏)", OAUTH_WITNESS.href);
+                add("启动快照(referrer)", OAUTH_WITNESS.referrer);
+                add("启动快照(window.name)", OAUTH_WITNESS.name);
+                (OAUTH_WITNESS.urls || []).forEach((u, i) => add(`历史 URL#${i + 1}`, u));
+            }
+            if (!deep) return list;
+            // 有些回调页会把跳转地址内联在 HTML / 存储里回显
+            try {
+                const html = (typeof document !== "undefined" && document && document.documentElement)
+                    ? String(document.documentElement.outerHTML || "") : "";
+                const m = html.match(/[^\s"'<>\\]{0,160}code=[A-Za-z0-9._~%*!$-]{20,120}[^\s"'<>\\]{0,32}/i);
+                if (m) add("页面内容", m[0]);
+            } catch (_) {}
+            for (const storeName of ["sessionStorage", "localStorage"]) {
+                try {
+                    const store = (typeof window !== "undefined" && window) ? window[storeName] : null;
+                    if (!store) continue;
+                    for (let i = 0; i < store.length && i < 40; i++) {
+                        const key = store.key(i);
+                        if (key == null) continue;
+                        const val = store.getItem(key);
+                        if (val && val.length < 4000 && /code=/i.test(val)) add(`${storeName}.${key}`, val);
+                    }
+                } catch (_) {}
+            }
+            return list;
+        },
+
+        /** 立刻在所有位置找一次授权码 */
+        collectCode(deep = false) {
+            return this.pick(this.candidates(deep));
+        },
+
+        /** 短轮询兜底：回调页有时先跳 ?removed=true，稍后内容/存储才写出来。
+         *  第一拍与每 4 拍做深度检查（HTML、存储），其余只查轻量位置，别把 CPU 烧了。 */
+        async waitForAnyCode(timeoutMs = 12000, stepMs = 500) {
+            const t0 = Date.now();
+            for (let tick = 0; Date.now() - t0 < timeoutMs; tick++) {
+                const hit = this.collectCode(tick === 0 || tick % 4 === 0);
+                if (hit) return hit;
+                await Utils.delay(stepMs);
+            }
+            return this.collectCode(true);
+        },
+
         /** 该授权码是否已经成功兑换过（授权码只保留展示，不再重复拿去换 Token） */
         used(code) {
             if (!GM_getValue("Config.codeUsed", false)) return false;
@@ -1195,11 +1328,20 @@ const __scBgKeepAlive = (function() {
                 const code = this.parseCode(c);
                 if (code) return code;
             }
-            Utils.log("🟡", `静默通道没拿到授权码（HTTP ${res.status}，最终地址 ${res.finalUrl || res.responseURL || "未知"}）`);
+            const finalUrl = res.finalUrl || res.responseURL || "";
+            if (/removed=true/i.test(finalUrl)) {
+                // 微软现在把 code 直接 302 掉：静默请求只会停在这一跳，拿不到 code，
+                // 必须靠页面通道从 Referer 里取（见 Auth.handleCallback）。
+                Utils.log("🟡", `静默通道被微软跳到了 ?removed=true（code 已被抹掉），改走页面 Referer 通道`);
+                return null;
+            }
+            Utils.log("🟡", `静默通道没拿到授权码（HTTP ${res.status}，最终地址 ${finalUrl || "未知"}）`);
             return null;
         },
 
-        /** 等待页面捕获授权码（或其它上下文直接换好了 Token） */
+        /** 等待页面捕获授权码（或其它上下文直接换好了 Token）。
+         *  原「自动打开授权页 → 在这里等 3 分钟」的逻辑已移除（脚本不再自动开标签页），
+         *  这个等待函数保留备查，当前无调用方。 */
         async waitForCode(since, timeoutMs = 180000) {
             const step = 3000;
             for (let waited = 0; waited < timeoutMs; waited += step) {
@@ -1221,41 +1363,28 @@ const __scBgKeepAlive = (function() {
             return {};
         },
 
+        /** 后台静默尝试捕获授权码。
+         *  无论「自动检测授权码」开关是开是关，都不会自动打开授权页：
+         *  开关只决定是否在后台静默发一次 authorize 请求碰碰运气，失败就只记日志（不推送通知），
+         *  交给用户点菜单「🔑 手动授权」/「📋 粘贴授权码」处理。 */
         async autoFetch(reason) {
-            Utils.log("🟡", `${reason}，尝试自动获取授权码...`);
+            if (!GM_getValue("Config.autoAuth", true)) {
+                Utils.log("🔴", `${reason}，且配置里已关闭「自动检测授权码」：请点菜单「🔑 手动授权」，登录后把跳转地址粘贴到「📋 粘贴授权码」。`);
+                return {};
+            }
+            Utils.log("🟡", `${reason}，后台静默尝试捕获授权码（不打开标签页）...`);
             const viaXhr = await this.fetchViaXhr();
             if (viaXhr) {
                 Utils.log("🟢", "自动获取授权码成功（静默通道）");
                 return { code: viaXhr };
             }
-            // 「自动授权」的设置项已从配置面板移除，行为保持原样（默认开启：没有可用 Token 时自动打开授权页）。
-            // 需要临时关掉时用 GM_setValue("Config.autoAuth", false)，恢复用 true 或删除该键。
-            if (!GM_getValue("Config.autoAuth", true)) {
-                Utils.log("🔴", "自动获取授权码失败（「自动授权」已被关闭），请点菜单「🔑 手动授权」，登录后把跳转地址粘贴到「📋 粘贴授权码」。", true);
-                return {};
-            }
-            const since = Utils.getTimestamp();
-            try {
-                GM_openInTab(this.authUrl, { active: true });
-            } catch (e) {
-                Utils.log("🔴", `无法打开授权页：${e.message}`, true);
-                return {};
-            }
-            Utils.log("🟡", "已打开微软授权页，等待授权码（最多 3 分钟；若要求登录请在页面完成登录）...");
-            const got = await this.waitForCode(since, 180000);
-            if (got.tokenReady) {
-                Utils.log("🟢", "其它上下文已完成授权，直接复用 Token");
-                return { tokenReady: true };
-            }
-            if (got.code) {
-                Utils.log("🟢", "已捕获授权码");
-                return { code: got.code };
-            }
-            Utils.log("🔴", "等待授权码超时。请点菜单「🔑 手动授权」，登录后把跳转地址粘贴到「📋 粘贴授权码」。", true);
+            Utils.log("🔴", "静默捕获授权码失败，不自动打开授权页。请点菜单「🔑 手动授权」登录：页面跳到 oauth20_desktop.srf 时脚本会自动从 Referer 捕获授权码并换 Token；也可以 F12 → 网络 → oauth20_desktop.srf?removed=true → 标头 → 请求标头 → 复制 Referer，再用「📋 粘贴授权码」粘贴。");
             return {};
         },
 
-        /** 授权回调页：捕获 code → 立刻兑换 → 通知并关闭页面 */
+        /** 授权回调页：捕获 code → 立刻兑换 → 通知并关闭页面。
+         *  注意别只看 location：微软会把 code 从地址栏抹成 ?removed=true，
+         *  真正的授权码只剩在 document.referrer（上一跳 302 的 Referer）里。 */
         async handleCallback() {
             const params = new URLSearchParams(location.search);
             const err = params.get("error");
@@ -1265,14 +1394,26 @@ const __scBgKeepAlive = (function() {
                 try { GM_notification({ title: "🔴 授权失败", text: `${err}：${desc}`, timeout: 0 }); } catch (_) {}
                 return;
             }
-            const code = this.parseCode(location.href);
-            if (!code) {
-                Utils.log("🔴", "授权回调页里没有找到 code 参数", true);
-                try { GM_notification({ title: "🔴 授权失败", text: "跳转地址里没有 code 参数", timeout: 0 }); } catch (_) {}
+            if (!params.get("code")) {
+                Utils.log("🟡", `回调地址里没有 code（${location.search || "无参数"}），改从 Referer / 启动快照里找...`);
+            }
+            // 1) 先同步抓一次（document-start 时最快的通道就是 location 与 document.referrer）
+            // 2) 没抓到再短轮询 12 秒，给「先跳 removed=true，稍后才写出内容/存储」留出余量
+            const hit = this.collectCode(false) || await this.waitForAnyCode(12000);
+            if (!hit) {
+                Utils.log("🔴", "自动捕获授权码失败：地址栏、document.referrer、启动快照里都没有 code", true);
+                try {
+                    GM_notification({
+                        title: "🔴 自动捕获授权码失败",
+                        text: "F12 → 网络 → 点 oauth20_desktop.srf?removed=true → 标头 → 请求标头 → 复制 Referer 右侧完整链接，再用「📋 粘贴授权码」",
+                        timeout: 0
+                    });
+                } catch (_) {}
                 return;
             }
-            this.save(location.href);
-            Utils.log("🟡", `已捕获授权码（${this.preview(code)}），正在换取 Token...`);
+            const code = hit.code;
+            Utils.log("🟢", `已捕获授权码（来源：${hit.source}，${this.preview(code)}），正在换取 Token...`);
+            this.save(hit.raw || code);
             const ok = await this.exchange(code);
             if (ok) {
                 try { GM_notification({ title: "🟢 授权成功", text: "Token 已保存，可以关闭此页了", timeout: 6000 }); } catch (_) {}
@@ -1282,19 +1423,45 @@ const __scBgKeepAlive = (function() {
             }
         },
 
+        /** 手动救急：在授权回调页（或任何 login.live.com 页面）当场把 Referer 里的 code
+         *  抓出来兑换。原菜单「🕵️ 捕获 Referer 里的授权码」已移除，逻辑保留备查。 */
+        async recoverFromPage() {
+            const hit = this.collectCode(true) || await this.waitForAnyCode(6000);
+            if (!hit) {
+                Utils.uiAlert(
+                    "🕵️ 没有在 Referer / 地址栏 / 页面内容里找到授权码。\n\n" +
+                    "请确认当前页就是授权跳转后的那一个（地址形如 /oauth20_desktop.srf?removed=true）。\n" +
+                    "若仍失败，按 F12 → 网络 → 点 oauth20_desktop.srf?removed=true → 标头 → 请求标头 →\n" +
+                    "复制 Referer 右侧的完整链接，再用「📋 粘贴授权码」粘贴。"
+                );
+                return false;
+            }
+            Utils.log("🟢", `从页面捕获授权码（来源：${hit.source}，${this.preview(hit.code)}），正在换取 Token...`);
+            this.save(hit.raw || hit.code);
+            const ok = await this.exchange(hit.code);
+            Utils.uiAlert(ok
+                ? "✅ 已用捕获到的授权码换取 Token 并保存。"
+                : "⚠️ 捕获到授权码，但换取 Token 失败（多半已过期或已被用过）。请重新「🔑 手动授权」。");
+            return ok;
+        },
+
         /** 粘贴流程：解析 → 保存 → 立刻兑换 → 明确告知结果 */
         async pasteFlow(input) {
             let raw = input;
             if (raw == null) {
                 raw = await Utils.uiPrompt(
                     "粘贴授权页跳转后的完整地址：\n" +
-                    "形如 https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY...&lc=2052"
+                    "形如 https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY...&lc=2052\n\n" +
+                    "如果手速不够快，地址栏发生了变化(没有code=M...=2052):\n" +
+                    "方案1：再次点击手动授权(看准时机复制地址栏内容)\n"+
+                    "方案2：手动授权 → F12 → 网络(Network) → oauth20_desktop.srf?removed=true → 标头(Headers) → 请求标头(Request headers) → Referer → 复制右侧完整链接\n"
+
                 );
                 if (raw == null) return false;
             }
             const code = this.save(raw);
             if (!code) {
-                Utils.uiAlert("❌ 没能从粘贴内容里解析出授权码。\n\n请确认复制的是授权页跳转后的完整地址（里面要带 code=），然后重新粘贴。");
+                Utils.uiAlert("❌ 没能从粘贴内容里解析出授权码。\n\n请确认复制的是授权页跳转后的完整地址（里面要带 code=），然后重新粘贴。形如:\nhttps://login.live.com/oauth20_desktop.srf?code=M.C561_BAY...&lc=2052");
                 Utils.log("🔴", `粘贴的授权码无法解析（长度 ${String(raw).trim().length}）`);
                 return false;
             }
@@ -4100,6 +4267,9 @@ const __scBgKeepAlive = (function() {
 
     // 后台 service_worker 没有 prompt，统一走 Utils.uiPrompt（无 DOM 时打开页面弹输入框）
     GM_registerMenuCommand("📋 粘贴授权码", () => { Auth.pasteFlow().catch(e => Utils.log("🔴", `粘贴授权码失败：${e.message}`)); });
+
+    // 原「🕵️ 捕获 Referer 里的授权码」菜单已移除：不再注册菜单按钮、不再弹窗，
+    // 逻辑保留在 Auth.recoverFromPage()（自动捕获仍由 Auth.handleCallback() 负责）。
 
     GM_registerMenuCommand("📊 Token状态", () => {
         const token = GM_getValue("Config.token", false);
