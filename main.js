@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.1.0
+// @version      1.1.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -4200,16 +4200,18 @@ const __scBgKeepAlive = (function() {
             .finally(() => Sched.finish(true));   // 手动跑过的这一轮也算数，顺延到下一次计划
     });
 
+    // 原「🔓 强制释放运行锁」菜单已移除：不再注册菜单按钮，
     // 万一某轮卡在「认领了但没跑完」的状态里（上下文被冻结、请求不回调等），
-    // 手动点这个可以立刻把锁和调度状态清干净，不用等 40 分钟的残留判定。
-    GM_registerMenuCommand("🔓 强制释放运行锁", () => {
+    // 需要立刻把锁和调度状态清干净（不用等 40 分钟残留判定）时，在控制台调用
+    // __MPDiagnostics.releaseLock()。
+    const diagReleaseLock = () => {
         try { Utils.releaseLock("Config.runLock"); } catch (_) {}
         try { Sched.clearClaim(); } catch (_) {}
         GM_setValue("Config.runState", null);
         TaskManager.running = false;
         TaskManager.runningSince = 0;
         Utils.log("🔓", "已强制释放运行锁并清理运行状态，下一轮可正常触发");
-    });
+    };
 
     GM_registerMenuCommand("🔔 配置通知接口", async () => {
         const configNames = [
@@ -4658,10 +4660,10 @@ const __scBgKeepAlive = (function() {
         Sched.arm(true);
     };
 
-    // 原五个诊断/操作菜单（Edge 连签状态、PC 搜索诊断、查看调度状态、重置调度计划、网络出口检测）
+    // 原六个菜单（Edge 连签状态、PC 搜索诊断、查看调度状态、重置调度计划、强制释放运行锁、网络出口检测）
     // 已从右键菜单移除。逻辑原样保留在这里，不再弹出任何提示框：需要时在控制台（脚本管理器或
     // rewards.bing.com 页面）调用 __MPDiagnostics.edgeStreak() / pcSearch() / region() / schedule() /
-    // resetSchedule()，前四个的返回值就是原来弹窗里的那段文本。
+    // resetSchedule() / releaseLock()，前四个的返回值就是原来弹窗里的那段文本。
     try {
         const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : globalThis;
         host.__MPDiagnostics = {
@@ -4669,7 +4671,8 @@ const __scBgKeepAlive = (function() {
             pcSearch: diagPcSearch,
             region: diagRegion,
             schedule: diagSchedStatus,
-            resetSchedule: diagResetSchedule
+            resetSchedule: diagResetSchedule,
+            releaseLock: diagReleaseLock
         };
     } catch (_) {}
 
