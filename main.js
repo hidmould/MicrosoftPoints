@@ -54,7 +54,7 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 搜索最小间隔（秒，脚本只会更慢不会更快）
+        title: 动作最小间隔（秒，搜索/阅读/卡片共用，脚本只会更慢不会更快）
         type: number
         default: 30
         min: 30
@@ -3215,6 +3215,11 @@ const __scBgKeepAlive = (function() {
         }
     };
 
+    /* 整轮墙钟预算：不管任务有没有全部做完，到点就交班给下一轮。
+     * 之前一轮会被 PC 搜索拖到 30 分钟以上（软预算 20 分钟 + 还在记账就延到 45 分钟），
+     * 表现就是「不按 20 分钟一轮，非要跑完才停」。 */
+    const ROUND_BUDGET_MS = 20 * 60 * 1000;
+
     /* ===== PC 搜索节拍器 =====
      * 现象：第一轮还能拿几分，之后每轮只拿一点，几十轮才凑满。
      * 两层原因：
@@ -3237,7 +3242,6 @@ const __scBgKeepAlive = (function() {
         OBSERVE_MAX: 16 * 1000,
         MAX_ATTEMPTS: 60,           // 一轮内的尝试上限（兜底）
         NO_CREDIT_LIMIT: 10 * 60 * 1000,  // 连续这么久一次都没记账 → 本轮收手
-        RECENT_CREDIT: 5 * 60 * 1000,     // 预算用完后，最近这么久还有记账就继续把这轮补满
         MIN_ATTEMPTS_BEFORE_GIVEUP: 8,    // 但至少先试够这么多次，别被两次记账延迟骗了
         GROW: 1.5,                  // 没记账：节拍放大倍数
         RETRY_GAP: 5 * 60 * 1000,   // 搜索没满时，下一轮提前多少毫秒续做
@@ -3256,6 +3260,21 @@ const __scBgKeepAlive = (function() {
         jitter(ms) {
             const v = ms * (1 + Math.random() * 0.35);
             return Math.max(5 * 1000, Math.round(v / 1000) * 1000);
+        },
+        /* 通用动作节拍：阅读、卡片这类「点一下就完事」的任务直接复用搜索这套间隔。
+         * 有进展 → 立刻回到最小间隔；没进展 → 按 GROW 放慢，封顶 MAX_MS。 */
+        nextGap(gap, progressed) {
+            return progressed ? this.startGap() : Math.min(this.MAX_MS, Math.round(gap * this.GROW));
+        },
+        /* 等一个节拍（带 0~35% 抖动，永不快于用户设的最小间隔） */
+        async beat(gap) {
+            await Utils.delay(this.jitter(gap));
+        },
+        /* 这点时间还等得起吗：等不起就把剩下的动作交给下一轮，别把整轮预算拖爆 */
+        fits(deadline, gap) {
+            const d = Number(deadline) || 0;
+            if (d <= 0) return true;
+            return Date.now() + Math.round(gap * 1.35) <= d;
         },
         // 只存「上一轮最高节拍」用于诊断；跨天自动失效
         saveGap(ms) {
@@ -3361,7 +3380,7 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async doRead() {
+        async doRead(roundDeadline) {
             if (!GM_getValue("Tasks.read", true) || this.readTimes > 2) return;
             if (this.readDate === RewardsAuto.state.dateNowNum) {
                 const verifyProgress = await API.getReadProgress();
@@ -3398,19 +3417,33 @@ const __scBgKeepAlive = (function() {
             const maxPerDay = 10;
             const target = Math.min(Math.max(Math.ceil((max - cur) / pointsPerArticle), 1), maxPerDay);
             Utils.log("📖", `今日还可阅读 ${target} 篇（上限 ${maxPerDay} 篇/天，每篇约 ${pointsPerArticle} 分）`);
+            // 阅读也是「一次只给一点」的动作，节奏直接复用 PC 搜索的节拍：
+            // 起步 30 秒，有新增积分就回到最短，连续没进展逐步放慢（封顶 3 分钟）。
+            // 以前是点开一篇隔 3~8 秒就点下一篇，整片阅读记录看起来像脚本。
+            let gap = SEARCH_PACER.startGap();
+            // 单轮最多给阅读 8 分钟：到点交班，剩下的篇数留给下一轮，别把搜索的配额挤没
+            const readCap = Date.now() + 8 * 60 * 1000;
+            const readDeadline = (Number(roundDeadline) || 0) > 0 ? Math.min(Number(roundDeadline), readCap) : readCap;
             let successCount = 0;
             let stagnant = 0;
             for (let i = 0; i < target; i++) {
+                if (!SEARCH_PACER.fits(readDeadline, gap)) {
+                    Utils.log("🟡", `阅读到点交班，还剩 ${target - i} 篇交给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
+                    break;
+                }
+                await SEARCH_PACER.beat(gap);
                 await RegionGuard.guard("阅读");
                 const result = await API.doRead();
                 await Utils.randomDelay(3000, 8000);
                 // 任务已满时该接口依然返回 200 + p:0 + isDuplicate:false，
                 // 所以不能只看返回值，必须用服务端进度增量判断这一篇是否真的计入。
                 const after = await API.getReadProgress();
+                let advanced = false;
                 if (after) {
                     const gained = after.progress - cur;
                     max = after.max;
                     if (gained > 0) {
+                        advanced = true;
                         successCount++;
                         stagnant = 0;
                         cur = after.progress;
@@ -3420,6 +3453,7 @@ const __scBgKeepAlive = (function() {
                         Utils.log("🟡", `阅读文章 ${i + 1}/${target} 未计入进度（${after.progress}/${after.max}）`);
                     }
                 } else if (result && result.points > 0) {
+                    advanced = true;
                     successCount++;
                     stagnant = 0;
                     cur += result.points;
@@ -3432,6 +3466,8 @@ const __scBgKeepAlive = (function() {
                         Utils.log("🟡", `阅读第 ${i + 1} 篇无新增积分（返回 p:${result.points}，isDuplicate:${result.isDuplicate}）`);
                     }
                 }
+                // 记进去了就回到最短节拍，没记进去就慢慢放慢，别一直一个速度猛点
+                gap = SEARCH_PACER.nextGap(gap, advanced);
                 if (cur >= max) {
                     Utils.log("📖", `阅读进度已满（${cur}/${max}），提前结束`);
                     break;
@@ -3470,7 +3506,7 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
-        async doPromos() {
+        async doPromos(roundDeadline) {
             if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 2) return true;
             if (this.promosDate === RewardsAuto.state.dateNowNum) {
                 Utils.log("✅", "活动卡片已完成");
@@ -3491,13 +3527,22 @@ const __scBgKeepAlive = (function() {
             // 否则这类卡片会让当天永远无法判定完成。
             const shouldSkip = (card) => card.kind === "quiz" && !GM_getValue("Tasks.quiz", true);
             let ok = 0, fail = 0;
+            // 卡片之间也用搜索那套节拍：起步 30 秒，领成功就回到最短，没成功逐步放慢
+            let gap = SEARCH_PACER.startGap();
+            let outOfTime = false;
             for (const card of cards) {
                 await RegionGuard.guard("活动卡片");
                 Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
                 if (shouldSkip(card)) continue;
-                await Utils.randomDelay(3000, 8000);
+                if (!SEARCH_PACER.fits(roundDeadline, gap)) {
+                    Utils.log("🟡", `卡片到点交班，剩下的 ${cards.length} 张里有未处理的留给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
+                    outOfTime = true;
+                    break;
+                }
+                await SEARCH_PACER.beat(gap);
                 const result = await API.claimCard(card, { attempts: 2 });
                 result ? ok++ : fail++;
+                gap = SEARCH_PACER.nextGap(gap, !!result);
             }
             // 以服务端状态为准：仍有未完成卡片时不标记当天完成，下次运行会继续重试
             let pending = 0;
@@ -3510,12 +3555,12 @@ const __scBgKeepAlive = (function() {
                 this.save();
             }
             Utils.log(pending === 0 ? "🔵" : "🟡",
-                `活动完成: ${ok}成功/${fail}失败${pending > 0 ? `，仍剩 ${pending} 张未完成` : ""}（服务端已确认）`,
+                `活动完成: ${ok}成功/${fail}失败${pending > 0 ? `，仍剩 ${pending} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`,
                 pending === 0 && ok > 0);
             return pending === 0;
         },
 
-        async doSearch() {
+        async doSearch(roundDeadline) {
             if (!GM_getValue("Tasks.search", true)) return;
             const info = await API.getRewardsInfo();
             if (!info) { Utils.log("🔴", "无法获取积分信息"); return; }
@@ -3551,15 +3596,18 @@ const __scBgKeepAlive = (function() {
                 return;
             }
 
-            // 单轮搜索预算固定 20 分钟：原来的「单轮搜索最长时间（分钟）」调整框已从设置里移除，
-            // 值不再可调，但预算、软/硬截止时间的计算与之前保持一致。
+            // 单轮搜索最多 20 分钟，并且不会超过整轮截止时间 roundDeadline（由 runAll 传入）。
+            // 旧逻辑是「软预算 20 分钟 + 还在记账就延到 45 分钟」，等于没有上限：
+            // 只要每次记账成功，softDeadline 那个判断永远不成立，一轮能连着搜 30 分钟以上，
+            // 表现就是「不按 20 分钟一轮，非要跑完才停」。现在到点就交班，
+            // 没搜满的配额由 SEARCH_PACER.pending 安排 5 分钟后提前续做。
             const budgetMin = 20;
             const startedAt = Date.now();
-            // 预算内正常搜；预算用完时只要还在持续记账就继续把这轮补满，最多熬到 hardDeadline。
-            // 目的是「一轮尽量做满」，而不是到点就交班。
-            const softDeadline = startedAt + budgetMin * 60 * 1000;
-            const hardMin = Math.max(budgetMin, Math.min(45, budgetMin * 2 + 10));
-            const hardDeadline = startedAt + hardMin * 60 * 1000;
+            const budgetDeadline = startedAt + budgetMin * 60 * 1000;
+            const roundLimit = Number(roundDeadline) || 0;
+            const softDeadline = roundLimit > 0 ? Math.min(budgetDeadline, roundLimit) : budgetDeadline;
+            const hardDeadline = softDeadline;   // 不再有「延到 45 分钟」：硬上限 = 软上限
+            const deadlineMin = Math.max(0, Math.round((softDeadline - startedAt) / 60000));
             // 每轮都从最小间隔起步，绝不继承上一轮被放大的节拍
             let gap = SEARCH_PACER.startGap();
             let peakGap = gap;
@@ -3573,7 +3621,7 @@ const __scBgKeepAlive = (function() {
             const usedQueries = new Set();
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
-            Utils.log("🔍", `单轮预算 ${budgetMin} 分钟（还在记账就最多延到 ${Math.round(hardMin)} 分钟），起始节拍 ${Math.round(gap / 1000)} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
+            Utils.log("🔍", `单轮搜索最多 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），起始节拍 ${Math.round(gap / 1000)} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
 
             while (attempts < attemptCap && Date.now() < hardDeadline) {
                 // 单轮可能跑十几分钟，顺手给运行锁和运行阶段续约，避免被别的上下文判成「已经挂了」
@@ -3658,13 +3706,9 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮按乐观估计结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
                     break;
                 }
-                if (Date.now() + gap > hardDeadline) {
-                    Utils.log("🟡", `已到本轮硬上限（${Math.round(hardMin)} 分钟），剩下的 ${Math.max(0, max - progress)} 分交给下一轮`);
-                    break;
-                }
-                // 预算用完之后，只有「最近还在持续记账」才继续熬，否则交班，别白耗
-                if (Date.now() + gap > softDeadline && Date.now() - lastCreditAt > SEARCH_PACER.RECENT_CREDIT) {
-                    Utils.log("🟡", `本轮预算（${budgetMin} 分钟）已用完且最近 ${Math.round(SEARCH_PACER.RECENT_CREDIT / 60000)} 分钟没有新记账，剩下的 ${Math.max(0, max - progress)} 分交给下一轮`);
+                if (Date.now() + gap > softDeadline) {
+                    // 到点就交班：不再像旧版那样「只要还在记账就一直熬到 45 分钟」
+                    Utils.log("🟡", `已到本轮上限（${deadlineMin} 分钟），剩下的 ${Math.max(0, max - progress)} 分交给下一轮`);
                     break;
                 }
                 // 节拍按「这一次搜索 → 下一次搜索」算：搜索本身、观察窗、二次核对花掉的时间
@@ -3706,7 +3750,7 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async doDailySet() {
+        async doDailySet(roundDeadline) {
             const today = Utils.getTodayNum();
             const todayStr = Utils.getTodayStr();
             const processedKey = "Config.dailySetProcessed";
@@ -3717,9 +3761,17 @@ const __scBgKeepAlive = (function() {
 
             const maxRounds = 3;
             let totalOk = 0, totalFail = 0, remain = -1;
+            // 每张日常卡之间同样用搜索那套节拍（起步 30 秒，成不成都会自动缩放）
+            let gap = SEARCH_PACER.startGap();
+            let outOfTime = false;
 
             // 服务端记账有延迟且偶发限流，单轮容易「一张没完成」，故多轮：发现 → 领取 → 复核
             for (let round = 1; round <= maxRounds; round++) {
+                if (!SEARCH_PACER.fits(roundDeadline, gap)) {
+                    Utils.log("🟡", `每日活动到点交班，剩下的卡片留给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
+                    outOfTime = true;
+                    break;
+                }
                 await RegionGuard.guard("每日活动");
                 Utils.log("📅", `第 ${round}/${maxRounds} 轮每日活动（服务端已确认 ${doneIds.size} 张）...`);
                 await Utils.randomDelay(2000, 5000);
@@ -3765,13 +3817,24 @@ const __scBgKeepAlive = (function() {
                     }
                 }
 
+                let roundOutOfTime = false;
                 for (const card of cards) {
                     if (doneIds.has(card.offerId)) continue;
                     await RegionGuard.guard("每日活动领取");
                     Utils.log("📅", `领取每日活动: ${card.title} +${card.points}p`);
-                    await Utils.randomDelay(3000, 6000);
+                    if (!SEARCH_PACER.fits(roundDeadline, gap)) {
+                        Utils.log("🟡", `每日活动到点交班，剩余卡片留给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
+                        roundOutOfTime = true;
+                        break;
+                    }
+                    await SEARCH_PACER.beat(gap);
                     const res = await API.claimCard(card, round === 1 ? { attempts: 2 } : {});
                     if (res) { totalOk++; doneIds.add(card.offerId); } else { totalFail++; }
+                    gap = SEARCH_PACER.nextGap(gap, !!res);
+                }
+                if (roundOutOfTime) {
+                    outOfTime = true;
+                    break;
                 }
 
                 // 每轮结束都以 DAPI 复核，只有真正完成的卡片才留在记录里
@@ -3807,7 +3870,7 @@ const __scBgKeepAlive = (function() {
 
             if (totalOk > 0 || totalFail > 0 || remain > 0) {
                 Utils.log(remain === 0 ? "🔵" : "🟡",
-                    `每日活动完成: ${totalOk}成功/${totalFail}失败${remain > 0 ? `，仍剩 ${remain} 张未完成` : ""}（服务端已确认）`,
+                    `每日活动完成: ${totalOk}成功/${totalFail}失败${remain > 0 ? `，仍剩 ${remain} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`,
                     remain === 0);
             } else if (remain === 0) {
                 Utils.log("✅", "每日活动已全部完成（服务端已确认）");
@@ -3939,6 +4002,8 @@ const __scBgKeepAlive = (function() {
             this.running = true;
             this.runningSince = Date.now();
             Sched.state("running");
+            // 本轮墙钟预算：到点就交班，剩余任务交给下一轮（避免一轮被搜索拖到 30 分钟以上）
+            const roundDeadline = this.runningSince + ROUND_BUDGET_MS;
             try {
                 // 后台常驻实例会跨轮次复用，这几个「本轮重试次数」必须每轮归零，
                 // 否则累计到 3 次失败后就再也不重试（旧版 @crontab 每轮新实例，天然为 0）。
@@ -3994,43 +4059,62 @@ const __scBgKeepAlive = (function() {
                     if (RewardsAuto.state.pc401) {
                         Utils.log("🟡", "PC 会话不可用（只影响 PC 通道任务），阅读改用 App 通道继续执行");
                     }
-                    await withRetry(() => this.doRead(), "阅读");
+                    await withRetry(() => this.doRead(roundDeadline), "阅读");
                     await Utils.randomDelay();
                 } else {
                     await withRetry(() => this.doSign(), "签到");
                     await Utils.randomDelay();
                 }
-                await withRetry(() => this.doPromos(), "活动卡片");
+                await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
                 await Utils.randomDelay();
-                await withRetry(() => this.doSearch(), "搜索");
+                await withRetry(() => this.doSearch(roundDeadline), "搜索");
                 await withRetry(() => this.doStreak(), "连签检测");
+                // 到点就不再开新阶段：整轮严格按 ROUND_BUDGET_MS 交班，没做完的留给下一轮
+                const roundExpired = () => Date.now() > roundDeadline;
+                const skipByDeadline = name => Utils.log("🟡", `本轮已到 ${ROUND_BUDGET_MS / 60000} 分钟上限，${name}交给下一轮`);
                 await Utils.randomDelay();
-                Utils.log("📅", "开始执行每日活动任务...");
-                await Utils.randomDelay();
-                const dailySetRes = await withRetry(() => this.doDailySet(), "每日活动");
+                let dailySetRes = null;
+                if (roundExpired()) {
+                    skipByDeadline("每日活动");
+                } else {
+                    Utils.log("📅", "开始执行每日活动任务...");
+                    await Utils.randomDelay();
+                    dailySetRes = await withRetry(() => this.doDailySet(roundDeadline), "每日活动");
+                }
                 try {
                     await this.doClaimPoints();
                 } catch (e) {
                     if (e && e.regionBlocked) throw e;
                     Utils.log("🟡", `领取积分执行异常: ${e.message}`);
                 }
-                Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
-                await Utils.randomDelay(3000, 8000);
-                const newCards = await API.discoverCards();
-                if (newCards.length > 0) {
-                    Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
-                    let ok = 0, fail = 0;
-                    for (const card of newCards) {
-                        await RegionGuard.guard("二次扫描");
-                        Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
-                        if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
-                        await Utils.randomDelay(3000, 8000);
-                        const result = await API.claimCard(card);
-                        result ? ok++ : fail++;
-                    }
-                    Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
+                if (roundExpired()) {
+                    skipByDeadline("二次扫描");
                 } else {
-                    Utils.log("✅", "二次扫描：无新卡片");
+                    Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
+                    await Utils.randomDelay(3000, 8000);
+                    const newCards = await API.discoverCards();
+                    if (newCards.length > 0) {
+                        Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
+                        let ok = 0, fail = 0;
+                        // 这里同样是「卡片」，按搜索那套节拍一张一张来
+                        let rescanGap = SEARCH_PACER.startGap();
+                        for (const card of newCards) {
+                            await RegionGuard.guard("二次扫描");
+                            Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
+                            if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
+                            if (!SEARCH_PACER.fits(roundDeadline, rescanGap)) {
+                                Utils.log("🟡", `二次扫描到点交班，剩余卡片留给下一轮（当前节拍 ${Math.round(rescanGap / 1000)} 秒）`);
+                                break;
+                            }
+                            await SEARCH_PACER.beat(rescanGap);
+                            const result = await API.claimCard(card);
+                            result ? ok++ : fail++;
+                            rescanGap = SEARCH_PACER.nextGap(rescanGap, !!result);
+                        }
+                        Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
+                    } else {
+                        Utils.log("✅", "二次扫描：无新卡片");
+                    }
                 }
                 // Edge 浏览连签：后台累计 30 分钟才记账，这里每轮至少推进一次
                 //（常驻调度的心跳里还有节拍器按 report_per_minutes 的节奏续报）
@@ -4160,15 +4244,17 @@ const __scBgKeepAlive = (function() {
         const restricted = Number(GM_getValue("Config.restrictedTimes", 0)) || 0;
         let text = "🔍 PC 搜索诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
-        text += `最小间隔：${pacer.min} 秒（Config.span，两次搜索之间不会快于它，只会更慢）\n`;
+        text += `最小间隔：${pacer.min} 秒（Config.span，搜索/阅读/卡片共用，不会快于它，只会更慢）\n`;
         text += `每轮起始节拍：${pacer.min} 秒（每轮重置，不继承上一轮被放大的节拍）\n`;
         text += `单轮内退让上限：${SEARCH_PACER.MAX_MS / 1000} 秒；连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手\n`;
+        text += `阅读/卡片节拍：复用同一套（起步 ${pacer.min} 秒，没进展放慢到 ${SEARCH_PACER.MAX_MS / 1000} 秒，带动随机抖动）\n`;
         if (pacer.last) {
             text += `上一轮：${pacer.last.attempts} 次搜索 / 记账 ${pacer.last.credits} 次（最高节拍 ${pacer.last.peak} 秒）\n`;
         } else {
             text += `上一轮：还没有记录\n`;
         }
-        text += `单轮预算：20 分钟（固定，不可调）\n`;
+        text += `单轮搜索上限：20 分钟（到点交班，未满的配额 5 分钟后提前续做）\n`;
+        text += `整轮墙钟预算：20 分钟（到点不再开新阶段，剩余任务交给下一轮）\n`;
         text += `提前续做：${pacer.pending ? "已排程（本轮没搜满）" : "无"}\n`;
         text += `限流计数：${restricted}/3\n`;
         text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
@@ -4408,7 +4494,7 @@ const __scBgKeepAlive = (function() {
             }
             this.saveNext(plan);
             this.state(ok ? "done" : "idle");
-            if (ok) Utils.log("🕒", `本轮结束，下一轮 ${this.fmt(this.plan(now))}`);
+            if (ok) Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟，上限 ${ROUND_BUDGET_MS / 60000} 分钟），下一轮 ${this.fmt(this.plan(now))}`);
         },
 
         start(task) {
@@ -4484,7 +4570,7 @@ const __scBgKeepAlive = (function() {
                         : this.isBusy(now)
                             ? `，本轮正在执行中（已 ${Math.round((now - ((this.getState() || {}).at || now)) / 60000)} 分钟）`
                             : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
-                    Utils.log("💓", `常驻调度心跳：本次已运行 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
+                    Utils.log("💓", `常驻调度心跳：后台实例已存活 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
                 }
             } catch (e) {
                 Utils.log("🔴", `常驻调度异常：${e && e.message ? e.message : e}`);
