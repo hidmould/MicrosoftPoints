@@ -258,8 +258,18 @@ const __scBgKeepAlive = (function() {
             lockedPoints: 0,
             // 网页通道确认「未登录/无 Cookie」后置真：当轮剩余卡片直接走 DAPI，避免白发请求
             webNoAuth: false,
+            // 网页通道连续失败计数：连续失败到阈值后本轮不再试网页，避免一串超时把整轮拖住
+            webFailStreak: 0,
         }
     };
+
+    /* ===== 防「卡住」预算（网页优先改造后新增） =====
+     * 网页通道每一步都是网络请求：Server Action POST、404 后探测 action id、目的地访问。
+     * 没有上限的话，某个接口一直超时就会让整轮长时间没有日志，看起来像卡死。 */
+    const CLAIM_ONCE_TIMEOUT = 150 * 1000;        // 单张卡单次尝试的硬上限：超过就记日志、放弃这次尝试
+    const NEXT_ACTION_SCAN_MAX = 8;               // 探测 Server Action ID 时最多扫几个 chunk
+    const NEXT_ACTION_SCAN_BUDGET = 45 * 1000;    // 探测 Server Action ID 的总耗时上限
+    const WEB_FAIL_LIMIT = 3;                     // 网页通道连续失败几次后，本轮改为只用 DAPI
 
     /* ===== 卡片锁态语义（从「微软积分商城签到（改进加强版）.user.js」迁移） =====
      * 网页端下发的活动卡片带 isLocked / isUnlocked / unlockCriteria 三个字段，
@@ -2500,20 +2510,35 @@ const __scBgKeepAlive = (function() {
 
         async getNextActionHash(html) {
             let cached = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
-            if (html && html.includes("_next/static/chunks/")) {
-                const scriptSrcs = [...new Set(html.match(/\/_next\/static\/chunks\/[a-z0-9_\-]+\.js\?dpl=[^"]+/g) || [])];
+            // 探测有代价：每个 chunk 都是一次 15 秒超时的网络请求，顺序扫几十个 chunk 会让整轮
+            // 长时间没有任何日志（看起来就像卡死）。所以这里加三重限制：
+            //   1) 最多扫 NEXT_ACTION_SCAN_MAX 个 chunk；
+            //   2) 总耗时不超过 NEXT_ACTION_SCAN_BUDGET；
+            //   3) 整轮扫完仍没找到，10 分钟内不再扫（负缓存），避免每张卡 404 都重来一遍。
+            const lastScan = Number(GM_getValue("Config.nextActionScanAt", 0)) || 0;
+            const cooled = Date.now() - lastScan < 10 * 60 * 1000;
+            if (html && html.includes("_next/static/chunks/") && !cooled) {
+                const scriptSrcs = [...new Set(html.match(/\/_next\/static\/chunks\/[a-z0-9_\-]+\.js\?dpl=[^"]+/g) || [])]
+                    .slice(0, NEXT_ACTION_SCAN_MAX);
+                const deadline = Date.now() + NEXT_ACTION_SCAN_BUDGET;
+                let scanned = 0;
                 for (const src of scriptSrcs) {
+                    if (Date.now() > deadline) break;
+                    scanned++;
                     try {
-                        const chunkText = await Utils.xhr({ url: "https://rewards.bing.com" + src });
+                        const chunkText = await Utils.xhr({ url: "https://rewards.bing.com" + src, timeout: 8000 });
                         const match = chunkText.match(/createServerReference\)\("([a-f0-9]{40,44})"[^)]*"reportActivity"\)/);
                         if (match && match[1]) {
                             cached = match[1];
                             RewardsAuto._nextAction = cached;
                             GM_setValue("Config.nextAction", cached);
-                            break;
+                            return cached;
                         }
                     } catch (_) {}
                 }
+                // 没找到：记下时间戳做负缓存，并留一条日志说明「为什么后面不再探测」
+                GM_setValue("Config.nextActionScanAt", Date.now());
+                Utils.log("🟡", `Server Action ID 探测未命中（扫了 ${scanned} 个 chunk），10 分钟内不再探测，先用现有 ID 继续`);
             }
             return cached;
         },
@@ -2540,12 +2565,33 @@ const __scBgKeepAlive = (function() {
                     Utils.log("⏳", `等待 ${Math.round(lo / 1000)}~${Math.round(hi / 1000)} 秒后重试（第 ${i + 1}/${attempts} 次）：${name}`);
                     await Utils.randomDelay(lo, hi);
                 }
-                const ok = await this._claimCardOnce(card, { diag });
+                // 单次尝试加硬超时：某个请求一直不回调时，不让它把整轮任务拖死，
+                // 超时后照常进入下一次尝试（或交给 DAPI）。
+                const ok = await this._claimCardOnceWithTimeout(card, { diag, name, attempt: i + 1 });
                 if (ok) return true;
             }
 
             Utils.log("🟡", `卡片领取未确认（已重试 ${attempts} 次）：${name} [${diag.join(" ")}]`);
             return false;
+        },
+
+        // 单次尝试的硬超时包装：网络请求不回调时，超时后放弃这次尝试并留下日志，
+        // 免得一张卡把整轮任务无限期拖住（日志里就能看到「单卡处理超时」）。
+        async _claimCardOnceWithTimeout(card, { diag = [], name = "", attempt = 1 } = {}) {
+            const label = name || card.title || card.offerId;
+            let timer = null;
+            const timeout = new Promise(resolve => {
+                timer = setTimeout(() => {
+                    diag.push(`timeout(${CLAIM_ONCE_TIMEOUT / 1000}s)`);
+                    Utils.log("🔴", `单卡处理超时（第 ${attempt} 次尝试，${CLAIM_ONCE_TIMEOUT / 1000} 秒）：${label}，放弃这次尝试`);
+                    resolve(false);
+                }, CLAIM_ONCE_TIMEOUT);
+            });
+            try {
+                return await Promise.race([this._claimCardOnce(card, { diag }), timeout]);
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
         },
 
         // 单次领取尝试：访问目的地（urlreward 产生进度的真实机制）→ 网页通道 → DAPI 兜底 → 服务端复核
@@ -2575,11 +2621,21 @@ const __scBgKeepAlive = (function() {
             }
 
             // ---------- 1) 网页通道（优先） ----------
-            if (!skipWeb && card.hash && !RewardsAuto.state.webNoAuth) {
+            if (!skipWeb && !card.hash) {
+                // DAPI 发现的日常卡没有 hash（网页通道拿不到交卷标识），直接走 DAPI
+                diag.push("web(无hash)");
+            } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
+                diag.push("web(未登录跳过)");
+            } else if (!skipWeb && RewardsAuto.state.webFailStreak >= WEB_FAIL_LIMIT) {
+                // 熔断：本轮网页通道已连续失败多次（超时/500），再挨张试只会把整轮拖得很久
+                diag.push("web(本轮已熔断)");
+            } else if (!skipWeb) {
                 let webAccepted = false;
+                let webErr = null;
                 try {
                     webAccepted = await this.claimCardWeb(card);
                 } catch (e) {
+                    webErr = e;
                     diag.push(`web(${e.message})`);
                     // 401/403 = 网页通道登录态不可用（典型情况就是没有 Cookie）。
                     // 记下来，后续卡片不再白发网页请求，直接走 DAPI。
@@ -2589,6 +2645,7 @@ const __scBgKeepAlive = (function() {
                     }
                 }
                 if (webAccepted) {
+                    RewardsAuto.state.webFailStreak = 0;
                     await Utils.randomDelay(2000, 4000);
                     if (await this.isOfferComplete(offerId, true) === true) {
                         Utils.log("🟢", `网页通道领取成功：${name}`);
@@ -2597,12 +2654,14 @@ const __scBgKeepAlive = (function() {
                     diag.push("web(已发出但服务端未生效)");
                 } else {
                     diag.push("web(请求未被接受)");
+                    // 网页失败立刻留一条日志（以前只在全部重试结束的汇总里出现，
+                    // 中途卡住时完全看不出停在哪张卡、什么原因）
+                    if (!RewardsAuto.state.webNoAuth) {
+                        RewardsAuto.state.webFailStreak += 1;
+                        Utils.log("🟠", `网页通道未成功（${name}）：${webErr ? webErr.message : "请求未被接受"}`
+                            + `（连续 ${RewardsAuto.state.webFailStreak}/${WEB_FAIL_LIMIT} 次，超限后本轮改用 DAPI）`);
+                    }
                 }
-            } else if (!skipWeb && !card.hash) {
-                // DAPI 发现的日常卡没有 hash（网页通道拿不到交卷标识），直接走 DAPI
-                diag.push("web(无hash)");
-            } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
-                diag.push("web(未登录跳过)");
             }
 
             // ---------- 2) DAPI 兜底（Bearer Token 鉴权，不使用浏览器 Cookie，跨浏览器一致） ----------
@@ -3889,6 +3948,7 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.lockedCount = 0;
                 RewardsAuto.state.lockedPoints = 0;
                 RewardsAuto.state.webNoAuth = false;
+                RewardsAuto.state.webFailStreak = 0;
                 RewardsAuto.state.startTime = Utils.getTimestamp();
                 Utils.log("🚀", "启动全能自动化任务...");
                 this.init();
@@ -4134,6 +4194,17 @@ const __scBgKeepAlive = (function() {
             .then(() => TaskManager.runAll())
             .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
             .finally(() => Sched.finish(true));   // 手动跑过的这一轮也算数，顺延到下一次计划
+    });
+
+    // 万一某轮卡在「认领了但没跑完」的状态里（上下文被冻结、请求不回调等），
+    // 手动点这个可以立刻把锁和调度状态清干净，不用等 40 分钟的残留判定。
+    GM_registerMenuCommand("🔓 强制释放运行锁", () => {
+        try { Utils.releaseLock("Config.runLock"); } catch (_) {}
+        try { Sched.clearClaim(); } catch (_) {}
+        GM_setValue("Config.runState", null);
+        TaskManager.running = false;
+        TaskManager.runningSince = 0;
+        Utils.log("🔓", "已强制释放运行锁并清理运行状态，下一轮可正常触发");
     });
 
     GM_registerMenuCommand("🔔 配置通知接口", async () => {
@@ -4410,7 +4481,9 @@ const __scBgKeepAlive = (function() {
                     GM_setValue("Config.heartbeatAt", now);
                     const tip = stopped
                         ? "，今日任务已全部完成、检测已停止，明天自动恢复"
-                        : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
+                        : this.isBusy(now)
+                            ? `，本轮正在执行中（已 ${Math.round((now - ((this.getState() || {}).at || now)) / 60000)} 分钟）`
+                            : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
                     Utils.log("💓", `常驻调度心跳：本次已运行 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
                 }
             } catch (e) {
