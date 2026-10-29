@@ -14,7 +14,7 @@
    - *方案1*：点击手动授权(看准时机复制地址栏内容，地址栏会发生变化)，授权码必须包含(code=M.xxx=2052):
    - *方案2*：手动授权→F12→络(Network)→oauth20_desktop.srf?removed=true →标头(Headers)→请求标头(Request headers)→Referer→复制右侧完整链接
      
-      <img src="img/img.png" alt="img" style="width: 400px; height: auto;">
+      <img src="https://scriptcat.org/api/v2/resource/image/fZBP77hgN0mgSZl6" alt="img" style="width: 400px; height: auto;">
    
    - **📋 粘贴授权码**，把整段地址粘进去，回车。
    - 提示"授权成功"即可。之后用 Token 运行。
