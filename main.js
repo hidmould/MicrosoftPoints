@@ -338,6 +338,7 @@ const __scBgKeepAlive = (function() {
     const NEXT_ACTION_SCAN_MAX = 8;               // 探测 Server Action ID 时最多扫几个 chunk
     const NEXT_ACTION_SCAN_BUDGET = 45 * 1000;    // 探测 Server Action ID 的总耗时上限
     const WEB_FAIL_LIMIT = 3;                     // 网页通道连续失败几次后，本轮改为只用 DAPI
+    const QUEST_SCAN_MAX = 3;                     // 单轮最多拉几个 Rewards App quest 详情页
 
     /* ===== 卡片锁态语义（从「微软积分商城签到（改进加强版）.user.js」迁移） =====
      * 网页端下发的活动卡片带 isLocked / isUnlocked / unlockCriteria 三个字段，
@@ -1840,6 +1841,9 @@ const __scBgKeepAlive = (function() {
                 reportParams.set("IG", ig);
                 reportParams.set("IID", "commerce.5067");
                 if (cnSp.get("form")) reportParams.set("form", cnSp.get("form"));
+                // PUBL=RewardsDO 是「在积分商城应用内搜索」的发布者签名，桌面 quest 的搜索型子项靠它归因，
+                // 转发出去不影响日常搜索卡的既有行为
+                if (cnSp.get("PUBL")) reportParams.set("PUBL", cnSp.get("PUBL"));
                 if (cnSp.get("ocid") || cnSp.get("OCID")) reportParams.set("ocid", cnSp.get("ocid") || cnSp.get("OCID"));
                 if (cnSp.get("rnoreward")) reportParams.set("rnoreward", cnSp.get("rnoreward"));
                 try {
@@ -2393,6 +2397,97 @@ const __scBgKeepAlive = (function() {
             return items;
         },
 
+        /* 桌面奖励应用（Rewards App）专属 quest：earn 页里的任务卡常常只下发
+         * <a href="/earn/quest/<questId>">，父任务不出 offerId 字段，只按 offerId 匹配会整个列表都摸不到
+         * （表现就是「任务板块整块漏掉」）。故链接与 offerId 两个来源都取，去重后限量。
+         * 只认 App 专属 quest（Rewards App 周任务 / 月度打卡），其余 quest 不在这里处理。 */
+        _appQuestIds(html, limit = QUEST_SCAN_MAX) {
+            // 页面上有三处存法：内联 HTML 属性、flight 负载字符串、转义后的 JSON，
+            // 统一把 \" 和 \/ 还原再匹配，否则转义过的链接会整条摸不到
+            const clean = String(html || "")
+                .replace(/\\"/g, '"')
+                .replace(/\\\//g, "/")
+                .replace(/\\u0026/g, "&");
+            const ids = [];
+            const add = (raw) => {
+                let id = String(raw || "").split("?")[0].split("#")[0].trim();
+                try { id = decodeURIComponent(id); } catch (_) {}
+                if (!id || ids.includes(id)) return;
+                if (!/RewardsApp|Exclusive|punchcard/i.test(id)) return;
+                ids.push(id);
+            };
+            for (const m of clean.matchAll(/\/earn\/quest\/([^"'\s?#\\]+)/g)) add(m[1]);
+            for (const m of clean.matchAll(/"offerId":"([^"]*pcparent[^"]*)"/g)) add(m[1]);
+            return ids.slice(0, Math.max(1, Number(limit) || 1));
+        },
+
+        /* 桌面 quest 子卡（WW_pcchildN_*）的前置动作分流。子项的完成机制由 href 决定，
+         * 只交卷而不做前置动作时服务端看不到这次行为，进度不会推进（user.js 的实测结论）：
+         *   - href 指向 /redeem/… ：领取型，点开链接即完成，搜索上报与交卷都替代不了；
+         *   - href 带 form=ML2Y2H / PUBL=RewardsDO ：App 内搜索型，必须先真的搜一次并上报；
+         *   - 其余 urlreward ：无前置动作，直接交卷。
+         * diag 收集日志片段，供失败汇总里看出卡在哪一步。 */
+        async _prepareDesktopQuest(card, diag = []) {
+            const href = String(card.destination || "");
+            if (!/^https?:/i.test(href)) { diag.push("前置(无链接)"); return diag; }
+            const headers = Object.assign({}, RewardsAuto.desktopAppHeaders,
+                card.questUrl ? { referer: card.questUrl } : {});
+
+            if (/\/redeem\//i.test(href)) {
+                try {
+                    await Utils.xhr({ url: href, headers });
+                    diag.push("前置(兑换链接已打开)");
+                } catch (e) {
+                    diag.push(`前置(兑换失败 ${e.message})`);
+                }
+                await Utils.randomDelay(3000, 5000);
+                return diag;
+            }
+
+            const search = String(href.split("?")[1] || "");
+            if (!/(^|&)(form=ML2Y2H|PUBL=RewardsDO)/.test(search)) {
+                diag.push("前置(无)");
+                return diag;
+            }
+            // 应用搜索型：走既有的「真搜索 + ncheader + reportActivity」上报链路，
+            // 该链路保留 form=ML2Y2H 这个应用搜索签名，服务端才把这次搜索算到 quest 上
+            diag.push("前置搜索(应用签名)");
+            try {
+                const ok = await this.reportDailyActivity(href);
+                diag.push(ok ? "前置搜索已上报" : "前置搜索未上报");
+            } catch (e) {
+                diag.push(`前置搜索失败(${e.message})`);
+            }
+            await Utils.randomDelay(2000, 4000);
+            return diag;
+        },
+
+        /* 桌面 quest 子卡的完成态：只能回 quest 详情页看该子项的 isCompleted。
+         * DAPI 的 promotion 列表里没有 pcchild 这一项，isOfferComplete() 会一直返回 null，
+         * 用它判定就会被当成「永远没做完」而反复重试（原 bug 的另一半）。 */
+        async isDesktopQuestDone(card) {
+            if (!card || !card.questUrl || !card.offerId) return null;
+            try {
+                const html = await Utils.xhr({ url: card.questUrl, headers: RewardsAuto.desktopAppHeaders });
+                if (!html) return null;
+                const clean = String(html).replace(/\\"/g, '"');
+                const idx = clean.indexOf(`"offerId":"${card.offerId}"`);
+                if (idx < 0) return null;
+                // 取该子项所在的对象片段：以 offerId 为锚点向两侧找花括号，字段顺序无关
+                const start = clean.lastIndexOf("{", idx);
+                const end = clean.indexOf("}", idx);
+                const obj = (start >= 0 && end > start)
+                    ? clean.slice(start, end + 1)
+                    : clean.slice(Math.max(0, idx - 400), idx + 800);
+                const m = obj.match(/"isCompleted"\s*:\s*(true|false)/i)
+                    || obj.match(/"state"\s*:\s*"(completed|CLAIMED)"/i);
+                if (!m) return null;
+                return m[1].toLowerCase() === "true" || m[1].toLowerCase() === "completed";
+            } catch (_) {
+                return null;   // 请求失败不误判成已完成
+            }
+        },
+
         async discoverCards() {
             const cards = [];
             const seenCardKeys = new Set();
@@ -2415,11 +2510,12 @@ const __scBgKeepAlive = (function() {
                 const clean = html.replace(/\\"/g, '"');
                 
                 const pushCard = (card) => {
-                    if (!card || !card.offerId || !card.hash || card.points <= 0) return;
+                    if (!card || !card.offerId || !card.hash || card.points <= 0) return false;
                     const key = `${card.offerId}:${card.hash}`;
-                    if (seenCardKeys.has(key)) return;
+                    if (seenCardKeys.has(key)) return false;
                     seenCardKeys.add(key);
                     cards.push(card);
+                    return true;
                 };
 
                 const inferKind = (offerId, title = "") => {
@@ -2556,31 +2652,59 @@ const __scBgKeepAlive = (function() {
                 // 注意：此块必须留在 try 内，一旦引用 try 外的 html 会抛 ReferenceError 并被 catch 静默吞掉。
                 try {
                     if (!earnHtml) return cards;
-                    const questMatch = earnHtml.match(/href="(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i)
-                        || earnHtml.match(/"(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i);
-                    if (questMatch) {
-                        const questPath = questMatch[1];
-                        const questUrl = "https://rewards.bing.com" + questPath;
-                        const questHtml = await Utils.xhr({
-                            url: questUrl,
-                            headers: RewardsAuto.desktopAppHeaders
-                        });
-                        if (questHtml) {
-                            for (const qItem of this._flightItems(this._flightText(questHtml), "WW_pcchild\\d+[^\"]+")) {
-                                const qLock = CardLock.probe(qItem);
-                                if (qItem.offerId && qItem.hash && !qLock.locked && qItem.isCompleted !== true) {
-                                    Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
-                                    pushCard({
-                                        title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
-                                        points: 10,
-                                        offerId: qItem.offerId,
-                                        hash: qItem.hash,
-                                        kind: "desktop_app",
-                                        destination: qItem.destination || qItem.href || "",
-                                        url: "https://rewards.bing.com/earn"
-                                    });
-                                }
+                    const questIds = this._appQuestIds(earnHtml);
+                    if (questIds.length === 0) Utils.log("🖥️", "未发现桌面奖励应用专属任务");
+                    for (const questOfferId of questIds) {
+                        const questUrl = `https://rewards.bing.com/earn/quest/${encodeURIComponent(questOfferId)}`;
+                        // 详情页必须用 Rewards 应用 UA 取：普通 UA 下子项会整片渲染成 isLocked=true，
+                        // 真实解锁态与进度都看不到 —— 这是「卡明明已解锁、脚本却当锁卡跳过 / 看不到」的根因。
+                        const questHtml = await Utils.xhr({ url: questUrl, headers: RewardsAuto.desktopAppHeaders });
+                        if (!questHtml) {
+                            Utils.log("🟡", `桌面任务详情页获取失败：${questOfferId}`);
+                            continue;
+                        }
+                        // 子项 offerId 形如 WW_pcchild7_urlreWard_… / ENWW_pcchild3_urlreward_…，前缀不固定
+                        const items = this._flightItems(this._flightText(questHtml), "[^\"]*pcchild[^\"]*");
+                        if (items.length === 0) {
+                            Utils.log("🟡", `桌面任务 ${questOfferId} 未解析到子项，页面结构可能已变更`);
+                            continue;
+                        }
+                        for (const qItem of items) {
+                            const qOfferId = String(qItem.offerId || "");
+                            const qHash = String(qItem.hash || "");
+                            if (!qOfferId || !qHash) continue;            // 无 hash 无法交卷
+                            if (qItem.isCompleted === true) continue;     // 已完成
+                            if (qItem.isDisabled === true) continue;      // 服务端禁用
+                            if (qItem.hidden === true) continue;
+                            // 锁态仍按 isLocked/isUnlocked/unlockCriteria 语义判：isLocked=true 是服务端
+                            // 还没放行这一项，此时交卷不会记账，跳过并留痕
+                            const qLock = CardLock.probe(qItem);
+                            if (qLock.locked) {
+                                Utils.log("🔒", `桌面任务子项未解锁，跳过：${qOfferId} [${qLock.reason}]`);
+                                continue;
                             }
+                            let dest = String(qItem.href || qItem.destination || qItem.destinationUrl || "");
+                            try {
+                                // 子项 href 可能是相对路径：搜索型的挂在 www.bing.com 下，
+                                // 其余（兑换页等）挂在 rewards.bing.com 下，按路径分流补全，别一律拼站点域名
+                                const base = /^\/?search\?/i.test(dest) ? "https://www.bing.com" : "https://rewards.bing.com";
+                                dest = dest ? new URL(dest, base).href : "";
+                            } catch (_) { /* 保留原值 */ }
+                            const pushed = pushCard({
+                                title: `[桌面专享] ${qItem.title || qItem.linkText || qItem.name || qOfferId}`,
+                                // quest 子项不下发 points，这里只用于日志展示
+                                points: Number(qItem.points || 0) || 10,
+                                offerId: qOfferId,
+                                hash: qHash,
+                                kind: "desktop_app",
+                                // source/questUrl 是后续交卷与完成态复核的关键：POST 要打到详情页路由，
+                                // 完成态也要回详情页读 isCompleted（DAPI 里没有这一项）
+                                source: "quest",
+                                questUrl,
+                                destination: dest,
+                                url: questUrl
+                            });
+                            if (pushed) Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qOfferId}`);
                         }
                     }
                 } catch (eQuest) {
@@ -2689,13 +2813,27 @@ const __scBgKeepAlive = (function() {
         async _claimCardOnce(card, { skipWeb = false, diag = [] } = {}) {
             const offerId = card.offerId;
             const name = card.title || offerId;
+            // 桌面 quest 子卡（WW_pcchildN_*）：两处与普通卡完全不同 ——
+            //   1) 交卷必须 POST 到 quest 详情页路由，/earn 页面对它无效（原 bug 的主因）；
+            //   2) 完成态只能回详情页读 isCompleted，DAPI 的 promotion 列表里没有这一项，
+            //      isOfferComplete() 恒为 null，用它判定就永远「没做完」而反复重试。
+            const isQuest = card.source === "quest" || (card.kind === "desktop_app" && !!card.questUrl);
 
-            if (await this.isOfferComplete(offerId, false) === true) {
+            if (isQuest) {
+                if (await this.isDesktopQuestDone(card) === true) {
+                    Utils.log("✅", `服务端已确认完成：${name}`);
+                    return true;
+                }
+            } else if (await this.isOfferComplete(offerId, false) === true) {
                 Utils.log("✅", `服务端已确认完成：${name}`);
                 return true;
             }
 
-            if (card.destination && /^https?:/i.test(card.destination)) {
+            if (isQuest) {
+                // 子项按 href 分流做前置动作（兑换型点开链接、App 搜索型先真搜一次）；
+                // 只交卷不做前置动作时服务端看不到这次行为，进度不会推进
+                await this._prepareDesktopQuest(card, diag);
+            } else if (card.destination && /^https?:/i.test(card.destination)) {
                 try {
                     await Utils.xhr({
                         url: card.destination,
@@ -2714,8 +2852,10 @@ const __scBgKeepAlive = (function() {
                 diag.push("web(无hash)");
             } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
                 diag.push("web(未登录跳过)");
-            } else if (!skipWeb && RewardsAuto.state.webFailStreak >= WEB_FAIL_LIMIT) {
-                // 熔断：本轮网页通道已连续失败多次（超时/500），再挨张试只会把整轮拖得很久
+            } else if (!skipWeb && !isQuest && RewardsAuto.state.webFailStreak >= WEB_FAIL_LIMIT) {
+                // 熔断：本轮网页通道已连续失败多次（超时/500），再挨张试只会把整轮拖得很久。
+                // 只对普通卡生效 —— quest 子卡走的是详情页路由这条独立链路，被普通卡的失败连坐
+                // 就会永远做不完（日志里表现为「发现了任务但从来没交过卷」）。
                 diag.push("web(本轮已熔断)");
             } else if (!skipWeb) {
                 let webAccepted = false;
@@ -2735,11 +2875,20 @@ const __scBgKeepAlive = (function() {
                 if (webAccepted) {
                     RewardsAuto.state.webFailStreak = 0;
                     await Utils.randomDelay(2000, 4000);
-                    if (await this.isOfferComplete(offerId, true) === true) {
+                    if (isQuest) {
+                        // 服务端记账有延迟，回读详情页确认几次再判定
+                        for (let v = 0; v < 3; v++) {
+                            if (await this.isDesktopQuestDone(card) === true) {
+                                Utils.log("🟢", `桌面任务子项已完成：${name}`);
+                                return true;
+                            }
+                            if (v < 2) await Utils.randomDelay(3000, 5000);
+                        }
+                        diag.push("web(已发出但子项未标记完成)");
+                    } else if (await this.isOfferComplete(offerId, true) === true) {
                         Utils.log("🟢", `网页通道领取成功：${name}`);
                         return true;
                     }
-                    diag.push("web(已发出但服务端未生效)");
                 } else {
                     diag.push("web(请求未被接受)");
                     // 网页失败立刻留一条日志（以前只在全部重试结束的汇总里出现，
@@ -2764,6 +2913,13 @@ const __scBgKeepAlive = (function() {
                 diag.push("dapi(请求失败)");
             }
             await Utils.randomDelay(1500, 3000);
+            if (isQuest) {
+                if (await this.isDesktopQuestDone(card) === true) {
+                    Utils.log("🟢", `桌面任务子项已完成：${name}`);
+                    return true;
+                }
+                return false;
+            }
             if (await this.isOfferComplete(offerId, true) === true) {
                 Utils.log("🟢", `DAPI 上报已生效：${name}`);
                 return true;
@@ -2773,14 +2929,20 @@ const __scBgKeepAlive = (function() {
 
         // 网页通道（Edge 与 Chrome/Firefox 差异所在）：返回 true 仅表示请求被接受，真实加分由 claimCard() 用 DAPI 复核
         async claimCardWeb(card) {
-            // Server Action 的 POST 目标必须是带 action 路由的页面：日常/连签卡在 dashboard，其余在 earn。
+            // Server Action 的 POST 目标必须是带 action 路由的页面：日常/连签卡在 dashboard，
+            // 普通活动卡在 earn，桌面 quest 子卡在它自己的详情页 /earn/quest/<id>。
             // 旧版直接用 card.url 当目标，而 getuserinfo 卡的 url 可能是 destinationUrl（指向 bing.com 搜索页），
-            // 往搜索页 POST action 一定 404/405 —— 这是「已解锁卡交卷失败」的另一半原因。
-            const isDash = card.kind === "daily" || card.kind === "streak" || card.source === "getuserinfo";
-            const pageUrl = card.kind === "desktop_app"
-                ? (card.url || "https://rewards.bing.com/earn")
-                : (isDash ? "https://rewards.bing.com/dashboard" : "https://rewards.bing.com/earn");
-            const referer = card.url || pageUrl;
+            // 往搜索页 POST action 一定 404/405 —— 这是「已解锁卡交卷失败」的另一半原因；
+            // quest 子卡当年也是 POST 到 /earn，服务端根本不认这个 hash，所以「发现了但没做完」。
+            const isQuest = card.source === "quest" || (card.kind === "desktop_app" && !!card.questUrl);
+            const isDash = !isQuest && (card.kind === "daily" || card.kind === "streak" || card.source === "getuserinfo");
+            const pageUrl = isQuest
+                ? card.questUrl
+                : (card.kind === "desktop_app"
+                    ? (card.url || "https://rewards.bing.com/earn")
+                    : (isDash ? "https://rewards.bing.com/dashboard" : "https://rewards.bing.com/earn"));
+            // quest 子卡的 action 只在详情页路由上有效，referer 必须是详情页
+            const referer = isQuest ? card.questUrl : (card.url || pageUrl);
             const segment = isDash ? "dashboard" : "earn";
             let nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
 
@@ -2828,36 +2990,40 @@ const __scBgKeepAlive = (function() {
             }
 
             // 策略 2: 目标链接如果是搜索页，模拟执行每日活动上报
-            if (card.destination && card.destination.startsWith("http")) {
+            // quest 子卡不走这条：它的前置搜索已由 _prepareDesktopQuest 按应用签名上报过，
+            // 再报一次只会重复（而且搜索上报本来就不能替代交卷）
+            if (!isQuest && card.destination && card.destination.startsWith("http")) {
                 try {
                     await this.reportDailyActivity(card.destination);
                     return true;
                 } catch (_) {}
             }
 
-            // 策略 3: 老版 reportactivity
-            try {
-                const token = await this.getRewardsToken();
-                if (token) {
-                    await Utils.xhr({
-                        method: "POST",
-                        url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
-                        headers: {
-                            "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                            "user-agent": RewardsAuto.ua.pc,
-                            "referer": referer,
-                            "origin": "https://rewards.bing.com",
-                            "x-requested-with": "XMLHttpRequest"
-                        },
-                        data: new URLSearchParams({
-                            id: card.offerId, hash: card.hash, timeZone: 480,
-                            activityAmount: 1, dbs: 0, form: "", type: "",
-                            __RequestVerificationToken: token
-                        }).toString()
-                    });
-                    return true;
-                }
-            } catch (_) {}
+            // 策略 3: 老版 reportactivity（quest 子卡的服务端只认 Server Action，这条对它无效）
+            if (!isQuest) {
+                try {
+                    const token = await this.getRewardsToken();
+                    if (token) {
+                        await Utils.xhr({
+                            method: "POST",
+                            url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
+                            headers: {
+                                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                                "user-agent": RewardsAuto.ua.pc,
+                                "referer": referer,
+                                "origin": "https://rewards.bing.com",
+                                "x-requested-with": "XMLHttpRequest"
+                            },
+                            data: new URLSearchParams({
+                                id: card.offerId, hash: card.hash, timeZone: 480,
+                                activityAmount: 1, dbs: 0, form: "", type: "",
+                                __RequestVerificationToken: token
+                            }).toString()
+                        });
+                        return true;
+                    }
+                } catch (_) {}
+            }
 
             Utils.log("🟡", `卡片领取未确认(${card.offerId})`);
             return false;
