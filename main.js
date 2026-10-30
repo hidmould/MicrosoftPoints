@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.1.3
+// @version      1.1.4
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅待领积分自动领取、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -34,6 +34,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_cookie
+// @grant        GM_addValueChangeListener
 // @grant        GM_info
 // @grant        GM_log
 // @grant        GM_registerMenuCommand
@@ -41,7 +42,7 @@
 // @tips         此脚本为开源免费使用，请勿购买
 // ==/UserScript==
 
-/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab */
+/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab, GM_addValueChangeListener */
 
 /* ==UserConfig==
 Config:
@@ -680,7 +681,14 @@ const __scBgKeepAlive = (function() {
                             const match = res.responseHeaders?.match(/Location:\s*(.*?)\s*\r?\n/i);
                             resolve(match ? match[1] : false);
                         } else {
-                            reject(new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
+                            // 把状态码 / 响应头 / 响应体片段挂到错误对象上：
+                            // 5xx 时要能区分「边缘层（Akamai）拦截」和「应用真的报错」，
+                            // 只留一句 message 的话，日志里永远看不出是被谁拒的。
+                            const err = new Error(`HTTP ${res.status}，用时 ${cost} 秒`);
+                            err.status = res.status;
+                            err.headers = String(res.responseHeaders || "");
+                            err.body = String(res.responseText || "").slice(0, 300);
+                            reject(err);
                         }
                     },
                     onerror: (err) => {
@@ -694,6 +702,141 @@ const __scBgKeepAlive = (function() {
                 });
             });
         },
+
+        /* 是否正跑在 rewards.bing.com 页面上（有 DOM + 同站）。
+         * 这是唯一能发出「浏览器自己的同源请求」的上下文，领取兜底全靠它。 */
+        isRewardsPage() {
+            try {
+                return this.hasDOM()
+                    && typeof location !== "undefined"
+                    && location.hostname === "rewards.bing.com";
+            } catch (_) {
+                return false;
+            }
+        },
+
+        /* 页面上下文专用：用浏览器自己的 fetch 发请求。
+         * GM_xmlhttpRequest 在后台 service_worker 里是「扩展代发」——Origin 是扩展、客户端提示/套接字
+         * 指纹也和真人点按钮不一样，Edge 的风控对这种组合尤其敏感（实测 0.2 秒就被边缘层 503，
+         * 请求根本没进 Next.js）。页面里的 fetch 是浏览器自己发的同源请求，最接近真人操作。
+         * 注意：referer / user-agent / origin 都是浏览器自己管，这里只放普通头。 */
+        async fetchSameOrigin(url, { method = "GET", headers = {}, data = null, timeout = 15000 } = {}) {
+            const start = Date.now();
+            const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+            const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, timeout) : null;
+            try {
+                const res = await fetch(url, {
+                    method,
+                    credentials: "include",
+                    cache: "no-store",
+                    headers,
+                    body: data == null ? undefined : data,
+                    signal: ctrl ? ctrl.signal : undefined,
+                });
+                const text = await res.text();
+                const cost = ((Date.now() - start) / 1000).toFixed(2);
+                if (res.status >= 200 && res.status < 300) return text;
+                const err = new Error(`HTTP ${res.status}，用时 ${cost} 秒`);
+                err.status = res.status;
+                err.headers = [...res.headers].map(([k, v]) => `${k}: ${v}`).join("\n");
+                err.body = String(text || "").slice(0, 300);
+                throw err;
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
+        },
+
+        /* 后台 → 页面：借一次「真浏览器同源请求」来领积分。
+         * 只有本机确实有 rewards 页面在跑脚本时才尝试（靠 Config.pageAliveAt 心跳判断），
+         * 没有页面就立即返回 null，绝不打开新标签页、也不干等。 */
+        async askPageClaim(payload = {}) {
+            try {
+                if (typeof GM_getValue !== "function") return null;
+                const alive = Number(GM_getValue("Config.pageAliveAt", 0)) || 0;
+                if (!alive || Date.now() - alive > 3 * 60 * 1000) return null;
+                const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                GM_setValue("Config.claimAssistReq", { id, at: Date.now(), actionId: payload.actionId || "" });
+                Utils.log("🔁", "检测到 rewards 页面正在运行，改由页面发起同源领取请求（更接近真人操作）");
+                for (let i = 0; i < 40; i++) {          // 最多等 20 秒；页面侧一次请求约 1~3 秒
+                    await Utils.delay(500);
+                    const res = GM_getValue("Config.claimAssistRes", null);
+                    if (res && typeof res === "object" && res.id === id) {
+                        GM_setValue("Config.claimAssistRes", null);
+                        return res;
+                    }
+                }
+            } catch (_) { /* 兜底通道，失败就当没有 */ }
+            return null;
+        },
+
+        /* 页面侧：响应后台借请求。用同源 fetch 打 Server Action，再用同源 fetch 回读余额复核。
+         * 领取接口幂等，被后台与页面重复调用也不会多领。 */
+        async servePageClaim() {
+            if (!Utils.isRewardsPage()) return;
+            const req = GM_getValue("Config.claimAssistReq", null);
+            if (!req || typeof req !== "object" || !req.id) return;
+            if (Date.now() - (req.at || 0) > 120000) return;   // 过期请求直接丢弃
+            GM_setValue("Config.claimAssistReq", null);
+            const out = { id: req.id, at: Date.now(), ok: false, claimed: 0, after: 0, reason: "", diag: "" };
+            const dashUrl = "https://rewards.bing.com/dashboard";
+            try {
+                let before = 0, present = false;
+                let dashHtml = "";
+                try {
+                    dashHtml = await Utils.fetchSameOrigin(dashUrl);
+                    const probe = API._claimProbe(dashHtml);
+                    before = probe.balance;
+                    present = probe.present;
+                } catch (_) {}
+                // actionId 优先用后台传来的；没有才自己提取。
+                // 提取要靠页面 HTML 里的 chunk 清单，document-start 时 outerHTML 往往是空的，
+                // 所以优先用刚抓到的 dashboard HTML，最后才退回当前文档。
+                const actionId = req.actionId
+                    || await API.getClaimActionId(
+                        String(dashHtml || (document.documentElement || {}).outerHTML || "")
+                    );
+                const diag = [];
+                for (const t of [{ seg: "dashboard", url: dashUrl }, { seg: "earn", url: "https://rewards.bing.com/earn" }]) {
+                    try {
+                        const text = await Utils.fetchSameOrigin(t.url, {
+                            method: "POST",
+                            headers: {
+                                "content-type": "text/plain;charset=UTF-8",
+                                "next-action": actionId,
+                                "next-router-state-tree": Utils.routerStateTree(t.seg),
+                            },
+                            data: "[]",
+                        });
+                        const accepted = API._claimAccepted(text);
+                        diag.push(`${t.seg}:${accepted ? "已接受" : "未接受"}`);
+                        if (accepted) { out.reason = "已接受"; break; }
+                    } catch (e) {
+                        diag.push(`${t.seg}:${e.message}`);
+                    }
+                }
+                out.diag = diag.join(" ");
+                for (let i = 0; i < 3 && !out.ok; i++) {
+                    if (i) await Utils.delay(2000 * i);
+                    try {
+                        const probe = API._claimProbe(await Utils.fetchSameOrigin(dashUrl));
+                        if (before > 0 && probe.balance > before) {
+                            out.ok = true; out.claimed = probe.balance - before; out.after = probe.balance;
+                            break;
+                        }
+                        // 待领池清空且读到余额：算领到（与后台同一套判定）
+                        if (present && !probe.present && probe.balance > 0) {
+                            out.ok = true; out.after = probe.balance;
+                            break;
+                        }
+                    } catch (_) {}
+                }
+                if (!out.ok && !out.reason) out.reason = "未被接受";
+            } catch (e) {
+                out.reason = e.message;
+            }
+            try { GM_setValue("Config.claimAssistRes", out); } catch (_) {}
+        },
+
 
         randomRange(min, max) {
             return Math.floor(Math.random() * (max - min + 1) + min);
@@ -2921,17 +3064,26 @@ const __scBgKeepAlive = (function() {
          *  - `ok=false`：请求没被接受 / 尚未确认，交给下一轮再试。 */
         async claimPendingPoints({ html = "" } = {}) {
             const dashUrl = "https://rewards.bing.com/dashboard";
+            const earnUrl = "https://rewards.bing.com/earn";
+            /* 页面上下文优先用浏览器自己的同源 fetch；后台上下文才用 GM_xmlhttpRequest。
+             * 两者差异不是「谁更快」，而是请求到底以谁的身份发出：扩展代发的请求在 Edge 上更容易
+             * 被边缘层直接 503（0.2 秒返回，没进 Next.js），浏览器同源请求则与真人点击一致。 */
+            const pageMode = Utils.isRewardsPage();
             const pageHeaders = {
                 "user-agent": RewardsAuto.ua.pc,
                 "referer": "https://rewards.bing.com/",
                 "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             };
-            const result = { ok: false, claimed: 0, amount: 0, before: 0, after: 0, reason: "" };
+            const readPage = (url) => pageMode
+                ? Utils.fetchSameOrigin(url, { headers: { "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" } })
+                : Utils.xhr({ url, headers: pageHeaders });
+            const result = { ok: false, claimed: 0, amount: 0, before: 0, after: 0, reason: "", diag: [] };
+            const diag = result.diag;
 
             let page = html;
             if (!page) {
                 try {
-                    page = await Utils.xhr({ url: dashUrl, headers: pageHeaders });
+                    page = await readPage(dashUrl);
                 } catch (e) {
                     result.reason = `读取 dashboard 失败：${e.message}`;
                     return result;
@@ -2941,7 +3093,7 @@ const __scBgKeepAlive = (function() {
             if (!probe.present) {
                 // 部分账号的待领池只挂在 earn 页，dashboard 读不到时再确认一次
                 try {
-                    const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn", headers: pageHeaders });
+                    const earnHtml = await readPage(earnUrl);
                     const earnProbe = this._claimProbe(earnHtml);
                     if (earnProbe.present) {
                         probe = earnProbe;
@@ -2957,14 +3109,6 @@ const __scBgKeepAlive = (function() {
 
             result.amount = probe.amount;
             result.before = probe.balance || await this.getBalance();
-
-            // 领取动作打在哪条路由上都能被服务端执行，但返回体「被接受」不等于真的入账，
-            // 所以每发一次就回读一次：没入账就换下一条路由（dashboard 是领取按钮自己的路由，优先）
-            const targets = [
-                { url: dashUrl, segment: "dashboard" },
-                { url: "https://rewards.bing.com/earn", segment: "earn" },
-            ];
-            let lastErr = null;
 
             const applyProbe = (after) => {
                 // before 没读到（0）时不能拿余额当增量，否则会把「总余额」误报成「本次领取」
@@ -2989,7 +3133,7 @@ const __scBgKeepAlive = (function() {
                     if (i) await Utils.delay(gap * i);
                     let afterPage = "";
                     try {
-                        afterPage = await Utils.xhr({ url: dashUrl, headers: pageHeaders });
+                        afterPage = await readPage(dashUrl);
                     } catch (_) { /* 读不到就再等一轮 */ }
                     if (!afterPage) continue;
                     if (applyProbe(this._claimProbe(afterPage))) return true;
@@ -2997,46 +3141,118 @@ const __scBgKeepAlive = (function() {
                 return false;
             };
 
-            const sendClaim = async (actionId) => {
-                let anyAccepted = false;
-                for (const target of targets) {
-                    try {
-                        const res = await Utils.xhr({
-                            method: "POST",
-                            url: target.url,
-                            headers: {
-                                "content-type": "text/plain;charset=UTF-8",
-                                "next-action": actionId,
-                                "referer": target.url,
-                                // 显式覆盖 Origin：扩展 origin 会被风控账号的 server action 直接 500
-                                "origin": "https://rewards.bing.com",
-                                "next-router-state-tree": Utils.routerStateTree(target.segment),
-                                "user-agent": RewardsAuto.ua.pc,
-                                "accept": "text/x-component",
-                            },
-                            data: "[]"
-                        });
-                        if (!this._claimAccepted(res)) continue;
-                        anyAccepted = true;
-                        await Utils.delay(2000);
-                        if (await verify(2, 3000)) return true;   // 真的入账了才收手
-                    } catch (e) {
-                        lastErr = e;
-                    }
+            /* 领取请求的「指纹」不能只赌一种组合。
+             * 实测同一份代码在 Chrome 里能领、在 Edge 里直接 503（0.2 秒就被拒，请求没进 Next.js；
+             * 而标识失效时服务端返回的是 400 Invalid Server Action request，不是 503）。
+             * 后台上下文里唯一「强制指定、又随浏览器不同而变化」的头就是 user-agent：
+             * 旧代码无条件把它覆盖成 Edge UA —— 在 Edge 上等于真实 UA，在 Chrome 上却让 UA 与
+             * Sec-CH-UA / navigator 对不上，反而更像「伪造客户端」。
+             * 所以后台侧改成多套组合逐个试：先按最小头打（不覆盖 UA/accept，让浏览器自己带一致的那套，
+             * 这也是参考脚本在 Edge 上能领取的写法），被拒后再回退到旧的全套头；
+             * 5xx 之间退避重试，不把一次 503 当最终结论。 */
+            const CLAIM_PROFILES = [
+                { name: "dashboard", url: dashUrl, segment: "dashboard", full: false },
+                { name: "earn", url: earnUrl, segment: "earn", full: false },
+                { name: "dashboard-full", url: dashUrl, segment: "dashboard", full: true },
+                { name: "earn-full", url: earnUrl, segment: "earn", full: true },
+            ];
+            const sendClaimRequest = (profile, actionId) => {
+                // Server Action 必需的头；其余（origin/referer/UA/客户端提示）交给上下文自己
+                const headers = {
+                    "content-type": "text/plain;charset=UTF-8",
+                    "next-action": actionId,
+                    "next-router-state-tree": Utils.routerStateTree(profile.segment),
+                };
+                if (pageMode) {
+                    // 同源 fetch：origin/referer/UA 由浏览器自动带上，手动设置只会被忽略或造成不一致
+                    return Utils.fetchSameOrigin(profile.url, {
+                        method: "POST",
+                        headers: Object.assign({ "accept": "text/x-component" }, headers),
+                        data: "[]",
+                    });
                 }
-                return anyAccepted ? "maybe" : false;
+                return Utils.xhr({
+                    method: "POST",
+                    url: profile.url,
+                    headers: Object.assign(headers, {
+                        "referer": profile.url,
+                        // 显式覆盖 Origin：扩展 origin 会被风控账号的 server action 直接 500
+                        "origin": "https://rewards.bing.com",
+                        ...(profile.full ? {
+                            "user-agent": RewardsAuto.ua.pc,
+                            "accept": "text/x-component",
+                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        } : {}),
+                    }),
+                    data: "[]",
+                });
             };
 
             let actionId = await this.getClaimActionId(page);
-            let accepted = await sendClaim(actionId);
-            // 标识失效（404/500）：重新提取一次再试，站点每次部署都会换
-            if (!result.ok && !accepted && lastErr && /\b(404|500|502|503)\b/.test(String(lastErr.message))) {
-                Utils.log("🟡", `领取标识可能已失效（${lastErr.message}），重新提取…`);
-                GM_setValue("Config.claimActionScanAt", 0);
-                const fresh = await this.getClaimActionId(page, true);
-                if (fresh && fresh !== actionId) {
-                    actionId = fresh;
-                    accepted = await sendClaim(actionId);
+            let accepted = false;
+            let refreshed = false;
+            let lastErr = null;
+            // 两轮出手：先立刻把所有组合试一遍，被拒后等一会儿再来一轮
+            //（边缘层的拦截常常是短暂的，隔几秒同样的请求就可能放过）
+            const waves = [0, 6000];
+            for (let w = 0; w < waves.length && !result.ok; w++) {
+                if (accepted) break;         // 已被接受：别再重复提交，只等复核入账
+                if (w) {
+                    const wait = waves[w] + Utils.randomRange(0, 2000);
+                    Utils.log("⏳", `领取请求未被接受（${lastErr ? lastErr.message : "未知原因"}），${Math.round(wait / 1000)} 秒后换一种请求方式重试`);
+                    await Utils.delay(wait);
+                }
+                for (const profile of CLAIM_PROFILES) {
+                    if (result.ok || accepted) break;
+                    let res;
+                    try {
+                        res = await sendClaimRequest(profile, actionId);
+                    } catch (e) {
+                        lastErr = e;
+                        diag.push(`${profile.name}:${e.message}`);
+                        // 400 = 领取标识对不上（站点重新部署过）：清缓存重新提取，后续请求用新标识
+                        if (e.status === 400 && !refreshed) {
+                            refreshed = true;
+                            Utils.log("🟡", `领取标识可能已失效（${e.message}），重新提取…`);
+                            GM_setValue("Config.claimActionScanAt", 0);
+                            const fresh = await this.getClaimActionId(page, true);
+                            if (fresh && fresh !== actionId) {
+                                actionId = fresh;
+                                Utils.log("🧩", `领取标识已刷新：${fresh.slice(0, 8)}…`);
+                            }
+                        }
+                        // 登录态失效：换路由/换头都没意义，直接收手交给下一轮
+                        if (e.status === 401 || e.status === 403) {
+                            result.reason = `登录态已失效（${e.message}），请重新授权/登录`;
+                            return result;
+                        }
+                        continue;
+                    }
+                    if (!this._claimAccepted(res)) {
+                        diag.push(`${profile.name}:响应未被接受`);
+                        continue;
+                    }
+                    accepted = true;
+                    diag.push(`${profile.name}:已接受`);
+                    await Utils.delay(1500);
+                    if (await verify(2, 3000)) break;   // 真的入账了才收手
+                }
+            }
+
+            /* 后台仍没领到时，借本机开着的 rewards 页面用同源 fetch 领一次。
+             * 这是参考脚本在 Edge 上验证过的兜底：扩展代发的请求换成浏览器自己发的同源请求，
+             * 往往就能过。没有页面在跑脚本时立刻跳过，不会打开新标签页。
+             * 注意这里不只在「被拒」时兜底：后台拿到 2xx 但始终没入账（unverified）也该试一次，
+             * 因为真正执行领取的可能压根没落到服务端的领取逻辑上。 */
+            if (!result.ok && !pageMode) {
+                const assist = await Utils.askPageClaim({ actionId });
+                if (assist) {
+                    diag.push(`page-fetch:${assist.ok ? "已入账" : (assist.reason || "未接受")}`);
+                    if (assist.ok) {
+                        result.ok = true;
+                        result.claimed = assist.claimed || 0;
+                        result.after = assist.after || 0;
+                    }
                 }
             }
 
@@ -3044,7 +3260,18 @@ const __scBgKeepAlive = (function() {
             if (!result.ok && accepted) await verify(3, 5000);
 
             if (!result.ok) {
-                result.reason = accepted ? "unverified" : (lastErr ? lastErr.message : "领取请求未被接受");
+                const status = lastErr && lastErr.status;
+                const edgeBlocked = lastErr && /akamai|ghost/i.test(String(lastErr.headers || ""));
+                // 5xx 时把状态码、是不是边缘层、试了几种组合都带上：
+                // 只留一句「HTTP 503」，日志里永远看不出是被谁拒的
+                result.reason = accepted
+                    ? "unverified"
+                    : (lastErr
+                        ? `${lastErr.message}`
+                            + (status >= 500 || status === 429
+                                ? `（${edgeBlocked ? "边缘层拦截，" : ""}已尝试 ${diag.length} 种请求方式）`
+                                : "")
+                        : "领取请求未被接受");
             }
             return result;
         },
@@ -4469,9 +4696,15 @@ const __scBgKeepAlive = (function() {
             const today = RewardsAuto.state.dateNowNum;
             const warned = Number(GM_getValue("Config.claimWarnDate", 0)) === today;
             GM_setValue("Config.claimWarnDate", today);
+            // 失败时把「每种请求方式的结果」附在后面：503 到底是边缘层拦截还是应用报错，一眼能看出来
+            const detail = Array.isArray(res.diag) && res.diag.length
+                ? `；请求结果：${res.diag.slice(-4).join("，")}`
+                : "";
             Utils.log(warned ? "🟡" : "🎁",
                 `自动领取未成功（${res.reason || "未知原因"}）：${amount}待领`
-                + (warned ? "，下一轮继续重试" : `；自动领取若持续失败，可手动打开 https://rewards.bing.com/dashboard 领取`),
+                + (warned
+                    ? `，下一轮继续重试${detail}`
+                    : `；已在后台改用多种请求方式重试，若仍失败可手动打开 https://rewards.bing.com/dashboard 领取${detail}`),
                 !warned);
             return false;
         },
@@ -5174,6 +5407,27 @@ const __scBgKeepAlive = (function() {
         if (bootstrapped) return;
         bootstrapped = true;
         TaskManager.init();
+
+        // 页面上下文：给后台的「同源领取」兜底请求做服务；同时写心跳，让后台知道本机有页面可用。
+        if (Utils.isRewardsPage()) {
+            const beat = () => { try { GM_setValue("Config.pageAliveAt", Date.now()); } catch (_) {} };
+            beat();
+            try { setInterval(beat, 60 * 1000); } catch (_) {}
+            try {
+                if (typeof GM_addValueChangeListener === "function") {
+                    GM_addValueChangeListener("Config.claimAssistReq", () => {
+                        Utils.servePageClaim().catch(() => {});
+                    });
+                }
+            } catch (_) {}
+            // 轮询兜底：不是所有沙箱都支持 GM_addValueChangeListener（有的还会因权限被拒），
+            // 少这一条兜底就会出现「后台写了请求、页面永远不响应」的静默失败。
+            // 3 秒一拍、只看一个键，代价可以忽略。
+            try { setInterval(() => { Utils.servePageClaim().catch(() => {}); }, 3000); } catch (_) {}
+            // 启动时补一次：上一轮可能写下了请求但页面当时还没起来
+            Utils.servePageClaim().catch(() => {});
+        }
+
 
         // 后台点「📋 粘贴授权码」时会置 Config.pendingPaste 并打开页面，
         // 页面侧在加载 / 获得焦点时把输入框补弹出来。
