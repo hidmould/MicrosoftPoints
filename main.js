@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.1.2
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
+// @version      1.1.3
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅待领积分自动领取、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -96,6 +96,10 @@ Tasks:
         default: true
     edge:
         title: Edge 浏览连签（后台分次上报，累计 30 分钟）
+        type: checkbox
+        default: true
+    claim:
+        title: 自动领取待领积分（pointClaim 待领池）
         type: checkbox
         default: true
 Notice:
@@ -339,6 +343,14 @@ const __scBgKeepAlive = (function() {
     const NEXT_ACTION_SCAN_BUDGET = 45 * 1000;    // 探测 Server Action ID 的总耗时上限
     const WEB_FAIL_LIMIT = 3;                     // 网页通道连续失败几次后，本轮改为只用 DAPI
     const QUEST_SCAN_MAX = 3;                     // 单轮最多拉几个 Rewards App quest 详情页
+    /* ===== 待领积分（pointClaim）=====
+     * 新版 Rewards 把「打卡 / 连签 / 等级奖励」先记进待领池（页面数据里的 "pointClaim"），
+     * 必须在 dashboard 上点一次「领取」才真正入账。官方按钮走的是 Next.js Server Action，
+     * 标识随站点部署变化，故先用手里的标识、失效（404/500）时再从页面 chunk 里重新提取。 */
+    const CLAIM_ACTION_DEFAULT = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d";
+    const CLAIM_ACTION_KNOWN_CHUNK = "/_next/static/chunks/4069k0g6u-2ge.js";   // 领取组件的分包（兜底探测用）
+    const CLAIM_ACTION_SCAN_MAX = 10;             // 提取领取标识时最多扫几个 chunk
+    const CLAIM_ACTION_SCAN_BUDGET = 30 * 1000;   // 提取领取标识的总耗时上限
 
     /* ===== 卡片锁态语义（从「微软积分商城签到（改进加强版）.user.js」迁移） =====
      * 网页端下发的活动卡片带 isLocked / isUnlocked / unlockCriteria 三个字段，
@@ -2755,6 +2767,288 @@ const __scBgKeepAlive = (function() {
             return cached;
         },
 
+        /* ===== 待领积分（pointClaim）：识别 + 领取 =====
+         * 旧版这里只读 dashboard 的「可领取」文案，然后提示用户「请手动前往领取」。
+         * 其实官方那颗按钮就是一次 Next.js Server Action（reportClaimAllPoints，body 为空数组），
+         * 用同一套请求就能自动化；接口幂等，待领池为空时连请求都不发。 */
+        _claimProbe(html) {
+            const clean = String(html || "").replace(/\\"/g, '"');
+            const out = { present: false, amount: 0, balance: 0, source: "" };
+            const bal = clean.match(/"balance"\s*:\s*(\d+)/) || clean.match(/"availablePoints"\s*:\s*(\d+)/);
+            if (bal) out.balance = parseInt(bal[1], 10) || 0;
+
+            const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/);
+            if (m && m[1] !== "null") {
+                out.source = "pointClaim";
+                /* 线上结构（已抓包核对 4069k0g6u-2ge.js）：
+                 *   pointClaim = { points: <待领总额>, entries: [{ date, category, points, expiryDate }] }
+                 * 页面判定能不能领用的就是 pointClaim.points > 0，所以先取它；
+                 * 取不到再把 entries 里的明细加总，最后才退化成「取最大数字」。
+                 * `points:0` 是「池子空了」的正常表示，不能再发领取请求（会每轮都空跑）。 */
+                const slice = this._jsonSlice(clean, m.index + m[0].length - 1);
+                const direct = slice.match(/^\{\s*"(?:points|claimablePoints|pendingPoints|amount|totalPoints)"\s*:\s*(\d+)/i);
+                let decided = false;   // 金额是否可信（可信时 0 就代表池子空）
+                if (direct) {
+                    out.amount = parseInt(direct[1], 10) || 0;
+                    decided = true;
+                } else {
+                    const entriesIdx = slice.indexOf('"entries"');
+                    if (entriesIdx >= 0) {
+                        const arrIdx = slice.indexOf("[", entriesIdx);
+                        const arr = arrIdx >= 0 ? this._jsonSlice(slice, arrIdx) : "";
+                        const sum = [...arr.matchAll(/"points"\s*:\s*(\d+)/g)]
+                            .reduce((acc, x) => acc + (parseInt(x[1], 10) || 0), 0);
+                        out.amount = sum;
+                        decided = true;
+                    } else {
+                        const nums = [...slice.matchAll(/"(?:claimable[A-Za-z]*|pending[A-Za-z]*|amount|points|total[A-Za-z]*|value)"\s*:\s*(\d+)/gi)]
+                            .map(x => parseInt(x[1], 10))
+                            .filter(n => n > 0);
+                        if (nums.length) {
+                            out.amount = Math.max(...nums);
+                            decided = true;
+                        }
+                    }
+                }
+                // 结构没认出（既不是 points 也不是 entries）时宁可按「有」处理：
+                // 漏领比多发一次幂等请求的代价大得多
+                out.present = decided ? out.amount > 0 : true;
+            }
+            if (!out.present) {
+                // 飞行数据缺失或 pointClaim 为 null 时，退回渲染文案再确认一次：
+                // 字段口径一变就漏领是最难发现的一类问题，页面明摆着有「可领取 N」就该去领。
+                // 注意要先跳过标签自身的属性（alt 后面常跟着 width/height 之类的数字），
+                // 否则会把 w/h 当成待领金额
+                const alt = clean.match(/alt="可领取"[^>]*>[\s\S]{0,300}?(\d[\d,]{0,6})/i);
+                if (alt) {
+                    out.present = true;
+                    out.source = "alt";
+                    out.amount = parseInt(alt[1].replace(/,/g, ""), 10) || 0;
+                }
+            }
+            return out;
+        },
+
+        // 从 idx 处的 { 或 [ 开始做括号配平，返回这段 JSON 字面量（字符串里的括号不计数）
+        _jsonSlice(text, idx) {
+            const open = text[idx];
+            if (open !== "{" && open !== "[") return "";
+            const close = open === "{" ? "}" : "]";
+            let depth = 0, inStr = false, esc = false;
+            for (let i = idx; i < text.length; i++) {
+                const c = text[i];
+                if (inStr) {
+                    if (esc) esc = false;
+                    else if (c === "\\") esc = true;
+                    else if (c === '"') inStr = false;
+                    continue;
+                }
+                if (c === '"') inStr = true;
+                else if (c === open) depth++;
+                else if (c === close) {
+                    depth--;
+                    if (depth === 0) return text.slice(idx, i + 1);
+                }
+            }
+            return text.slice(idx, idx + 2000);
+        },
+
+        /* 领取标识提取：站点每次部署都会换标识，缓存里只留「上次成功提取」的值。
+         * 默认值来自已实测的部署，命中时连 chunk 都不用扫（扫一轮要十几次请求）。 */
+        async getClaimActionId(html, force = false) {
+            const cached = RewardsAuto._claimAction || GM_getValue("Config.claimAction", "") || CLAIM_ACTION_DEFAULT;
+            const lastScan = Number(GM_getValue("Config.claimActionScanAt", 0)) || 0;
+            if (!force && Date.now() - lastScan < 10 * 60 * 1000) return cached;
+            const page = String(html || "");
+            if (!page.includes("_next/static/chunks/")) return cached;
+            const srcs = [...new Set(page.match(/\/_next\/static\/chunks\/[a-z0-9_\-]+\.js\?dpl=[^"]+/g) || [])]
+                .sort((a, b) => (/dashboard|earn|claim/i.test(a) ? 0 : 1) - (/dashboard|earn|claim/i.test(b) ? 0 : 1))
+                .slice(0, CLAIM_ACTION_SCAN_MAX);
+            // 领取组件不在首屏分包里，新版清单也未必枚举得到：再挂一个已知的领取分包兜底
+            // （CDN 会保留旧分包，线上实测仍可取到 reportClaimAllPoints）
+            srcs.push(CLAIM_ACTION_KNOWN_CHUNK);
+            const deadline = Date.now() + CLAIM_ACTION_SCAN_BUDGET;
+            const patterns = [
+                /createServerReference\)?\s*\(\s*"([a-f0-9]{40,64})"([\s\S]{0,600}?)\)/g,
+                /registerServerReference\)?\s*\(\s*[^,]+,\s*"([a-f0-9]{40,64})"([\s\S]{0,600}?)\)/g,
+            ];
+            for (const src of srcs) {
+                if (Date.now() > deadline) break;
+                let js = "";
+                try {
+                    js = await Utils.xhr({ url: "https://rewards.bing.com" + src, timeout: 8000 });
+                } catch (_) {
+                    continue;
+                }
+                // 只有明确出现领取动作名的 chunk 才值得逐个正则匹配
+                if (!js || !js.includes("reportClaimAllPoints")) continue;
+                for (const re of patterns) {
+                    re.lastIndex = 0;
+                    let m;
+                    while ((m = re.exec(js)) !== null) {
+                        if (!/reportClaimAllPoints/.test(m[2] || "")) continue;
+                        RewardsAuto._claimAction = m[1];
+                        GM_setValue("Config.claimAction", m[1]);
+                        GM_setValue("Config.claimActionScanAt", Date.now());
+                        Utils.log("🧩", `待领积分领取标识已更新：${m[1].slice(0, 8)}…`);
+                        return m[1];
+                    }
+                }
+            }
+            // 没命中：记时间戳做负缓存，10 分钟内不再扫（和 action id 探测同一套策略）
+            GM_setValue("Config.claimActionScanAt", Date.now());
+            return cached;
+        },
+
+        /* Server Action 的响应是 flight 文本：动作无返回值时是 `0:null`，
+         * 有返回值时常见 `0:true` / `0:{...}`。HTTP 层已经保证 2xx，这里只排除错误体。 */
+        _claimAccepted(res) {
+            const text = String(res || "").trim();
+            if (!text) return false;
+            if (/^\s*error/i.test(text)) return false;
+            // 只把「有内容的错误字段」当失败：`"errors":[]` / `"errors":0` 是正常的空错误
+            if (/"errors?"\s*:\s*(?:"[^"]+"|true|[1-9]\d*|\{[^}]|\{\s*"|\[\s*(?:"|\{|\[))/i.test(text.slice(0, 400))) return false;
+            return /^\d+:true\b/m.test(text)
+                || text === "true"
+                || /"(?:success|isSuccess|claimed)"\s*:\s*true/i.test(text)
+                || /^\d+:null\b/m.test(text)
+                || /^\d+:\{/m.test(text);
+        },
+
+        /** 领取全部待领积分：识别待领池 → Server Action 领取 → 回读 dashboard 复核。
+         *  - `ok=true` 且 reason="empty"：本来就没有待领积分（不构成失败）；
+         *  - `ok=true`：确认入账（余额增加或待领池清空）；
+         *  - `ok=false`：请求没被接受 / 尚未确认，交给下一轮再试。 */
+        async claimPendingPoints({ html = "" } = {}) {
+            const dashUrl = "https://rewards.bing.com/dashboard";
+            const pageHeaders = {
+                "user-agent": RewardsAuto.ua.pc,
+                "referer": "https://rewards.bing.com/",
+                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            };
+            const result = { ok: false, claimed: 0, amount: 0, before: 0, after: 0, reason: "" };
+
+            let page = html;
+            if (!page) {
+                try {
+                    page = await Utils.xhr({ url: dashUrl, headers: pageHeaders });
+                } catch (e) {
+                    result.reason = `读取 dashboard 失败：${e.message}`;
+                    return result;
+                }
+            }
+            let probe = this._claimProbe(page);
+            if (!probe.present) {
+                // 部分账号的待领池只挂在 earn 页，dashboard 读不到时再确认一次
+                try {
+                    const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn", headers: pageHeaders });
+                    const earnProbe = this._claimProbe(earnHtml);
+                    if (earnProbe.present) {
+                        probe = earnProbe;
+                        page = earnHtml;
+                    }
+                } catch (_) {}
+            }
+            if (!probe.present) {
+                result.ok = true;
+                result.reason = "empty";
+                return result;
+            }
+
+            result.amount = probe.amount;
+            result.before = probe.balance || await this.getBalance();
+
+            // 领取动作打在哪条路由上都能被服务端执行，但返回体「被接受」不等于真的入账，
+            // 所以每发一次就回读一次：没入账就换下一条路由（dashboard 是领取按钮自己的路由，优先）
+            const targets = [
+                { url: dashUrl, segment: "dashboard" },
+                { url: "https://rewards.bing.com/earn", segment: "earn" },
+            ];
+            let lastErr = null;
+
+            const applyProbe = (after) => {
+                // before 没读到（0）时不能拿余额当增量，否则会把「总余额」误报成「本次领取」
+                const gain = (result.before > 0 && after.balance > 0) ? after.balance - result.before : 0;
+                if (gain > 0) {
+                    result.ok = true;
+                    result.claimed = gain;
+                    result.after = after.balance;
+                    return true;
+                }
+                // 待领池已清空即算领取成功；要求同时读到余额，避免「没登录/跳登录页」被误判成领完
+                if (!after.present && after.balance > 0) {
+                    result.ok = true;
+                    result.after = after.balance;
+                    return true;
+                }
+                return false;
+            };
+
+            const verify = async (times = 3, gap = 4000) => {
+                for (let i = 0; i < times; i++) {
+                    if (i) await Utils.delay(gap * i);
+                    let afterPage = "";
+                    try {
+                        afterPage = await Utils.xhr({ url: dashUrl, headers: pageHeaders });
+                    } catch (_) { /* 读不到就再等一轮 */ }
+                    if (!afterPage) continue;
+                    if (applyProbe(this._claimProbe(afterPage))) return true;
+                }
+                return false;
+            };
+
+            const sendClaim = async (actionId) => {
+                let anyAccepted = false;
+                for (const target of targets) {
+                    try {
+                        const res = await Utils.xhr({
+                            method: "POST",
+                            url: target.url,
+                            headers: {
+                                "content-type": "text/plain;charset=UTF-8",
+                                "next-action": actionId,
+                                "referer": target.url,
+                                // 显式覆盖 Origin：扩展 origin 会被风控账号的 server action 直接 500
+                                "origin": "https://rewards.bing.com",
+                                "next-router-state-tree": Utils.routerStateTree(target.segment),
+                                "user-agent": RewardsAuto.ua.pc,
+                                "accept": "text/x-component",
+                            },
+                            data: "[]"
+                        });
+                        if (!this._claimAccepted(res)) continue;
+                        anyAccepted = true;
+                        await Utils.delay(2000);
+                        if (await verify(2, 3000)) return true;   // 真的入账了才收手
+                    } catch (e) {
+                        lastErr = e;
+                    }
+                }
+                return anyAccepted ? "maybe" : false;
+            };
+
+            let actionId = await this.getClaimActionId(page);
+            let accepted = await sendClaim(actionId);
+            // 标识失效（404/500）：重新提取一次再试，站点每次部署都会换
+            if (!result.ok && !accepted && lastErr && /\b(404|500|502|503)\b/.test(String(lastErr.message))) {
+                Utils.log("🟡", `领取标识可能已失效（${lastErr.message}），重新提取…`);
+                GM_setValue("Config.claimActionScanAt", 0);
+                const fresh = await this.getClaimActionId(page, true);
+                if (fresh && fresh !== actionId) {
+                    actionId = fresh;
+                    accepted = await sendClaim(actionId);
+                }
+            }
+
+            // 服务端记账慢的账号再给一次机会（余额/待领池可能晚十几秒才刷新）
+            if (!result.ok && accepted) await verify(3, 5000);
+
+            if (!result.ok) {
+                result.reason = accepted ? "unverified" : (lastErr ? lastErr.message : "领取请求未被接受");
+            }
+            return result;
+        },
+
         /** 领取单张卡片（统一入口：先网页通道 → 网页完成不了再换 DAPI → 一律用服务端状态复核是否真的加分）。
          *  服务端可能要 1~3 分钟才把上报记入 progress，单次失败不等于真失败，故做多轮重试。
          */
@@ -4137,31 +4431,49 @@ const __scBgKeepAlive = (function() {
             return remain === 0;
         },
 
-        /** 只是读一下 dashboard 上「可领取」的积分并提示手动领取：
-         *  纯读操作，不写任何任务日期，也不参与 isAllDone 的完成判定 ——
-         *  这些积分无论领没领，都不影响「今日任务已全部完成、停止检测」的判断。 */
+        /** 自动领取待领积分（pointClaim）。
+         *  旧版只读 dashboard 的「可领取」文案然后提示「请手动领取」，现在走 Server Action 直接领：
+         *  待领池里的积分（搜索打卡 / 连签 / 等级奖励）会在这一步入账，领不到也不会让整轮失败。
+         *  仍然保留人工兜底提示，但只在当天第一次失败时提醒一次，避免每 20 分钟刷一遍。 */
         async doClaimPoints() {
             await RegionGuard.guard("领取积分");
+            if (!GM_getValue("Tasks.claim", true)) return true;
+            let res;
             try {
-                const dashboardHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
-                if (!dashboardHtml) {
-                    Utils.log("✅", "无法获取 dashboard 页面");
-                    return;
-                }
-                const claimableMatch = dashboardHtml.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
-                if (!claimableMatch) {
-                    Utils.log("✅", "无可领取积分");
-                    return;
-                }
-                const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
-                if (amount > 0) {
-                    Utils.log("🎁", `发现 ${amount} 积分待领取（请手动前往 dashboard 领取）`, true);
-                } else {
-                    Utils.log("✅", "可领取积分为 0");
-                }
+                res = await API.claimPendingPoints();
             } catch (e) {
-                Utils.log("🟡", `检测可领取积分失败: ${e.message}`);
+                Utils.log("🟡", `领取积分执行异常: ${e.message}`);
+                res = { ok: false, reason: e.message };
             }
+
+            if (res.ok) {
+                if (res.reason === "empty") {
+                    Utils.log("✅", "无可领取积分");
+                } else {
+                    const credit = res.claimed > 0
+                        ? `+${res.claimed} 分`
+                        : (res.amount > 0 ? `约 ${res.amount} 分（以服务端记账为准）` : "已领取");
+                    Utils.log("✨", `已自动领取待领积分 ${credit}${res.after ? `（当前余额：${res.after}）` : ""}`, true);
+                    // 领取成功清掉当天的失败提醒标记，下一天再失败还能提示
+                    GM_setValue("Config.claimWarnDate", 0);
+                }
+                return true;
+            }
+
+            const amount = res.amount > 0 ? `约 ${res.amount} 分` : "数量未知";
+            if (res.reason === "unverified") {
+                Utils.log("🟡", `已发送领取请求，服务端还没刷新（${amount}待领），下一轮会再确认`);
+                return false;
+            }
+            // 真正失败（标识失效 / 未登录 / 网络）：当天只提醒一次人工兜底，避免重复刷通知
+            const today = RewardsAuto.state.dateNowNum;
+            const warned = Number(GM_getValue("Config.claimWarnDate", 0)) === today;
+            GM_setValue("Config.claimWarnDate", today);
+            Utils.log(warned ? "🟡" : "🎁",
+                `自动领取未成功（${res.reason || "未知原因"}）：${amount}待领`
+                + (warned ? "，下一轮继续重试" : `；自动领取若持续失败，可手动打开 https://rewards.bing.com/dashboard 领取`),
+                !warned);
+            return false;
         },
 
         async doStreak() {
@@ -4886,7 +5198,7 @@ const __scBgKeepAlive = (function() {
 
     /** 「今日任务是否全部完成」的唯一判定：keep=false 时用它决定是否彻底停止检测。
      *  - 只看各任务自己落下的完成日期，以及服务端确认过的标记；
-     *  - 「🎁 可领取积分」只是读 dashboard 的提示，不参与判定（领不领都不影响停检测）；
+     *  - 「待领积分」的领取结果不参与判定（领没领都不影响停检测，下一轮/明天还会再领）；
      *  - 每次都重新读一遍今天的日期和任务日期：后台上下文会跨零点常驻，不刷新就会拿昨天的日期比较。
      */
     const isDayComplete = () => {
