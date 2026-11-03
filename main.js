@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
+// @version      1.6.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -22,6 +22,8 @@
 // @connect      open.feishu.cn
 // @connect      push.i-i.me
 // @connect      api.day.app
+// @connect      127.0.0.1
+// @connect      localhost
 // @match        https://login.live.com/oauth20_desktop.srf*
 // @match        https://rewards.bing.com/*
 // @match        https://www.bing.com/*
@@ -34,6 +36,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_cookie
+// @grant        GM_closeTab
 // @grant        GM_info
 // @grant        GM_log
 // @grant        GM_registerMenuCommand
@@ -799,6 +802,9 @@ const __scBgKeepAlive = (function() {
          * 现在只区分两档：有 MUID（= Bing 已识别这个浏览器）算「有会话」；
          * 读不到（无权限/超时）返回 null 表示「不确定」，绝不能当成未登录。 */
         async loginCookies() {
+            /* 权限被拒（日志里的 GM_cookie "permission not allowed"）后不再尝试：
+             * 每次调用都会刷一条错误日志并白等 2.5 秒，而它只用于诊断，不参与交卷判断。 */
+            if (GM_getValue("Config.cookieDenied", false)) return null;
             if (typeof GM_cookie === "undefined" || !GM_cookie || typeof GM_cookie.list !== "function") return null;
             const read = (filter) => new Promise(resolve => {
                 let settled = false;
@@ -817,7 +823,7 @@ const __scBgKeepAlive = (function() {
                 read({ url: "https://rewards.bing.com/" })
             ]);
             // 两条路都读不到 → 环境不支持/无权限，返回 null 表示「不确定」，不能当成未登录
-            if (byDomain === null && byUrl === null) return null;
+            if (byDomain === null && byUrl === null) { GM_setValue("Config.cookieDenied", true); return null; }
             const all = [...(byDomain || []), ...(byUrl || [])];
             const found = new Set(all.map(c => String((c && c.name) || "")));
             const hasMuid = found.has("MUID") || found.has("MUIDB");
@@ -1596,6 +1602,258 @@ const __scBgKeepAlive = (function() {
         },
     };
 
+    /* ===== CDP 辅助：用真实鼠标事件完成「应用内搜索」型卡片 =====
+     *
+     * 为什么需要它（2026-11-03 在真实 Edge 上做的对照实验）：
+     *   · 脚本直接请求搜索 URL        → 302 的 Location 里没有 rdrig → 不记账；
+     *   · 页面内 sj_rra(url)          → 有请求，但服务端按普通搜索记账，卡片不翻转；
+     *   · 页面内 element.click()/open → 不产生 rdrig；
+     *   · CDP Input.dispatchMouseEvent（真实鼠标事件）→ 产生 rdrig → 卡片完成 +15。
+     * rdrig 是 Bing 在「浏览器级导航 + 真实输入」时才发的指针，HTTP 无法伪造。
+     *
+     * 前提（脚本无法自行满足，必须由用户开机时带上）：
+     *   Edge 以 --remote-debugging-port=<端口> + 独立 --user-data-dir 启动，并在该窗口登录 rewards。
+     * 端口从 Config.cdpPort 读取，默认 9224；连不上就静默跳过，不影响其它任务。
+     */
+    const CDP = {
+        _ws: null,
+        _id: 0,
+        _pending: null,
+
+        base() {
+            const p = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
+            return "http://127.0.0.1:" + p;
+        },
+
+        // 探测端口是否可用（独立短超时，避免没开调试时拖慢整轮）
+        async available() {
+            if (typeof WebSocket === "undefined") return false;
+            try {
+                const r = await Utils.xhr({ url: this.base() + "/json/version", timeout: 3000 });
+                return !!(r && String(r).indexOf("Browser") >= 0);
+            } catch (_) {
+                return false;
+            }
+        },
+
+        async targets() {
+            try {
+                const txt = await Utils.xhr({ url: this.base() + "/json/list", timeout: 4000 });
+                return JSON.parse(txt);
+            } catch (_) {
+                return null;
+            }
+        },
+
+        // 找到（或新开）一个 rewards earn 页
+        async earnPage() {
+            const list = await this.targets();
+            if (!list) return null;
+            const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
+            if (hit) return hit;
+            try {
+                const res = await new Promise((resolve, reject) => {
+                    GM_xmlhttpRequest({
+                        method: "PUT",
+                        url: this.base() + "/json/new?" + encodeURIComponent("https://rewards.bing.com/earn"),
+                        onload: r => resolve(r.responseText),
+                        onerror: e => reject(new Error((e && e.error) || "new tab failed")),
+                        ontimeout: () => reject(new Error("timeout")),
+                        timeout: 8000
+                    });
+                });
+                const j = JSON.parse(res);
+                await Utils.delay(3000);
+                return j;
+            } catch (_) {
+                return null;
+            }
+        },
+
+        // 建立到某个 target 的 WebSocket（service worker 里有原生 WebSocket）
+        async connect(wsUrl) {
+            if (this._ws) {
+                try { this._ws.close(); } catch (_) {}
+                this._ws = null;
+            }
+            this._pending = new Map();
+            this._id = 0;
+            const ws = new WebSocket(wsUrl);
+            await new Promise((resolve, reject) => {
+                const t = setTimeout(() => reject(new Error("ws timeout")), 6000);
+                ws.onopen = () => { clearTimeout(t); resolve(); };
+                ws.onerror = () => { clearTimeout(t); reject(new Error("ws error")); };
+            });
+            ws.onmessage = ev => {
+                let m;
+                try { m = JSON.parse(ev.data); } catch (_) { return; }
+                const p = this._pending && this._pending.get(m.id);
+                if (!p) return;
+                this._pending.delete(m.id);
+                if (m.error) p.reject(new Error(JSON.stringify(m.error)));
+                else p.resolve(m.result);
+            };
+            this._ws = ws;
+            return ws;
+        },
+
+        send(method, params) {
+            if (!this._ws) return Promise.reject(new Error("ws not connected"));
+            const mid = ++this._id;
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    if (this._pending) this._pending.delete(mid);
+                    reject(new Error("cdp timeout: " + method));
+                }, 10000);
+                this._pending.set(mid, {
+                    resolve: v => { clearTimeout(timer); resolve(v); },
+                    reject: e => { clearTimeout(timer); reject(e); }
+                });
+                try { this._ws.send(JSON.stringify({ id: mid, method: method, params: params || {} })); }
+                catch (e) { clearTimeout(timer); reject(e); }
+            });
+        },
+
+        close() {
+            try { if (this._ws) this._ws.close(); } catch (_) {}
+            this._ws = null;
+            this._pending = null;
+        },
+
+        async evaluate(expression) {
+            const r = await this.send("Runtime.evaluate", { expression: expression, returnByValue: true, userGesture: true });
+            return r && r.result ? r.result.value : undefined;
+        },
+
+        /* 列出 earn 页上未完成的「应用内搜索」型卡（必须是 bing 搜索链接） */
+        async pendingCards() {
+            const expr = [
+                "(function(){",
+                "  var out = [];",
+                "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
+                "  var nodes = document.querySelectorAll(sel);",
+                "  for (var i = 0; i < nodes.length; i++) {",
+                "    var a = nodes[i];",
+                "    var txt = (a.innerText || '').replace(/\\s+/g, ' ').trim();",
+                "    if (/已完成/.test(txt)) continue;",
+                "    if (!/bing\\.com\\/search/i.test(a.href)) continue;",
+                "    out.push({ title: (txt.split(' ')[0] || txt).slice(0, 20), href: a.href });",
+                "  }",
+                "  return JSON.stringify(out);",
+                "})()"
+            ].join("\n");
+            const raw = await this.evaluate(expr);
+            try { return JSON.parse(raw || "[]"); } catch (_) { return []; }
+        },
+
+        /* 对该卡派发真实鼠标事件（唯一能产生 rdrig 的方式） */
+        async clickCard(href) {
+            const h = JSON.stringify(href);
+            const posExpr = [
+                "(function(){",
+                "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
+                "  var nodes = document.querySelectorAll(sel);",
+                "  var target = null;",
+                "  for (var i = 0; i < nodes.length; i++) { if (nodes[i].href === " + h + ") { target = nodes[i]; break; } }",
+                "  if (!target) return 'nf';",
+                "  target.scrollIntoView({ block: 'center' });",
+                "  var r = target.getBoundingClientRect();",
+                "  return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });",
+                "})()"
+            ].join("\n");
+            let pos = await this.evaluate(posExpr);
+            if (pos === "nf") return false;
+            await Utils.delay(900);
+            pos = await this.evaluate(posExpr);   // 滚动后重取坐标
+            if (pos === "nf") return false;
+            let pt = null;
+            try { pt = JSON.parse(pos); } catch (_) { return false; }
+            await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y, button: "none" });
+            await Utils.delay(250);
+            await this.send("Input.dispatchMouseEvent", { type: "mousePressed", x: pt.x, y: pt.y, button: "left", buttons: 1, clickCount: 1 });
+            await Utils.delay(250);
+            await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0, clickCount: 1 });
+            return true;
+        },
+
+        // 页面上的「已完成 / 总数」
+        async progress() {
+            const expr = [
+                "(function(){",
+                "  var done = 0, total = 0;",
+                "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
+                "  var nodes = document.querySelectorAll(sel);",
+                "  for (var i = 0; i < nodes.length; i++) {",
+                "    total++;",
+                "    if (/已完成/.test(nodes[i].innerText || '')) done++;",
+                "  }",
+                "  return JSON.stringify({ done: done, total: total });",
+                "})()"
+            ].join("\n");
+            const raw = await this.evaluate(expr);
+            try { return JSON.parse(raw || "{}"); } catch (_) { return { done: 0, total: 0 }; }
+        },
+
+        /* 对外主入口：用真实点击完成所有未完成的搜索型卡。
+         * 返回 { ok, handled, done, total, reason }；连不上 CDP 时 ok=false 且 reason 说明原因。 */
+        async claimAll(maxCards) {
+            const cap = Number(maxCards) || 6;
+            if (!(await this.available())) {
+                return { ok: false, reason: "CDP 端口未开放（需以 --remote-debugging-port 启动浏览器）" };
+            }
+            let page = await this.earnPage();
+            if (!page) return { ok: false, reason: "打不开 earn 页" };
+            const result = { ok: true, handled: 0, done: 0, total: 0 };
+            try {
+                await this.connect(page.webSocketDebuggerUrl);
+                const before = await this.progress();
+                result.done = before.done || 0;
+                result.total = before.total || 0;
+                Utils.log("🖱️", "CDP 已连接：当前已完成 " + before.done + "/" + before.total);
+
+                const cards = await this.pendingCards();
+                if (cards.length === 0) {
+                    Utils.log("✅", "CDP：没有待处理的应用搜索卡");
+                    return result;
+                }
+                Utils.log("🖱️", "CDP：发现 " + cards.length + " 张待处理卡（用真实点击完成）");
+
+                for (const card of cards.slice(0, cap)) {
+                    // 真实点击会开新标签；每次重新定位并确保连接可用
+                    page = await this.earnPage();
+                    if (!page) break;
+                    if (!this._ws || this._ws.readyState !== 1) {
+                        await this.connect(page.webSocketDebuggerUrl);
+                    }
+                    const ok = await this.clickCard(card.href);
+                    if (ok) {
+                        result.handled++;
+                        Utils.log("🖱️", "  已点击：" + card.title);
+                    }
+                    await Utils.delay(8000);   // 给新页面跑完自己的记账
+                }
+
+                // 轮询等待服务端记账（最多约 2 分钟）
+                for (let i = 0; i < 12; i++) {
+                    await Utils.delay(10000);
+                    const pg = await this.earnPage();
+                    if (!pg) break;
+                    if (!this._ws || this._ws.readyState !== 1) await this.connect(pg.webSocketDebuggerUrl);
+                    const now = await this.progress();
+                    result.done = now.done || 0;
+                    result.total = now.total || 0;
+                    if (result.handled > 0 && result.done >= result.total) break;
+                }
+                return result;
+            } catch (e) {
+                return { ok: false, reason: e.message };
+            } finally {
+                this.close();
+            }
+        }
+    };
+
+
     const API = {
         /* 统一走 POST 表单请求 token 端点，并解析 400 响应里的 JSON 错误体，
          * 否则 invalid_grant 会被当成网络错误盲重试。 */
@@ -1951,100 +2209,73 @@ const __scBgKeepAlive = (function() {
         },
 
         /* 「在 Rewards 应用内搜索」型卡片（href 带 form=ML2W4J/ML2Y2H 与 PUBL=RewardsDO）。
-         * 这类卡不靠 Server Action 交卷，而是靠「真的搜一次」让服务端记账。
          *
-         * 实现依据 = 2026-11-03 的真实抓包，共三个决定性细节：
-         *  1) 浏览器点的是 www.bing.com/search?...，服务端 302 到 cn.bing.com 时
-         *     才追加 &rdr=1&rdrig=<32位HEX>；脚本拿到的 card.destination 却已经是 cn 域名，
-         *     所以这里**必须主动先请求 www 版本**，否则永远拿不到 rdrig。
-         *  2) UA 是普通 Edge（不是 MSRewards/Desktop）。
-         *  3) ncheader body = wb=1；reportActivity 查询串 = IG + IID + 原链接全部参数 + ajaxreq=1，
-         *     body = url=<最终搜索URL>&V=web。
+         * 为什么必须开真实标签页（这是 11 轮排查的最终结论）：
+         *  - 服务端只在**顶层文档导航**时才在 302 里追加 rdrig（它靠 sec-fetch-mode:navigate /
+         *    sec-fetch-dest:document 识别）。这两个头是浏览器的禁止修改头，GM_xmlhttpRequest
+         *    伪装不出来，所以纯 HTTP 永远拿不到 rdrig；
+         *  - reportActivity 返回的不是 JSON，而是一段客户端模块（ModernRewards...），
+         *    真正的记账由页面里的 JS 执行，后台上下文没有那套运行时。
+         * 结论：这类卡只能在真实页面里完成 —— 打开标签页，让页面自己的脚本跑一遍，然后关掉。
          *
-         * 另外：reportActivity 的**返回内容**以前从来没被记录过，导致只能靠猜。
-         * 现在无论成败都打一行摘要，直接看服务端怎么说。 */
+         * 与「不打开多余标签页」的设计冲突，但这是唯一能真正完成的方式，且只对这类卡生效。 */
         async reportDailyActivity(searchUrl) {
             try {
                 const rawUrl = String(searchUrl || "").trim();
                 if (!rawUrl) return false;
                 const target = new URL(rawUrl.startsWith("http") ? rawUrl : `https://www.bing.com${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
+                const url = `https://www.bing.com${target.pathname}?${target.search.slice(1)}`;
 
-                const baseHeaders = {
-                    "user-agent": RewardsAuto.ua.pc,
-                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "cache-control": "max-age=0"
-                };
+                /* 节流用**持久化、按卡片区分**的时间戳，不能用内存 Set：
+                 *  - 内存 Set 在 MV3 service worker 被挂起后不会释放，第二次调用 has(url) 恒为真，
+                 *    直接 return —— 日志里就只剩「打开标签页」而永远没有「已关闭」；
+                 *  - 用全局时间戳又会让不同卡片互相阻塞（第 2 张卡被第 1 张挡 20 秒）。
+                 * 所以 key 里带上查询词摘要，按卡区分。 */
+                const cardKey = (String(target.search).match(/[?&]q=([^&]{0,40})/) || [])[1] || String(target.pathname);
+                const lastKey = `Config.searchTabAt.${cardKey}`;
+                const last = Number(GM_getValue(lastKey, 0)) || 0;
+                if (Date.now() - last < 20 * 1000) {
+                    Utils.log("🟡", "刚刚已为该搜索卡开过标签页，稍后再试");
+                    return false;
+                }
+                GM_setValue(lastKey, Date.now());
 
-                // 关键：强制走 www。card.destination 常常已经是 cn 域名，而 rdrig 只在
-                // www → cn 的 302 里生成。没有 rdrig，reportActivity 认不到是哪次点击。
-                const query = target.search.slice(1);
-                const wwwUrl = `https://www.bing.com${target.pathname}?${query}`;
-
-                let finalUrl = wwwUrl;
-                let serp = "";
+                let tab = null;
                 try {
-                    const full = await this._xhrFull({ url: wwwUrl, headers: baseHeaders });
-                    serp = String(full.text || "");
-                    if (full.finalUrl) finalUrl = full.finalUrl;
+                    Utils.log("🌐", `打开标签页完成应用搜索：${target.pathname.slice(0, 40)}`);
+                    /* active:true —— 前台打开。
+                     * 后台标签页会被浏览器降频（定时器最小间隔被拉长到 1 秒甚至更多），
+                     * 微软页面里那套 rewards 记账脚本依赖定时器/事件，后台状态下经常跑不完整。
+                     * 这是完成这类卡必要的代价：会短暂抢一次焦点，约 12 秒后自动关闭。 */
+                    tab = GM_openInTab(url, { active: true, insert: true, setParent: true });
+                    GM_setValue("Config.searchTabOpenedAt", Date.now());
                 } catch (e) {
-                    Utils.log("🟡", `搜索页打开失败: ${e.message}`);
+                    Utils.log("🟡", `无法打开标签页: ${e.message}`);
                     return false;
                 }
 
-                let finalParsed;
-                try { finalParsed = new URL(finalUrl); } catch (_) { finalParsed = target; }
-                const rdrig = finalParsed.searchParams.get("rdrig") || "";
-                const jumped = finalParsed.hostname !== "www.bing.com";
-                if (!rdrig) {
-                    Utils.log("🟡", `没能拿到 rdrig（跳转=${jumped}），本次上报大概率不记账：${finalUrl.slice(0, 140)}`);
+                /* 等页面把自己的记账链路走完。
+                 * 前台标签页不会降频，但页面 JS 仍有自己的节奏（抓包里三步在 1 秒内完成，
+                 * 冷启动 + 网络慢会久一些）。分小段等待并保活，避免 MV3 把长定时器掐断。 */
+                const waitMs = Number(typeof __MP_TEST_TAB_WAIT__ !== "undefined" ? __MP_TEST_TAB_WAIT__ : 12000);
+                const step = 1000;
+                for (let waited = 0; waited < waitMs; waited += step) {
+                    await Utils.delay(step);
+                    try { GM_getValue("Config.searchTabTick", 0); GM_setValue("Config.searchTabTick", Date.now()); } catch (_) {}
                 }
 
-                const compact = String(serp).split(/\s+/).join("");
-                const igMatch = compact.match(/[,{]?"?IG"?\s*:\s*"([A-Za-z0-9]+)"/);
-                const ig = igMatch ? igMatch[1] : "";
-
-                const reportBase = Object.assign({}, baseHeaders, {
-                    "accept": "*/*",
-                    "content-type": "application/x-www-form-urlencoded",
-                    "referer": finalUrl,
-                    "origin": finalParsed.origin
-                });
-
-                // ncheader：body 是 wb=1（抓包确认）
                 try {
-                    await Utils.xhr({
-                        method: "POST",
-                        url: `${finalParsed.origin}/rewardsapp/ncheader?ver=${String(Date.now()).slice(0, 8)}&IID=SERP.5048&IG=${encodeURIComponent(ig || Utils.getRandomUUID())}&ajaxreq=1`,
-                        headers: reportBase,
-                        data: "wb=1"
-                    });
-                } catch (e) {
-                    Utils.log("🟡", `ncheader 失败（继续上报）: ${e.message}`);
-                }
+                    if (tab && typeof tab.close === "function") {
+                        tab.close();
+                    } else if (tab && tab.tabId !== undefined && typeof GM_closeTab === "function") {
+                        GM_closeTab(tab.tabId);
+                    }
+                } catch (_) {}
 
-                // reportActivity：带 IG + 全部原参数（含 rdr/rdrig）
-                const reportQuery = finalParsed.search.slice(1);
-                const reportUrl = `${finalParsed.origin}/rewardsapp/reportActivity?IG=${encodeURIComponent(ig || Utils.getRandomUUID())}&IID=SERP.5058&${reportQuery}${reportQuery.includes("ajaxreq=") ? "" : "&ajaxreq=1"}`;
-                let respText = "";
-                try {
-                    respText = await Utils.xhr({
-                        method: "POST",
-                        url: reportUrl,
-                        headers: reportBase,
-                        data: `url=${encodeURIComponent(finalUrl)}&V=web`
-                    });
-                } catch (e) {
-                    Utils.log("🟡", `reportActivity 异常: ${e.message}`);
-                    return false;
-                }
-
-                // 服务端的真实回复 —— 这是判断「有没有被记账」的唯一直接依据
-                const brief = JSON.stringify(String(respText || "").split(/\s+/).join(" ").slice(0, 200));
-                Utils.log("📋", `搜索上报返回：IG=${(ig || "随机").slice(0, 12)} rdrig=${rdrig ? rdrig.slice(0, 8) : "无"} body=${brief}`);
+                Utils.log("📋", `应用搜索标签页已执行并关闭：${target.hostname}${target.pathname}`);
                 return true;
             } catch (e) {
-                Utils.log("🟡", `搜索上报失败: ${e.message}`);
+                Utils.log("🟡", `应用搜索失败: ${e.message}`);
                 return false;
             }
         },
@@ -2374,6 +2605,29 @@ const __scBgKeepAlive = (function() {
         isUnoffered(offerId) {
             if (!offerId) return false;
             try { return GM_getValue(this._unofferableKey(offerId), false) === true; } catch (_) { return false; }
+        },
+
+        /* 「需手动完成」名单：应用内搜索型卡被脚本上报过、但卡片状态只能靠真实点击翻转。
+         * 记下来避免同一张卡在一轮里反复开标签页；跨天自动失效。
+         * 注意这不是「不可做」——用户点一下就能完成，所以仍然会在日志里提示。 */
+        _manualKey(offerId) {
+            return `Config.manualCard.${Utils.getTodayNum()}.${offerId}`;
+        },
+
+        _markManualCard(offerId, name) {
+            if (!offerId) return;
+            try {
+                GM_setValue(this._manualKey(offerId), true);
+                RewardsAuto.state.manualCards = RewardsAuto.state.manualCards || [];
+                if (!RewardsAuto.state.manualCards.some(x => x.offerId === offerId)) {
+                    RewardsAuto.state.manualCards.push({ offerId, name: name || offerId });
+                }
+            } catch (_) {}
+        },
+
+        isManualCard(offerId) {
+            if (!offerId) return false;
+            try { return GM_getValue(this._manualKey(offerId), false) === true; } catch (_) { return false; }
         },
 
         // 通过 DAPI 发现「今日日常活动卡片」，不依赖页面 HTML / Cookie；preMap 可复用已获取的 map
@@ -2905,6 +3159,13 @@ const __scBgKeepAlive = (function() {
             const backoffs = opts.backoffs || [[8000, 12000], [20000, 30000], [45000, 60000]];
             const diag = [];
 
+            /* 应用内搜索型卡已被脚本上报过：卡片状态只能靠真实点击翻转，
+             * 再重试只会重复开标签页、白等 25 秒，所以直接跳过并保持提示。 */
+            if (this.isManualCard(offerId)) {
+                Utils.log("🖐️", `已自动上报搜索，完成状态需手动点击确认：${name}`);
+                return false;
+            }
+
             // 今日已被服务端明确拒绝（503 等级门槛）：不再重复撞，直接认输交给下一轮/明天
             if (this.isUnoffered(offerId)) {
                 Utils.log("🔒", `今日已确认做不了，跳过：${name}`);
@@ -2979,7 +3240,35 @@ const __scBgKeepAlive = (function() {
             }
 
             // ---------- 1) 网页通道（优先） ----------
-            if (!skipWeb && !card.hash) {
+            /* 分支顺序很重要：搜索型卡靠 destination 完成，不由 hash 驱动，
+             * 必须排在「无 hash」分支之前，否则 DAPI 发现的搜索卡会被误判成走 DAPI。 */
+            if (!skipWeb && this._isAppSearchCard(card)) {
+                /* 「应用内搜索」型卡（href 带 PUBL=RewardsDO / form=ML2W4J|ML2Y2H）。
+                 *
+                 * 实测（真实 Edge + CDP）说明这类卡有一个特殊性质：
+                 *   · 脚本可以打开页面并调用页面里的 sj_rra 完成上报，服务端也会记分；
+                 *   · 但卡片「已完成」状态只有用户从 earn 页真实点击才会翻转，脚本做不到。
+                 * 因此这里不再无谓地反复重试 3 次（每次都开标签页、等 60 秒，把整轮拖满），
+                 * 而是：上报一次 → 短暂等待 → 没完成就明确告知需要手动点击。 */
+                const searchOk = await this.reportDailyActivity(card.destination);
+                diag.push(searchOk ? "search(已上报)" : "search(失败)");
+                if (searchOk) {
+                    // 短暂等待：服务端记账可能比标签页加载慢，但不必等到 60 秒
+                    const deadline = Date.now() + 25 * 1000;
+                    while (Date.now() < deadline) {
+                        if (await this.isOfferCompleteAny(offerId, true) === true) {
+                            Utils.log("🟢", `应用搜索领取成功：${name}`);
+                            return true;
+                        }
+                        await Utils.delay(5000);
+                    }
+                    diag.push("search(已上报未标记完成)");
+                    Utils.log("🟡", "「" + name + "」已自动上报搜索，但卡片状态需手动确认："
+                        + "请在 rewards.bing.com/earn 点一次这张卡", true);
+                }
+                // 无论成败都不再重试：这类卡重试多少次结果都一样，只会占满整轮时间
+                this._markManualCard(offerId, name);
+            } else if (!skipWeb && !card.hash) {
                 // DAPI 发现的日常卡没有 hash（网页通道拿不到交卷标识），直接走 DAPI
                 diag.push("web(无hash)");
             } else if (!skipWeb && card.appOnly) {
@@ -2988,20 +3277,6 @@ const __scBgKeepAlive = (function() {
                 // 应用通道是另一套身份，被 401 熔断连坐就会让这类卡永远做不成。
                 await this._claimViaAppChannel(card, { diag, name });
                 if (await this.isOfferCompleteAny(offerId, true) === true) return true;
-            } else if (!skipWeb && this._isAppSearchCard(card)) {
-                // 「在 Rewards 应用内搜索」型卡（href 带 PUBL=RewardsDO / form=ML2W4J|ML2Y2H）:
-                // 这类卡不看 Server Action，靠真的走一遍应用搜索来记账。
-                // 以前把它们当普通卡交卷，服务端自然不给分（dapi(p=0) + web 不记账）。
-                const searchOk = await this.reportDailyActivity(card.destination);
-                diag.push(searchOk ? "search(已上报)" : "search(失败)");
-                if (searchOk) {
-                    await Utils.randomDelay(2000, 4000);
-                    if (await this.isOfferCompleteAny(offerId, true) === true) {
-                        Utils.log("🟢", `应用搜索领取成功：${name}`);
-                        return true;
-                    }
-                    diag.push("search(已上报待记账)");
-                }
             } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
                 diag.push("web(未登录跳过)");
             } else if (!skipWeb && RewardsAuto.state.webFailStreak >= WEB_FAIL_LIMIT) {
@@ -4005,6 +4280,20 @@ const __scBgKeepAlive = (function() {
                 return true;
             }
             Utils.log("🧩", `发现 ${cards.length} 个卡片`);
+
+            /* 先用 CDP 真实点击把「应用内搜索」型卡做掉 —— 这类卡只有真实鼠标事件
+             * 才能产生 rdrig（详见 CDP 模块注释）。CDP 不可用时静默跳过，不影响后续流程。 */
+            try {
+                const cdp = await CDP.claimAll(6);
+                if (cdp.ok && cdp.handled > 0) {
+                    Utils.log("🖱️", "CDP 真实点击完成 " + cdp.handled + " 张（当前 " + cdp.done + "/" + cdp.total + " 已完成）");
+                } else if (!cdp.ok) {
+                    Utils.log("🟡", "CDP 跳过：" + cdp.reason);
+                }
+            } catch (e) {
+                Utils.log("🟡", "CDP 异常：" + e.message);
+            }
+
             // 用户关掉 Quiz 时，Quiz 卡片本轮本来就不处理，判定「是否还有未完成」时也不该算它，
             // 否则这类卡片会让当天永远无法判定完成。
             const shouldSkip = (card) => card.kind === "quiz" && !GM_getValue("Tasks.quiz", true);
@@ -4039,7 +4328,8 @@ const __scBgKeepAlive = (function() {
                         const item = map.get(c.offerId);
                         if (item.complete) continue;
                         // 今日被服务端 503 拒绝的卡也不计入剩余：否则当天永远判不成完成
-                        if (CardLock.claimable(item) && !API.isUnoffered(c.offerId)) pending++;
+                        // 手动卡（已上报但状态需用户点击确认）也不计入剩余，否则当天永远判不成完成
+                        if (CardLock.claimable(item) && !API.isUnoffered(c.offerId) && !API.isManualCard(c.offerId)) pending++;
                         else lockedNow++;
                     }
                 }
@@ -4047,6 +4337,12 @@ const __scBgKeepAlive = (function() {
             if (pending === 0) {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
+            }
+            // 应用内搜索型卡：脚本只能上报搜索，卡片状态要用户点一下才翻转
+            const manualCards = (RewardsAuto.state.manualCards || []);
+            if (manualCards.length > 0) {
+                Utils.log("🖐️", "以下 " + manualCards.length + " 张卡已自动上报搜索，请在 earn 页手动点一次："
+                    + manualCards.map(m => m.name).join("、"), true);
             }
             if (lockedNow > 0) {
                 Utils.log("🔒", `另有 ${lockedNow} 张卡片处于锁定状态，不计入剩余量（满足条件后会自动重试）`);
@@ -5211,6 +5507,51 @@ const __scBgKeepAlive = (function() {
 
     // Bing 搜索页是脚本自己打开的：既不初始化，也不参与调度，免得开出一堆标签页
     if (isBingSearchPage) {
+        /* Bing 搜索页：脚本自己打开的页面不参与调度。
+         *
+         * 2026-11-03 在真实 Edge（CDP）里完整调试过这类「应用内搜索」卡，结论如下：
+         *
+         *  1) 页面被动打开时只加载 widget.js —— 不发 ncheader、更不发 reportActivity；
+         *  2) 页面全局函数 sj_rra(url) 是记账入口，调用后请求参数与手动抓包一致，
+         *     服务端也返回 RewardsIncrement:1、余额 +15；
+         *  3) **但卡片完成状态不会因此更新**（等 90 秒仍是未完成）；
+         *  4) 只有用户从 earn 页真实点击那张卡，卡片才会变成「已完成」；
+         *  5) 页面里 onRALoad 没有绑定（sjEvtBound=false），缺少事件驱动，
+         *     这就是「能加分但不标记完成」的原因。
+         *
+         * 所以脚本这边调用 sj_rra 作为**尽力而为**：能加分的账户会拿到分，
+         * 但卡片状态需要用户自己点一下。日志会明确写出这一点，不再让人误以为失败。 */
+        const sp = (() => { try { return new URLSearchParams(location.search); } catch (_) { return new URLSearchParams(); } })();
+        const isRewardSearch = /^(ML2W4J|ML2Y2H)$/i.test(sp.get("form") || "")
+            || (sp.get("PUBL") || "").toUpperCase() === "REWARDSDO";
+
+        if (isRewardSearch) {
+            Promise.resolve().then(async () => {
+                try {
+                    const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : window;
+                    let ready = false;
+                    for (let i = 0; i < 24; i++) {
+                        await Utils.delay(500);
+                        if (typeof host.sj_rra === "function" && typeof host.sj_gx === "function") { ready = true; break; }
+                    }
+                    if (!ready) {
+                        GM_log("🎯 奖励搜索页：页面未提供 sj_rra（非 Bing 奖励页或模块未加载）");
+                        return;
+                    }
+                    const href = String(location.href || "");
+                    const rdrig = sp.get("rdrig") || "";
+                    const ig = String((host._G && host._G.IG) || "");
+                    host.sj_rra(href);
+                    GM_log(`🎯 奖励搜索页：已调用 sj_rra（IG=${ig.slice(0,12)||"无"} rdrig=${rdrig ? rdrig.slice(0,8) : "无"}）`);
+                    GM_setValue("Config.rewardSearchSeenAt", Date.now());
+                    /* 实测提醒：这一步能让服务端记分（RewardsIncrement:1），
+                     * 但卡片状态不会因此变成「已完成」—— 那个状态只有真实点击才会翻转。 */
+                    GM_log("🎯 注意：sj_rra 已尽力上报；若卡片仍显示未完成，需在 earn 页手动点一次该卡");
+                } catch (e) {
+                    GM_log(`🎯 奖励搜索页处理异常：${e.message}`);
+                }
+            });
+        }
         GM_log("⏭️ 当前为 Bing 搜索页，跳过脚本初始化（防止重复执行/打开多余页面）");
         return;
     }
@@ -5271,7 +5612,7 @@ const __scBgKeepAlive = (function() {
     if (typeof __MP_TEST_HOOK__ === "function") {
         try {
             __MP_TEST_HOOK__({ Utils, API, RewardsAuto, RegionGuard, Webhooks, Sched, TaskManager, Auth,
-                CardLock, SEARCH_PACER, EdgeStreak, EdgePacer, UA, EDGE });
+                CardLock, SEARCH_PACER, EdgeStreak, EdgePacer, UA, EDGE, CDP });
         } catch (_) {}
     }
 
