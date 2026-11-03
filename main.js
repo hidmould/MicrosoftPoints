@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.1.2
+// @version      1.2.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）（全程后台运行，不打开多余标签页）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -363,6 +363,8 @@ const __scBgKeepAlive = (function() {
             return {
                 isLocked: pick("isLocked", "islocked"),
                 isUnlocked: pick("isUnlocked", "isunlocked"),
+                isDisabled: pick("isDisabled", "isdisabled"),
+                isHidden: pick("isHidden", "ishidden", "hidden"),
                 unlockCriteria: rawUnlock === "$undefined" ? undefined : rawUnlock,
                 state: String(pick("state", "State") || ""),
                 offerId: String(pick("offerId", "offerid", "name") || ""),
@@ -372,43 +374,82 @@ const __scBgKeepAlive = (function() {
 
         hasExplicitState(item) {
             const f = this.fields(item);
-            return f.isLocked !== undefined || f.isUnlocked !== undefined || f.unlockCriteria !== undefined;
+            return f.isLocked !== undefined || f.isUnlocked !== undefined
+                || f.isDisabled !== undefined || f.unlockCriteria !== undefined;
         },
 
-        // 只给「没有任何锁态字段」的来源兜底：这类文案出现时基本就是锁住/未开放
+        // 只给「没有任何锁态字段」的来源兜底：这类文案出现时基本就是锁住/未开放。
+        // 中文站点会把这些文案本地化，所以英文之外还得认「明天再来」「在必应应用/必应 App 中完成」。
         textLocked(text) {
-            return /offer is locked|available tomorrow|earn -1 points/i.test(String(text || ""));
+            const s = String(text || "");
+            return /offer is locked|available tomorrow|earn -1 points|明天再来|明天可用|已锁定|在必应应用|必应\s*app|仅限.*应用|需在应用/i.test(s);
         },
 
-        // → { locked, appExclusive, reason }；completed 由调用方按自己的字段判断
+        /* → { locked, appExclusive, appOnly, reason }
+         *   locked      : 今天没有任何通道能做（明天才开 / 已禁用 / 纯文案锁）→ 直接跳过，别反复重试
+         *   appExclusive: 只能通过 Rewards App 通道完成的卡（Moreactivities_RewardsApp / unlockCriteria=rewardsApp）
+         *   appOnly     : 必须走「Rewards 应用 UA」通道 —— 这类卡在普通浏览器 UA 下带锁徽标，
+         *                 换 Rewards 应用 UA 后服务端会渲染成 isLocked:false / isUnlocked:true，
+         *                 hash / offerId 与网页端完全一致，照样能用同一个 server action 交卷。
+         *                 旧版把这类卡当锁卡丢掉，就是「带锁标识的卡一张都做不成」的原因。
+         * completed 由调用方按自己的字段判断 */
         probe(item) {
             const f = this.fields(item);
             const appExclusive = /Moreactivities_RewardsApp/i.test(f.offerId)
                 || String(f.unlockCriteria || "").toLowerCase() === "rewardsapp";
+            /* 等级门槛卡：offerId 形如 WW_Rewards_locked_level2_Nov26w1_off。
+             * 这是「需要 Rewards 等级 2」的前置条件卡 —— 等级不够时服务端直接 503 拒绝交卷
+             * （实测 0.21 秒返回，是前置校验，不是网络抖动）。
+             * 但等级达标后同一张卡是可以完成的（isLocked:false + isUnlocked:true），
+             * 所以这里只标记身份，跳不跳过仍由下面的 isLocked/isUnlocked 决定：
+             * 按 ID 一律跳过会误杀已解锁的卡（也就是「带锁标识但其实已解锁」那一类）。 */
+            const levelGated = /locked_level2|newLevel2/i.test(f.offerId)
+                || String(f.unlockCriteria || "").toLowerCase() === "newlevel2";
+            const keep = (reason) => ({ locked: false, appExclusive, appOnly: appExclusive, levelGated, reason });
+            const skip = (reason) => ({ locked: true, appExclusive, appOnly: false, levelGated, reason });
+            const appTry = (reason) => ({ locked: false, appExclusive, appOnly: true, levelGated, reason });
+
+            // 1) 完全没有锁态字段（老页面 / DOM 兜底）：只能看文案
             if (!this.hasExplicitState(item)) {
-                if (this.textLocked(`${f.title} ${f.offerId} ${f.state}`)) {
-                    return { locked: true, appExclusive, reason: "仅有锁态文案" };
+                const text = `${f.title} ${f.offerId} ${f.state}`;
+                if (!this.textLocked(text)) {
+                    // 等级门槛卡且页面没给锁态字段：无法确认是否解锁，按「可尝试」处理
+                    // （真正的判据是交卷时服务端给不给分，503 会被 claimCard 记为今日不可做）
+                    return keep(levelGated ? "等级门槛卡(无锁态字段,按可尝试处理)" : "");
                 }
-                return { locked: false, appExclusive, reason: "" };
+                if (/在必应应用|必应\s*app|仅限.*应用|需在应用|bing\s*app|mobile\s*app/i.test(text)) {
+                    return appTry("文案指向 App 通道");
+                }
+                return skip("仅有锁态文案");
             }
-            // isLocked:false 是运行时权威信号（网页上锁图标已经消失）；unlockCriteria 只是「解锁条件的名字」
-            // 这类元数据，卡解锁之后它仍会留在负载里 —— 不能再据此判锁，否则刚解锁的卡会被永久挡住。
-            if (f.isLocked === false) {
-                return { locked: false, appExclusive, reason: appExclusive ? "rewardsApp" : "" };
-            }
-            if (f.isLocked === true) return { locked: true, appExclusive, reason: "isLocked=true" };
-            if (f.isUnlocked === false) return { locked: true, appExclusive, reason: "isUnlocked=false" };
-            // App 专属卡（unlockCriteria=rewardsApp / Moreactivities_RewardsApp）在网页端始终显示为锁态，
-            // 但本脚本的 DAPI 通道就是 Rewards App 通道，能直接完成它 —— 所以只有 isLocked/isUnlocked
-            // 明确表示「App 里也还没解锁」时才跳过，其余情况放行交给 DAPI 领取。
-            if (appExclusive) return { locked: false, appExclusive: true, reason: "rewardsApp" };
+            // isDisabled 是「这张卡今天彻底不可做」的硬信号，优先于任何解锁字段
+            if (f.isDisabled === true) return skip("isDisabled=true");
+            // isLocked:false 是运行时权威信号（网页上锁徽标已消失）。
+            // unlockCriteria 只是「解锁条件的名字」这类元数据，卡解锁后仍留在负载里，
+            // 不能再据此判锁，否则刚解锁的卡会被永久挡住。
+            if (f.isLocked === false) return keep(appExclusive ? "rewardsApp(已解锁)" : "");
+            if (f.isUnlocked === true) return keep(appExclusive ? "rewardsApp(已解锁)" : "");
+            // App 专属卡在普通浏览器 UA 下恒为锁态，但换成 Rewards 应用 UA 就是解锁态 → 交给 App 通道
+            if (appExclusive) return appTry(f.isLocked === true ? "isLocked=true(App 专属→App UA)" : "rewardsApp");
+            if (f.isLocked === true) return skip("isLocked=true");
+            if (f.isUnlocked === false) return skip("isUnlocked=false");
+            // 剩下的只有「有 unlockCriteria 但没有 isLocked」的未知态：按元数据判锁
             if (f.unlockCriteria !== undefined && f.unlockCriteria !== "") {
-                return { locked: true, appExclusive, reason: `unlockCriteria=${f.unlockCriteria}` };
+                return skip(`unlockCriteria=${f.unlockCriteria}`);
             }
-            if (f.state && this.textLocked(f.state)) {
-                return { locked: true, appExclusive, reason: `state=${f.state}` };
-            }
-            return { locked: false, appExclusive, reason: "" };
+            if (f.state && this.textLocked(f.state)) return skip(`state=${f.state}`);
+            return keep("");
+        },
+
+        /* 这张卡今天还值不值得上报：真锁卡 / 隐藏 一律不再重试。
+         * 以前 doPromos / doDailySet 用「服务端 complete 为假」判断剩余量，
+         * 锁着的卡永远 complete=false，于是当天永远判不成完成，整天反复重试同一张卡。 */
+        claimable(item) {
+            const lock = this.probe(item);
+            if (lock.locked) return false;
+            const f = this.fields(item);
+            if (f.isHidden === true) return false;
+            return true;
         }
     };
 
@@ -475,6 +516,15 @@ const __scBgKeepAlive = (function() {
                 edge: edgeUA,
                 mobile: `${this.ANDROID} EdgA/144.0.0.0`,
                 app: `${this.ANDROID} BingSapphire/32.6.2110003560`,
+                // Rewards 桌面应用（WebView2）通道：带锁徽标的 App 专属卡只有在这个 UA 下
+                // 才会被服务端渲染成 isLocked:false / isUnlocked:true。Chromium 版本跟随真实浏览器，
+                // 免得版本串看起来像一年前的客户端。
+                rewardsApp: (() => {
+                    const ver = [real, saved]
+                        .map(s => (String(s).match(/Chrome\/([\d.]+)/) || [])[1])
+                        .find(Boolean) || this.FALLBACK_CHROME;
+                    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${ver} Safari/537.36 Edg/${ver} MSRewards/Desktop/1.3.0`;
+                })(),
             };
             this._cacheAt = now;
             return this._cache;
@@ -651,6 +701,38 @@ const __scBgKeepAlive = (function() {
             });
         },
 
+        /* 与 xhr() 相同的调用方式，但返回完整响应 { text, finalUrl, status }。
+         * 「在 Rewards 应用内搜索」这类任务必须拿到**重定向后的最终 URL**：
+         * 真实流程是 GET www.bing.com/search?... → 302 到 cn.bing.com/search?...&rdr=1&rdrig=XXXX，
+         * 那个 rdrig 是服务端给这次点击分配的标识，reportActivity 靠它认账；
+         * 拿不到 rdrig，上报就会被当成「一次普通搜索」，永远不记到这张卡上。 */
+        xhrFull(options) {
+            return new Promise((resolve, reject) => {
+                const start = Date.now();
+                GM_xmlhttpRequest({
+                    anonymous: false,
+                    ...options,
+                    timeout: Number(options && options.timeout) || 15000,
+                    onload: (res) => {
+                        const cost = ((Date.now() - start) / 1000).toFixed(2);
+                        if (res.status >= 200 && res.status < 300) {
+                            resolve({ text: res.responseText, finalUrl: res.finalUrl || "", status: res.status });
+                        } else {
+                            reject(new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
+                        }
+                    },
+                    onerror: (err) => {
+                        const cost = ((Date.now() - start) / 1000).toFixed(2);
+                        reject(new Error(`${err?.error || "网络错误"}，用时 ${cost} 秒`));
+                    },
+                    ontimeout: () => {
+                        const cost = ((Date.now() - start) / 1000).toFixed(2);
+                        reject(new Error(`请求超时，用时 ${cost} 秒`));
+                    }
+                });
+            });
+        },
+
         xhr(options) {
             return new Promise((resolve, reject) => {
                 const start = Date.now();
@@ -706,6 +788,46 @@ const __scBgKeepAlive = (function() {
             return encodeURIComponent(JSON.stringify(tree));
         },
         getRandomUUID() { return crypto.randomUUID().replace(/-/g, "").toUpperCase(); },
+
+        /* 登录态探测：读 .bing.com / rewards.bing.com 下的 Cookie，回答「网页通道带没带登录态」。
+         *
+         * 判定依据来自 2026-11-03 的真实抓包（cn.bing.com 的 Cookie 名单）：
+         *   MUID, MUIDB, _EDGE_V, MSCC, _clck, _clsk, _EDGE_S, USRLOC, BID, GC, __Host-XY, SRCHHPGUSR
+         * 早期版本找的是 ACCS_ / _SS / MSPAuth 这些 login.live.com 的 cookie，
+         * 它们在 .bing.com 域下根本不存在，于是永远报「未登录」——那是误报，已修正。
+         *
+         * 现在只区分两档：有 MUID（= Bing 已识别这个浏览器）算「有会话」；
+         * 读不到（无权限/超时）返回 null 表示「不确定」，绝不能当成未登录。 */
+        async loginCookies() {
+            if (typeof GM_cookie === "undefined" || !GM_cookie || typeof GM_cookie.list !== "function") return null;
+            const read = (filter) => new Promise(resolve => {
+                let settled = false;
+                const done = v => { if (!settled) { settled = true; resolve(v); } };
+                // service_worker 里 GM_cookie 的回调可能永远不触发，2.5 秒兜底
+                setTimeout(() => done(null), 2500);
+                try {
+                    GM_cookie.list(filter, cookies => done(Array.isArray(cookies) ? cookies : []));
+                } catch (_) {
+                    done(null);
+                }
+            });
+            // .bing.com 与 rewards.bing.com 各读一次：登录态可能挂在其中一个域下
+            const [byDomain, byUrl] = await Promise.all([
+                read({ domain: "bing.com" }),
+                read({ url: "https://rewards.bing.com/" })
+            ]);
+            // 两条路都读不到 → 环境不支持/无权限，返回 null 表示「不确定」，不能当成未登录
+            if (byDomain === null && byUrl === null) return null;
+            const all = [...(byDomain || []), ...(byUrl || [])];
+            const found = new Set(all.map(c => String((c && c.name) || "")));
+            const hasMuid = found.has("MUID") || found.has("MUIDB");
+            // Bing 系的「已识别浏览器」标记：这些存在就说明 cookie 是完整的（抓包名单为准）
+            const bingMarks = ["_EDGE_S", "_EDGE_V", "SRCHHPGUSR", "MSCC", "BID", "USRLOC"];
+            const bingReady = bingMarks.some(n => found.has(n));
+            const hasSession = hasMuid || bingReady;
+            return { hasMuid, hasSession, names: [...found].slice(0, 20) };
+        },
+
         isJSON(s) {
             try { const j = JSON.parse(s); return Array.isArray(j) || (typeof j === "object" && j !== null); }
             catch { return false; }
@@ -1828,72 +1950,107 @@ const __scBgKeepAlive = (function() {
             });
         },
 
+        /* 「在 Rewards 应用内搜索」型卡片（href 带 form=ML2W4J/ML2Y2H 与 PUBL=RewardsDO）。
+         * 这类卡不靠 Server Action 交卷，而是靠「真的搜一次」让服务端记账。
+         *
+         * 实现依据 = 2026-11-03 的真实抓包，共三个决定性细节：
+         *  1) 浏览器点的是 www.bing.com/search?...，服务端 302 到 cn.bing.com 时
+         *     才追加 &rdr=1&rdrig=<32位HEX>；脚本拿到的 card.destination 却已经是 cn 域名，
+         *     所以这里**必须主动先请求 www 版本**，否则永远拿不到 rdrig。
+         *  2) UA 是普通 Edge（不是 MSRewards/Desktop）。
+         *  3) ncheader body = wb=1；reportActivity 查询串 = IG + IID + 原链接全部参数 + ajaxreq=1，
+         *     body = url=<最终搜索URL>&V=web。
+         *
+         * 另外：reportActivity 的**返回内容**以前从来没被记录过，导致只能靠猜。
+         * 现在无论成败都打一行摘要，直接看服务端怎么说。 */
         async reportDailyActivity(searchUrl) {
             try {
-                const fullUrl = searchUrl.startsWith("http") ? searchUrl : `https://cn.bing.com${searchUrl}`;
-                const ig = Utils.getRandomUUID().replace(/-/g, '').substring(0, 32).toUpperCase();
-                const cnUrl = fullUrl.replace(/^https?:\/\/www\.bing\.com/, "https://cn.bing.com")
-                                     .replace(/^https:\/\/bing\.com/, "https://cn.bing.com");
-                const cnUrlObj = new URL(cnUrl);
-                const cnSp = cnUrlObj.searchParams;
-                const reportParams = new URLSearchParams();
-                reportParams.set("IG", ig);
-                reportParams.set("IID", "commerce.5067");
-                if (cnSp.get("form")) reportParams.set("form", cnSp.get("form"));
-                if (cnSp.get("ocid") || cnSp.get("OCID")) reportParams.set("ocid", cnSp.get("ocid") || cnSp.get("OCID"));
-                if (cnSp.get("rnoreward")) reportParams.set("rnoreward", cnSp.get("rnoreward"));
+                const rawUrl = String(searchUrl || "").trim();
+                if (!rawUrl) return false;
+                const target = new URL(rawUrl.startsWith("http") ? rawUrl : `https://www.bing.com${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
+
+                const baseHeaders = {
+                    "user-agent": RewardsAuto.ua.pc,
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "cache-control": "max-age=0"
+                };
+
+                // 关键：强制走 www。card.destination 常常已经是 cn 域名，而 rdrig 只在
+                // www → cn 的 302 里生成。没有 rdrig，reportActivity 认不到是哪次点击。
+                const query = target.search.slice(1);
+                const wwwUrl = `https://www.bing.com${target.pathname}?${query}`;
+
+                let finalUrl = wwwUrl;
+                let serp = "";
                 try {
-                    await Utils.xhr({
-                        method: "GET", url: cnUrl,
-                        headers: {
-                            "user-agent": RewardsAuto.ua.pc,
-                            "referer": "https://rewards.bing.com/",
-                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
-                        }
-                    });
-                } catch (_) {}
-                const ncheaderParams = new URLSearchParams();
-                ncheaderParams.set("ver", String(Date.now()).substring(0, 8));
-                ncheaderParams.set("IID", "commerce.5057");
-                ncheaderParams.set("IG", ig);
+                    const full = await this._xhrFull({ url: wwwUrl, headers: baseHeaders });
+                    serp = String(full.text || "");
+                    if (full.finalUrl) finalUrl = full.finalUrl;
+                } catch (e) {
+                    Utils.log("🟡", `搜索页打开失败: ${e.message}`);
+                    return false;
+                }
+
+                let finalParsed;
+                try { finalParsed = new URL(finalUrl); } catch (_) { finalParsed = target; }
+                const rdrig = finalParsed.searchParams.get("rdrig") || "";
+                const jumped = finalParsed.hostname !== "www.bing.com";
+                if (!rdrig) {
+                    Utils.log("🟡", `没能拿到 rdrig（跳转=${jumped}），本次上报大概率不记账：${finalUrl.slice(0, 140)}`);
+                }
+
+                const compact = String(serp).split(/\s+/).join("");
+                const igMatch = compact.match(/[,{]?"?IG"?\s*:\s*"([A-Za-z0-9]+)"/);
+                const ig = igMatch ? igMatch[1] : "";
+
+                const reportBase = Object.assign({}, baseHeaders, {
+                    "accept": "*/*",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "referer": finalUrl,
+                    "origin": finalParsed.origin
+                });
+
+                // ncheader：body 是 wb=1（抓包确认）
                 try {
                     await Utils.xhr({
                         method: "POST",
-                        url: `https://cn.bing.com/rewardsapp/ncheader?${ncheaderParams.toString()}`,
-                        headers: {
-                            "content-type": "application/x-www-form-urlencoded",
-                            "user-agent": RewardsAuto.ua.pc,
-                            "referer": cnUrl,
-                            "origin": "https://cn.bing.com",
-                            "accept": "*/*",
-                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
-                        },
-                        data: "wb=1;i=1;v=1"
+                        url: `${finalParsed.origin}/rewardsapp/ncheader?ver=${String(Date.now()).slice(0, 8)}&IID=SERP.5048&IG=${encodeURIComponent(ig || Utils.getRandomUUID())}&ajaxreq=1`,
+                        headers: reportBase,
+                        data: "wb=1"
                     });
-                } catch (_) {}
-                const bodyParams = new URLSearchParams();
-                bodyParams.set("url", cnUrl);
-                bodyParams.set("V", "web");
-                await Utils.xhr({
-                    method: "POST",
-                    url: `https://cn.bing.com/rewardsapp/reportActivity?${reportParams.toString()}`,
-                    headers: {
-                        "content-type": "application/x-www-form-urlencoded",
-                        "user-agent": RewardsAuto.ua.pc,
-                        "referer": cnUrl,
-                        "origin": "https://cn.bing.com",
-                        "accept": "*/*",
-                        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
-                    },
-                    data: bodyParams.toString()
-                });
+                } catch (e) {
+                    Utils.log("🟡", `ncheader 失败（继续上报）: ${e.message}`);
+                }
+
+                // reportActivity：带 IG + 全部原参数（含 rdr/rdrig）
+                const reportQuery = finalParsed.search.slice(1);
+                const reportUrl = `${finalParsed.origin}/rewardsapp/reportActivity?IG=${encodeURIComponent(ig || Utils.getRandomUUID())}&IID=SERP.5058&${reportQuery}${reportQuery.includes("ajaxreq=") ? "" : "&ajaxreq=1"}`;
+                let respText = "";
+                try {
+                    respText = await Utils.xhr({
+                        method: "POST",
+                        url: reportUrl,
+                        headers: reportBase,
+                        data: `url=${encodeURIComponent(finalUrl)}&V=web`
+                    });
+                } catch (e) {
+                    Utils.log("🟡", `reportActivity 异常: ${e.message}`);
+                    return false;
+                }
+
+                // 服务端的真实回复 —— 这是判断「有没有被记账」的唯一直接依据
+                const brief = JSON.stringify(String(respText || "").split(/\s+/).join(" ").slice(0, 200));
+                Utils.log("📋", `搜索上报返回：IG=${(ig || "随机").slice(0, 12)} rdrig=${rdrig ? rdrig.slice(0, 8) : "无"} body=${brief}`);
                 return true;
             } catch (e) {
-                Utils.log("🟡", `每日活动上报失败: ${e.message}`);
+                Utils.log("🟡", `搜索上报失败: ${e.message}`);
                 return false;
             }
         },
+
+        // 小包装：给 reportDailyActivity 用，便于单测里替换
+        _xhrFull(options) { return Utils.xhrFull(options); },
 
         async signPC() {
             try {
@@ -2142,12 +2299,81 @@ const __scBgKeepAlive = (function() {
             return map;
         },
 
+        /* 服务端完成状态的三态查询：true=已完成 / false=确认未完成 / null=查不到。
+         * 关键：null 绝不能当 false 用。从网页 HTML（flight 数据）发现的卡，在 DAPI 列表里
+         * 可能根本不存在 —— 那样「完成判定」永远为假，claimCard 会把同一张卡无限重试下去。
+         * 这类卡交给 isOfferCompleteAny 去网页侧再确认一次。 */
         async isOfferComplete(offerId, force = false) {
             if (!offerId) return null;
             const map = await this.getPromotionMap(force);
             if (!map) return null;
             const item = map.get(offerId);
-            return item ? item.complete : null;
+            if (!item) return null;          // 不在 DAPI 列表 = 状态未知，不是「未完成」
+            return item.complete;
+        },
+
+        _webCompleteCache: null,
+
+        /* 网页侧完成状态：DAPI 查不到这张卡时用它兜底。
+         * earn 页的 flight 数据里同一个 offerId 带 isCompleted，是网页通道唯一的完成凭证。
+         * 20 秒内复用同一份解析结果：一轮里复核多张卡不必反复拉整页 HTML。 */
+        async isOfferCompleteWeb(offerId, force = false) {
+            if (!offerId) return null;
+            const now = Date.now();
+            if (!force && this._webCompleteCache && now - this._webCompleteCache.ts < 20000) {
+                const cached = this._webCompleteCache.map;
+                if (cached.has(offerId)) return cached.get(offerId);
+            }
+            try {
+                const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+                if (!html) return null;
+                const map = new Map();
+                for (const item of this._flightItems(this._flightText(html))) {
+                    const id = item.offerId || item.offerid;
+                    if (!id) continue;
+                    const cur = Number(item.pointProgress || 0);
+                    const max = Number(item.pointProgressMax || 0);
+                    const done = item.isCompleted === true || item.complete === true || (max > 0 && cur >= max);
+                    // 同一 offerId 可能出现多份（不同区块），已完成优先
+                    if (done || !map.has(id)) map.set(id, !!done);
+                }
+                this._webCompleteCache = { ts: now, map };
+                return map.has(offerId) ? map.get(offerId) : null;
+            } catch (_) {
+                return null;
+            }
+        },
+
+        /* 综合完成判定：DAPI 权威优先，查不到再问网页侧；两边都查不到才是 null。
+         * 这样「只在网页侧存在、DAPI 不认识」的卡也能正确判定完成，不会无限重试。
+         * 注意：网页侧那一路不吃 force —— claimCard 一次尝试里就有 5 处判定，
+         * 3 次重试等于 15 次整页请求，而网页侧的完成状态不会在一秒内变化。
+         * 它有自己的 20 秒缓存，force 只用来强制刷新 DAPI（那是权威源）。 */
+        async isOfferCompleteAny(offerId, force = false) {
+            const viaApp = await this.isOfferComplete(offerId, force);
+            if (viaApp !== null) return viaApp;
+            return await this.isOfferCompleteWeb(offerId, false);
+        },
+
+        /* 「今日不可做」名单：当天不再重试某些确认做不了的卡，跨天自动失效。
+         * 这些卡永远 complete=false，每轮都撞既浪费请求，也让 doPromos 的剩余量永远清不掉。
+         *
+         * 注意：目前**没有任何地方主动调用 _markUnoffered**，这是有意的。
+         * 曾经按 offerId 里的 locked_level2 在 503 时拉黑，但用户实测那张卡在网页上是
+         * 已解锁状态（银牌满足门槛），拉黑等于把一张本来能完成的卡永久跳过 —— 已撤回。
+         * 保留读写两个通道，等有可靠判据（例如服务端明确回「本期已结束」）时再启用。 */
+        _unofferableKey(offerId) {
+            return `Config.unofferable.${Utils.getTodayNum()}.${offerId}`;
+        },
+
+        _markUnoffered(offerId) {
+            if (!offerId) return;
+            try { GM_setValue(this._unofferableKey(offerId), true); } catch (_) {}
+        },
+
+        isUnoffered(offerId) {
+            if (!offerId) return false;
+            try { return GM_getValue(this._unofferableKey(offerId), false) === true; } catch (_) { return false; }
         },
 
         // 通过 DAPI 发现「今日日常活动卡片」，不依赖页面 HTML / Cookie；preMap 可复用已获取的 map
@@ -2166,7 +2392,8 @@ const __scBgKeepAlive = (function() {
                 if (!scheduledToday) continue;
                 if (item.complete) continue;
                 if (item.hidden) continue;
-                // 语义化的锁卡判定：真锁卡跳过并计数，已解锁（isLocked:false + isUnlocked:true）照常下发
+                // 语义化的锁卡判定：真锁卡跳过并计数；带锁徽标的 App 卡下发并打 appOnly 标记
+                // （DAPI 通道本身就是 App 通道，所以这类卡照常能用 DAPI 交卷）
                 const lock = CardLock.probe(item);
                 if (lock.locked) {
                     // 用局部计数，最后取最大值写回 state：doDailySet 每轮都会重新发现一遍，直接累加会重复计分
@@ -2183,7 +2410,8 @@ const __scBgKeepAlive = (function() {
                     kind: "daily",
                     url: "https://rewards.bing.com/earn",
                     destination: item.destination || "",
-                    source: "dapi"
+                    source: "dapi",
+                    ...(lock.appOnly ? { appOnly: true } : {})
                 });
             }
             if (lockedCount > 0) {
@@ -2399,20 +2627,37 @@ const __scBgKeepAlive = (function() {
             let earnHtml = ""; // 提升到 try 外：桌面奖励任务解析块需要复用 earn 页 HTML
             // 锁卡统计：单次扫描内汇总，扫描结束写进 state 供结算日志使用
             const lockStat = { count: 0, points: 0, app: 0 };
-            const noteLock = (item, points = 0) => {
+            /* 判断一张卡要被怎么处理：
+             *   null        → 正常卡，走「网页通道 → DAPI」；
+             *   skip=true   → 今天真做不了（明天才开 / isDisabled），别放进队列，否则永远判不成完成；
+             *   appOnly=true→ 普通 UA 下带锁徽标，必须换 Rewards 应用 UA 交卷（见 claimCardWeb）。 */
+            const classify = (item, points = 0) => {
                 const lock = CardLock.probe(item);
-                if (!lock.locked) return false;
-                lockStat.count++;
-                lockStat.points += Number(points) || 0;
-                if (lock.appExclusive) lockStat.app++;
-                Utils.log("🔒", `跳过锁卡：${item.title || item.name || item.offerId || "活动卡片"} +${points}p${lock.appExclusive ? "（App 专属）" : "（需在必应 App 完成）"} [${lock.reason}]`);
-                return true;
+                if (lock.locked) {
+                    lockStat.count++;
+                    lockStat.points += Number(points) || 0;
+                    Utils.log("🔒", `跳过锁卡：${item.title || item.name || item.offerId || "活动卡片"} +${points}p [${lock.reason}]`);
+                    return { skip: true, appOnly: false };
+                }
+                if (lock.appOnly) {
+                    lockStat.app++;
+                    Utils.log("🔓", `带锁徽标的 App 卡，改用 Rewards 应用通道：${item.title || item.name || item.offerId} +${points}p [${lock.reason}]`);
+                    return { skip: false, appOnly: true };
+                }
+                return { skip: false, appOnly: false };
             };
             try {
                 const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                 if (!html) { Utils.log("🔴", "earn 页面返回空"); return cards; }
                 earnHtml = html;
                 const clean = html.replace(/\\"/g, '"');
+
+                // 记录部署 ID：Server Action 交卷要带 x-deployment-id，缺了会「2xx 但不记账」
+                const dplMatch = clean.match(/[?&](?:amp;)?dpl=([A-Za-z0-9._-]+)/i);
+                if (dplMatch) {
+                    RewardsAuto._dpl = dplMatch[1];
+                    GM_setValue("Config.dpl", dplMatch[1]);
+                }
                 
                 const pushCard = (card) => {
                     if (!card || !card.offerId || !card.hash || card.points <= 0) return;
@@ -2420,6 +2665,15 @@ const __scBgKeepAlive = (function() {
                     if (seenCardKeys.has(key)) return;
                     seenCardKeys.add(key);
                     cards.push(card);
+                };
+
+                // 带锁徽标的卡按 appOnly 标记下发；真锁卡丢弃
+                const pushWithLock = (item, card, points) => {
+                    if (!card) return false;
+                    const verdict = classify(item, points);
+                    if (verdict.skip) return false;
+                    pushCard(verdict.appOnly ? { ...card, appOnly: true } : card);
+                    return true;
                 };
 
                 const inferKind = (offerId, title = "") => {
@@ -2431,34 +2685,6 @@ const __scBgKeepAlive = (function() {
                     if (/dailyset|daily|每日/.test(text)) return "daily";
                     if (/streak|打卡|连续/.test(text)) return "streak";
                     return "open_only";
-                };
-
-                const parseCard = (obj) => {
-                    const offerIdMatch = obj.match(/"offerId":"([^"]+)"/i) || obj.match(/"offerid":"([^"]+)"/i);
-                    const hashMatch = obj.match(/"hash":"([^"]+)"/) || obj.match(/"activityId":"([^"]+)"/) || obj.match(/"id":"([^"]+)"/);
-                    if (!offerIdMatch || !hashMatch) return null;
-                    const offerId = offerIdMatch[1];
-                    const hash = hashMatch[1];
-                    const pointsMatch = obj.match(/"points":(\d+)/);
-                    const isCompletedMatch = obj.match(/"isCompleted":(true|false)/i) || obj.match(/"state":"(completed|CLAIMED)"/i);
-                    const titleMatch = obj.match(/"title":"([^"]+)"/) || obj.match(/"name":"([^"]+)"/);
-                    const points = pointsMatch ? parseInt(pointsMatch[1]) : 0;
-                    const isCompleted = isCompletedMatch ? (isCompletedMatch[1] === "true" || isCompletedMatch[1] === "completed") : false;
-                    if (isCompleted) return null;
-                    const title = titleMatch ? titleMatch[1] : "";
-                    // 从原始对象里取锁态字段（老页面只下发文案时由 CardLock 走文案兜底）
-                    const isLockedMatch = obj.match(/"isLocked":(true|false)/i);
-                    const isUnlockedMatch = obj.match(/"isUnlocked":(true|false)/i);
-                    const unlockCriteriaMatch = obj.match(/"unlockCriteria":"([^"]*)"/i);
-                    if (noteLock({
-                        offerId, title,
-                        isLocked: isLockedMatch ? isLockedMatch[1] === "true" : undefined,
-                        isUnlocked: isUnlockedMatch ? isUnlockedMatch[1] === "true" : undefined,
-                        unlockCriteria: unlockCriteriaMatch ? unlockCriteriaMatch[1] : undefined
-                    }, points)) return null;
-                    const skip = RewardsAuto.skipPatterns.some(p => title.toLowerCase().includes(p.toLowerCase()) || offerId.toLowerCase().includes(p.toLowerCase()));
-                    if (skip) return null;
-                    return { title, points, offerId, hash, kind: inferKind(offerId, title) };
                 };
 
                 try {
@@ -2485,7 +2711,6 @@ const __scBgKeepAlive = (function() {
                             const doneCur = Number(item.pointProgress || 0);
                             const isCompleted = item.isCompleted || item.complete || (doneMax > 0 && doneCur >= doneMax);
                             if (!offerId || !hash || points <= 0 || isCompleted) return null;
-                            if (noteLock(item, points)) return null;
                             const skip = RewardsAuto.skipPatterns.some(p => title.toLowerCase().includes(p.toLowerCase()) || offerId.toLowerCase().includes(p.toLowerCase()));
                             if (skip) return null;
                             return { title, points, offerId, hash, kind: kind || inferKind(offerId, title), source: "getuserinfo", url: "https://rewards.bing.com/dashboard", destination: item.destinationUrl || "" };
@@ -2495,16 +2720,28 @@ const __scBgKeepAlive = (function() {
                         for (const dateKey of todayKeys) {
                             const dailyItems = dailySetPromotions[dateKey];
                             if (Array.isArray(dailyItems)) {
-                                for (const item of dailyItems) pushCard(normalizeDashboardCard(item, "daily"));
+                                for (const item of dailyItems) {
+                                    const card = normalizeDashboardCard(item, "daily");
+                                    if (card) pushWithLock(item, card, card.points);
+                                }
                             }
                         }
                         const morePromotions = dashboard.morePromotions || dashboard.promotions || [];
                         if (Array.isArray(morePromotions)) {
-                            for (const item of morePromotions) pushCard(normalizeDashboardCard(item));
+                            for (const item of morePromotions) {
+                                const card = normalizeDashboardCard(item);
+                                if (card) pushWithLock(item, card, card.points);
+                            }
                         }
                     }
                 } catch (e) {
-                    Utils.log("🟡", `getuserinfo 活动解析跳过: ${e.message}`);
+                    /* getuserinfo 的 401 只是「后台 service worker 没带这个接口要的会话 Cookie」，
+                     * 和网页 Server Action 的 401/403（cookie 真失效）不是一回事：rewards.bing.com 的
+                     * earn/dashboard 页面本身照样能匿名打开，Server Action 也照样能交卷。
+                     * 所以这里绝不能置 webNoAuth —— 一旦置了，后续每张卡的网页通道都会被整体跳过，
+                     * 普通卡就只剩 dapi(p=0) 一条路，重试多少次都是同一组失败。 */
+                    const noCookie = /\b(401|403)\b/.test(String(e.message));
+                    Utils.log("🟡", `${noCookie ? "getuserinfo 无会话（不影响 Server Action 交卷）" : "getuserinfo 活动解析跳过"}: ${e.message}`);
                 }
 
                 // --- [Next.js Flight Chunks & DAPI parsing] ---
@@ -2512,12 +2749,11 @@ const __scBgKeepAlive = (function() {
                     for (const item of this._flightItems(this._flightText(html))) {
                         if (!item.offerId || !item.hash) continue;
                         if (item.isCompleted === true || item.hidden === true) continue;
-                        // isLocked 不再一刀切：先按 isLocked/isUnlocked/unlockCriteria 语义判定，
-                        // 已解锁卡（isLocked:false + isUnlocked:true）不会再被误判成锁卡
-                        if (noteLock(item, Number(item.points || 0))) continue;
                         const points = Number(item.points || 0);
                         if (points <= 0 && !item.offerId.includes("DailySet")) continue;
-                        pushCard({
+                        // isLocked 不再一刀切：锁态交给 CardLock 语义判定，
+                        // 带锁徽标的 App 卡会以 appOnly 下发并用应用 UA 交卷（以前是被直接丢弃）
+                        pushWithLock(item, {
                             title: item.title || item.name || item.offerId,
                             points: points || 10,
                             offerId: item.offerId,
@@ -2525,7 +2761,7 @@ const __scBgKeepAlive = (function() {
                             kind: inferKind(item.offerId, item.title || ""),
                             destination: item.destination || item.destinationUrl || "",
                             url: "https://rewards.bing.com/earn"
-                        });
+                        }, points);
                     }
                 } catch (e) {
                     Utils.log("🟡", `Flight 数据解析异常: ${e.message}`);
@@ -2567,8 +2803,15 @@ const __scBgKeepAlive = (function() {
                         });
                         if (questHtml) {
                             for (const qItem of this._flightItems(this._flightText(questHtml), "WW_pcchild\\d+[^\"]+")) {
+                                // 这段请求走的就是 Rewards 应用 UA（desktopAppHeaders），所以 isLocked 在这里
+                                // 已经是「应用视角」的结论：只有真锁（明天才开 / isDisabled）才跳过。
                                 const qLock = CardLock.probe(qItem);
-                                if (qItem.offerId && qItem.hash && !qLock.locked && qItem.isCompleted !== true) {
+                                if (qLock.locked) {
+                                    if (qItem.offerId && qItem.hash) {
+                                        lockStat.count++;
+                                        Utils.log("🔒", `桌面任务仍在锁定期：${qItem.title || qItem.offerId} [${qLock.reason}]`);
+                                    }
+                                } else if (qItem.offerId && qItem.hash && qItem.isCompleted !== true) {
                                     Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
                                     pushCard({
                                         title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
@@ -2587,10 +2830,15 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟡", `桌面应用专属任务解析跳过: ${eQuest.message}`);
                 }
 
-            if (lockStat.count > 0) {
+            if (lockStat.count > 0 || lockStat.app > 0) {
                 RewardsAuto.state.lockedCount = Math.max(RewardsAuto.state.lockedCount, lockStat.count);
                 RewardsAuto.state.lockedPoints = Math.max(RewardsAuto.state.lockedPoints, lockStat.points);
-                Utils.log("🔒", `锁卡汇总：${lockStat.count} 张（${lockStat.points} 分）已跳过${lockStat.app ? `，其中 App 专属 ${lockStat.app} 张` : ""}；这批卡需在必应 App 里满足解锁条件后才能完成`);
+                if (lockStat.count > 0) {
+                    Utils.log("🔒", `锁卡汇总：${lockStat.count} 张（${lockStat.points} 分）今天做不了，已跳过`);
+                }
+                if (lockStat.app > 0) {
+                    Utils.log("🔓", `App 卡汇总：${lockStat.app} 张带锁徽标，已改走 Rewards 应用通道交卷`);
+                }
             }
 
             return cards;
@@ -2631,6 +2879,22 @@ const __scBgKeepAlive = (function() {
             return cached;
         },
 
+        /* 判断这张卡是不是「在 Rewards 应用内搜索」型。
+         * 判据来自页面真实 href：带 form=ML2W4J / ML2Y2H 与 PUBL=RewardsDO 签名的，
+         * 在网页上就是一条普通搜索链接（不是领取按钮），完成方式是「真的搜一次」。
+         * 这类卡拿 Server Action 交卷，服务端只会返回 2xx 或 503，但永远不记分 ——
+         * 这是「web(已发出但服务端未生效) + dapi(p=0) 反复重试」的根因。 */
+        _isAppSearchCard(card) {
+            const dest = String((card && card.destination) || "");
+            if (!dest) return false;
+            const q = dest.includes("?") ? dest.slice(dest.indexOf("?") + 1) : "";
+            if (!q) return false;
+            // 只认搜索型签名；领取型链接也可能带 PUBL=RewardsDO，故要求同时是 bing 搜索地址
+            const isBingSearch = /bing\.com\/search/i.test(dest);
+            const hasSign = /(^|&)(form=ML2W4J|form=ML2Y2H|PUBL=RewardsDO)/i.test(q);
+            return isBingSearch && hasSign;
+        },
+
         /** 领取单张卡片（统一入口：先网页通道 → 网页完成不了再换 DAPI → 一律用服务端状态复核是否真的加分）。
          *  服务端可能要 1~3 分钟才把上报记入 progress，单次失败不等于真失败，故做多轮重试。
          */
@@ -2641,8 +2905,14 @@ const __scBgKeepAlive = (function() {
             const backoffs = opts.backoffs || [[8000, 12000], [20000, 30000], [45000, 60000]];
             const diag = [];
 
+            // 今日已被服务端明确拒绝（503 等级门槛）：不再重复撞，直接认输交给下一轮/明天
+            if (this.isUnoffered(offerId)) {
+                Utils.log("🔒", `今日已确认做不了，跳过：${name}`);
+                return false;
+            }
+
             // 0) 服务端已完成：直接认账，避免重复上报触发风控
-            if (await this.isOfferComplete(offerId, true) === true) {
+            if (await this.isOfferCompleteAny(offerId, true) === true) {
                 Utils.log("✅", `服务端已确认完成：${name}`);
                 return true;
             }
@@ -2690,7 +2960,7 @@ const __scBgKeepAlive = (function() {
             const offerId = card.offerId;
             const name = card.title || offerId;
 
-            if (await this.isOfferComplete(offerId, false) === true) {
+            if (await this.isOfferCompleteAny(offerId, false) === true) {
                 Utils.log("✅", `服务端已确认完成：${name}`);
                 return true;
             }
@@ -2712,6 +2982,26 @@ const __scBgKeepAlive = (function() {
             if (!skipWeb && !card.hash) {
                 // DAPI 发现的日常卡没有 hash（网页通道拿不到交卷标识），直接走 DAPI
                 diag.push("web(无hash)");
+            } else if (!skipWeb && card.appOnly) {
+                // 带锁徽标的 App 卡：普通 UA 交卷一定被拒，直接用 Rewards 应用 UA 交卷。
+                // 这条分支不受 webNoAuth / webFailStreak 熔断影响 —— 熔断是针对「浏览器会话」的，
+                // 应用通道是另一套身份，被 401 熔断连坐就会让这类卡永远做不成。
+                await this._claimViaAppChannel(card, { diag, name });
+                if (await this.isOfferCompleteAny(offerId, true) === true) return true;
+            } else if (!skipWeb && this._isAppSearchCard(card)) {
+                // 「在 Rewards 应用内搜索」型卡（href 带 PUBL=RewardsDO / form=ML2W4J|ML2Y2H）:
+                // 这类卡不看 Server Action，靠真的走一遍应用搜索来记账。
+                // 以前把它们当普通卡交卷，服务端自然不给分（dapi(p=0) + web 不记账）。
+                const searchOk = await this.reportDailyActivity(card.destination);
+                diag.push(searchOk ? "search(已上报)" : "search(失败)");
+                if (searchOk) {
+                    await Utils.randomDelay(2000, 4000);
+                    if (await this.isOfferCompleteAny(offerId, true) === true) {
+                        Utils.log("🟢", `应用搜索领取成功：${name}`);
+                        return true;
+                    }
+                    diag.push("search(已上报待记账)");
+                }
             } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
                 diag.push("web(未登录跳过)");
             } else if (!skipWeb && RewardsAuto.state.webFailStreak >= WEB_FAIL_LIMIT) {
@@ -2735,7 +3025,7 @@ const __scBgKeepAlive = (function() {
                 if (webAccepted) {
                     RewardsAuto.state.webFailStreak = 0;
                     await Utils.randomDelay(2000, 4000);
-                    if (await this.isOfferComplete(offerId, true) === true) {
+                    if (await this.isOfferCompleteAny(offerId, true) === true) {
                         Utils.log("🟢", `网页通道领取成功：${name}`);
                         return true;
                     }
@@ -2764,18 +3054,40 @@ const __scBgKeepAlive = (function() {
                 diag.push("dapi(请求失败)");
             }
             await Utils.randomDelay(1500, 3000);
-            if (await this.isOfferComplete(offerId, true) === true) {
+            if (await this.isOfferCompleteAny(offerId, true) === true) {
                 Utils.log("🟢", `DAPI 上报已生效：${name}`);
                 return true;
             }
             return false;
         },
 
-        // 网页通道（Edge 与 Chrome/Firefox 差异所在）：返回 true 仅表示请求被接受，真实加分由 claimCard() 用 DAPI 复核
-        async claimCardWeb(card) {
+        /* 网页通道（Edge 与 Chrome/Firefox 差异所在）：返回 true 仅表示请求被接受，真实加分由 claimCard() 用 DAPI 复核。
+         * appChannel=true：用 Rewards 桌面应用 UA 交卷。带锁徽标的 App 专属卡在普通浏览器 UA 下
+         * 恒为 isLocked:true，但同一个 hash 在应用 UA 下就是解锁态 —— 换 UA 是这类卡唯一的完成方式。 */
+        /* 判断 Server Action 的响应是否「受理了这次交卷」。
+         * 旧判断是 res.includes("true") || res.includes('"a":')，太松：
+         * 任何带 true 的页面（甚至某些错误帧）都会被当成成功，于是日志里出现
+         * 「web(已发出但服务端未生效)」——受理了，但根本没记账。
+         * Next.js 的 flight 流里，错误帧长这样：1:E{"digest":"..."}，成功帧则是
+         * 0:{"a":"$@1"} 之后跟 1:{"ok":true} 之类。所以这里先明确排掉错误帧和登录页。 */
+        _actionLooksAccepted(res) {
+            const text = String(res || "");
+            if (!text) return false;
+            // flight 错误帧：<hex>:E{...}，或任何带 digest 的帧 —— 服务端抛错了，肯定没记账
+            if (/(?:^|\n)[0-9a-f]+:E\{/i.test(text) || /"digest"\s*:/.test(text)) return false;
+            // 未登录时会被重定向到登录页 / 返回 HTML 文档，这种 2xx 也不是受理
+            if (/^\s*<!doctype\s+html/i.test(text) || /<html[\s>]/i.test(text)) return false;
+            return text.includes('"ok":true')
+                || text.includes('"i":false')
+                || text.includes('"a":')
+                || text.includes("true");
+        },
+
+        async claimCardWeb(card, { appChannel = false } = {}) {
             // Server Action 的 POST 目标必须是带 action 路由的页面：日常/连签卡在 dashboard，其余在 earn。
             // 旧版直接用 card.url 当目标，而 getuserinfo 卡的 url 可能是 destinationUrl（指向 bing.com 搜索页），
             // 往搜索页 POST action 一定 404/405 —— 这是「已解锁卡交卷失败」的另一半原因。
+            const useAppUA = appChannel || card.appOnly === true || card.kind === "desktop_app";
             const isDash = card.kind === "daily" || card.kind === "streak" || card.source === "getuserinfo";
             const pageUrl = card.kind === "desktop_app"
                 ? (card.url || "https://rewards.bing.com/earn")
@@ -2784,6 +3096,12 @@ const __scBgKeepAlive = (function() {
             const segment = isDash ? "dashboard" : "earn";
             let nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
 
+            // desktop_app（桌面应用每周专属）历史上用的是带 X-MSRewards-App 那套头；
+            // appOnly 卡只需要「Rewards 应用 UA」，不该再套 X-MSRewards-App 头（那会让服务端按另一种客户端渲染）。
+            const extraAppHeaders = card.kind === "desktop_app" ? RewardsAuto.desktopAppHeaders : {};
+            // 部署 ID：新版 Next.js 在 URL 的 ?dpl= 与 chunk 路径里都带它。user.js 实测缺这个头时
+            // 某些 action 会「返回 2xx 但不记账」——正是「web(已发出但服务端未更新)」的形态。
+            const dpl = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
             const buildHeaders = () => ({
                 "content-type": "text/plain;charset=UTF-8",
                 "next-action": nextAction,
@@ -2793,20 +3111,48 @@ const __scBgKeepAlive = (function() {
                 // next-router-state-tree 同样不能缺，否则新版 action 端点会 500。
                 "origin": "https://rewards.bing.com",
                 "next-router-state-tree": Utils.routerStateTree(segment),
-                "user-agent": RewardsAuto.ua.pc,
                 "accept": "text/x-component",
                 "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                ...(card.kind === "desktop_app" ? RewardsAuto.desktopAppHeaders : {})
+                ...(dpl ? { "x-deployment-id": dpl } : {}),
+                ...extraAppHeaders,
+                // 放在最后：appOnly 卡必须用 Rewards 应用 UA（desktopAppHeaders 里的 Mac UA 不能盖掉它）
+                "user-agent": useAppUA ? RewardsAuto.ua.rewardsApp : RewardsAuto.ua.pc
             });
             const payload = JSON.stringify([card.hash, 11, { offerid: card.offerId, isPromotional: "$undefined", timezoneOffset: "-480" }]);
 
             // 策略 1: Next.js Server Action (最稳妥、官方核心)
             try {
                 const res = await Utils.xhr({ method: "POST", url: pageUrl, headers: buildHeaders(), data: payload });
-                if (res && (res.includes("true") || res.includes('"i":false') || res.includes('"a":'))) {
+                /* 诊断：交卷响应是排查「已发出但服务端未生效」的唯一依据。
+                 * 上一版加了「全局最多 12 条」的采样上限，结果关键的那张卡被静默跳过，
+                 * 排查时反而看不到证据。现在改成「受理了就不打，没受理每张都打」：
+                 * 正常完成的卡不产生噪音，失败的卡一条不漏。 */
+                const accepted = res && this._actionLooksAccepted(res);
+                if (!accepted || GM_getValue("Config.debugDAPI", false)) {
+                    Utils.log("🔬", `交卷响应(${String(card.offerId).slice(0, 36)})：`
+                        + `受理=${!!accepted} ua=${useAppUA ? "app" : "pc"} dpl=${dpl || "无"} `
+                        + `hash=${String(card.hash || "").slice(0, 20)} appOnly=${!!card.appOnly} `
+                        + `src=${card.source || "-"} kind=${card.kind || "-"} `
+                        + `body=${JSON.stringify(String(res || "").replace(/\s+/g, " ").slice(0, 240))}`);
+                }
+                if (accepted) {
+                    // 交卷已受理：网页侧缓存里的完成状态已经过期，下次判定要重新拉取
+                    this._webCompleteCache = null;
                     return true;
                 }
             } catch (e2) {
+                /* 请求整个抛异常时响应体根本没拿到 —— 这恰恰最需要看到，以前只在 401/404 分支留日志。 */
+                Utils.log("🔬", `交卷异常(${String(card.offerId).slice(0, 36)})：`
+                    + `ua=${useAppUA ? "app" : "pc"} dpl=${dpl || "无"} kind=${card.kind || "-"} `
+                    + `err=${e2.message}`);
+                /* 503：服务端前置校验拒绝（0.2~0.6 秒就返回，不是网络问题）。
+                 * 早期版本曾按 offerId 里的 locked_level2 把这类卡通通拉黑当天不再尝试，
+                 * 但用户实测该卡在网页上是**已解锁**状态（账号银牌，满足门槛），
+                 * 拉黑等于把一张本来能完成的卡永久跳过 —— 已撤回。
+                 * 现在 503 一律按普通失败交给外层重试，不做任何 ID 级别的拉黑。 */
+                if (/HTTP 503/.test(String(e2.message))) {
+                    return false;
+                }
                 // 未登录 / 无 Cookie：网页通道再怎么重试也不会成功，当轮直接把机会让给 DAPI
                 // （DAPI 用 Bearer Token 鉴权，不依赖 Cookie，所以没 Cookie 也能把卡做完）
                 if (/\b(401|403)\b/.test(String(e2.message))) {
@@ -2861,6 +3207,39 @@ const __scBgKeepAlive = (function() {
 
             Utils.log("🟡", `卡片领取未确认(${card.offerId})`);
             return false;
+        },
+
+        /* App 专属卡（带锁徽标）专用的交卷通道：换 Rewards 桌面应用 UA 走同一个 server action。
+         * 这类卡的 hash / offerId 与网页端完全一致，差别只在 UA —— 普通 UA 下服务端渲染成锁态并拒绝交卷，
+         * 应用 UA 下就是解锁态。单次尝试只交一次卷，重试由 claimCard 的外层循环负责
+         * （每轮重试都会重新走一遍这里，避免在一次尝试里连发请求）。 */
+        async _claimViaAppChannel(card, { diag = [], name = "" } = {}) {
+            const label = name || card.title || card.offerId;
+            if (!card.hash) {
+                diag.push("app(无hash)");
+                return false;
+            }
+            try {
+                const accepted = await this.claimCardWeb(card, { appChannel: true });
+                if (!accepted) {
+                    diag.push("app(请求未被接受)");
+                    return false;
+                }
+                diag.push("app(已交卷)");
+                await Utils.randomDelay(2000, 4000);
+                // 交卷受理 ≠ 记账：服务端 progress 可能要几十秒才更新，这里只做一次快速确认，
+                // 真正「算不算完成」由 claimCard 的重试循环 + isOfferComplete 判定。
+                if (await this.isOfferCompleteAny(card.offerId, true) === true) {
+                    Utils.log("🟢", `应用通道领取成功：${label}`);
+                    return true;
+                }
+                Utils.log("🟡", `应用通道已交卷，等待服务端记账：${label}`);
+                return false;
+            } catch (e) {
+                diag.push(`app(${e.message})`);
+                Utils.log("🟡", `应用通道交卷失败（${label}）：${e.message}`);
+                return false;
+            }
         },
 
         /* 从搜索结果页里取服务器给这次搜索分配的 IG（交互 ID）。
@@ -3602,6 +3981,21 @@ const __scBgKeepAlive = (function() {
             }
             Utils.log("🧩", "扫描活动卡片...");
             const cards = await API.discoverCards();
+            // 登录态诊断：直接回答「网页通道到底有没有登录 Cookie」。
+            // 以前只能靠日志里 web(HTTP 401) 还是 web(已发出…) 反推，绕了一大圈。
+            try {
+                const ck = await Utils.loginCookies();
+                if (ck === null) {
+                    Utils.log("🔑", "登录态：无法读取 Cookie（脚本管理器未授予 GM_cookie 或超时），按未确认处理");
+                } else if (ck.hasSession) {
+                    // 判定依据是 .bing.com 下真实存在的 cookie（MUID/_EDGE_S/SRCHHPGUSR 等），
+                    // 不是 login.live.com 的 ACCS_ 那套 —— 后者在 bing.com 域下永远读不到。
+                    Utils.log("🔑", `登录态：已登录（Bing cookie 齐全，MUID=${ck.hasMuid}）：${ck.names.slice(0, 8).join(",")}`);
+                } else {
+                    Utils.log("🟡", `登录态：Cookie 里没有 Bing 登录标识（MUID=${ck.hasMuid}）：${ck.names.slice(0, 8).join(",") || "空"}；`
+                        + `网页通道可能不记账`, true);
+                }
+            } catch (_) {}
             if (cards.length === 0) {
                 // 今天压根没有待办卡片（常见的全领完/当天没放卡）：这就是「已完成」，必须落日期。
                 // 否则 promosDate 一直停在昨天，keep=false 时 isAllDone 永远为假，会无限空转。
@@ -3632,15 +4026,30 @@ const __scBgKeepAlive = (function() {
                 result ? ok++ : fail++;
                 gap = SEARCH_PACER.nextGap(gap, !!result);
             }
-            // 以服务端状态为准：仍有未完成卡片时不标记当天完成，下次运行会继续重试
+            // 以服务端状态为准：仍有未完成卡片时不标记当天完成，下次运行会继续重试。
+            // 但锁着的卡（明天才开 / 需在必应 App 里满足条件）永远 complete=false，
+            // 把它们算进 pending 会让当天永远判不成完成 —— 只统计「今天还有希望完成」的卡。
             let pending = 0;
+            let lockedNow = 0;
             try {
                 const map = await API.getPromotionMap(true);
-                if (map) pending = cards.filter(c => !shouldSkip(c) && map.has(c.offerId) && !map.get(c.offerId).complete).length;
+                if (map) {
+                    for (const c of cards) {
+                        if (shouldSkip(c) || !map.has(c.offerId)) continue;
+                        const item = map.get(c.offerId);
+                        if (item.complete) continue;
+                        // 今日被服务端 503 拒绝的卡也不计入剩余：否则当天永远判不成完成
+                        if (CardLock.claimable(item) && !API.isUnoffered(c.offerId)) pending++;
+                        else lockedNow++;
+                    }
+                }
             } catch (_) {}
             if (pending === 0) {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
+            }
+            if (lockedNow > 0) {
+                Utils.log("🔒", `另有 ${lockedNow} 张卡片处于锁定状态，不计入剩余量（满足条件后会自动重试）`);
             }
             Utils.log(pending === 0 ? "🔵" : "🟡",
                 `活动完成: ${ok}成功/${fail}失败${pending > 0 ? `，仍剩 ${pending} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`,
@@ -3895,7 +4304,9 @@ const __scBgKeepAlive = (function() {
                             cards = cards.map(c => {
                                 const w = byId.get(c.offerId);
                                 if (!w) return c;
-                                return { ...c, hash: w.hash, url: w.url || c.url };
+                                // appOnly 一并带过来：网页端也认为它是「带锁徽标的 App 卡」时，
+                                // 交卷要走应用 UA 通道，而不是普通网页通道
+                                return { ...c, hash: w.hash, url: w.url || c.url, ...(w.appOnly || c.appOnly ? { appOnly: true } : {}) };
                             });
                             const enriched = cards.filter(c => c.hash).length;
                             if (enriched > 0) Utils.log("🧩", `已为 ${enriched} 张日常卡补上网页交卷标识（hash）`);
@@ -3933,7 +4344,15 @@ const __scBgKeepAlive = (function() {
                         const todays = [...map.values()].filter(i =>
                             (i.offerId.includes(RewardsAuto.appConfig.offerIds.dailySetPrefix) || i.dailySetDate === todayStr)
                             && (i.dailySetDate === todayStr || i.offerId.includes(String(today))));
-                        remain = todays.filter(i => !i.complete).length;
+                        // 锁着的卡（明天才开 / 需在必应 App 里满足条件）永远 complete=false，
+                        // 把它们算进「剩余」会让当天永远判不成完成：doDailySet 反反复复重试同一张卡，
+                        // 关掉持续检测时 isDayComplete 也永远为假。所以剩余量只统计「今天还有希望完成」的卡。
+                        const openable = todays.filter(i => CardLock.claimable(i));
+                        const lockedNow = todays.length - openable.length;
+                        remain = openable.filter(i => !i.complete).length;
+                        if (lockedNow > 0) {
+                            Utils.log("🔒", `${lockedNow} 张日常活动卡处于锁定状态，不计入剩余量`);
+                        }
                         for (const i of todays) {
                             if (i.complete) doneIds.add(i.offerId);
                             else doneIds.delete(i.offerId);
