@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.6.0
+// @version      1.9.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -792,8 +792,46 @@ const __scBgKeepAlive = (function() {
         },
         getRandomUUID() { return crypto.randomUUID().replace(/-/g, "").toUpperCase(); },
 
-        /* 登录态探测：读 .bing.com / rewards.bing.com 下的 Cookie，回答「网页通道带没带登录态」。
+        /* 首次运行时的 GM_cookie 权限探测。
          *
+         * GM_cookie 是需要**用户授权**的权限：ScriptCat 第一次真正调用 GM_cookie.list()
+         * 时会弹出「是否允许访问 Cookie」的提示。这个弹窗必须由一次真实调用触发 ——
+         * 光在脚本头写 `@grant GM_cookie` 不会弹。
+         *
+         * 以前第一次调用发生在 doPromos 深处（要跑完签到/阅读/搜索才轮到），
+         * 用户根本不知道要授权，日志里只留下一句「无法读取 Cookie」，很困惑。
+         * 现在挪到启动最前面：一运行就弹窗，用户点「允许」即可。
+         *
+         * 三种结果：
+         *   ok=true  已授权且能读到 Bing cookie → 正常；
+         *   ok=false 用户拒绝 / 管理器不支持 → 记下 cookieDenied，后续不再重试（避免刷错误日志）；
+         *   读得到但没 Bing cookie → 只是没登录，不影响权限本身。 */
+        async probeCookiePermission() {
+            // 已经探测过就不再重复（避免每次 reload 都弹一次授权提示）
+            const probed = GM_getValue("Config.cookieProbed", false);
+            if (probed) return;
+
+            if (typeof GM_cookie === "undefined" || !GM_cookie || typeof GM_cookie.list !== "function") {
+                GM_setValue("Config.cookieProbed", true);
+                Utils.log("🔑", "当前脚本管理器不支持 GM_cookie（读不到登录态，但不影响任务执行）");
+                return;
+            }
+
+            Utils.log("🔑", "首次运行：请求 Cookie 读取权限（若弹出授权框请点「允许」）", true);
+            const r = await this.loginCookies();
+            GM_setValue("Config.cookieProbed", true);
+
+            if (r === null) {
+                Utils.log("🟡", "Cookie 读取被拒绝或超时：脚本仍可正常运行，只是读不到登录态诊断。"
+                    + "如需放权，去脚本管理器的「脚本详情 → 权限」里允许 Cookie 访问，然后重新运行。", true);
+            } else if (r.hasSession) {
+                Utils.log("🔑", "Cookie 权限正常，已登录：" + (r.names || []).slice(0, 6).join(","), false);
+            } else {
+                Utils.log("🔑", "Cookie 权限正常，但读出的是未登录状态（请确认已在该浏览器登录 rewards）");
+            }
+        },
+
+        /* 登录态探测：读 .bing.com / rewards.bing.com 下的 Cookie，回答「网页通道带没带登录态」。
          * 判定依据来自 2026-11-03 的真实抓包（cn.bing.com 的 Cookie 名单）：
          *   MUID, MUIDB, _EDGE_V, MSCC, _clck, _clsk, _EDGE_S, USRLOC, BID, GC, __Host-XY, SRCHHPGUSR
          * 早期版本找的是 ACCS_ / _SS / MSPAuth 这些 login.live.com 的 cookie，
@@ -1603,26 +1641,74 @@ const __scBgKeepAlive = (function() {
     };
 
     /* ===== CDP 辅助：用真实鼠标事件完成「应用内搜索」型卡片 =====
+    /* ===== CDP 辅助：用真实鼠标事件完成「应用内搜索」型卡片 =====
      *
      * 为什么需要它（2026-11-03 在真实 Edge 上做的对照实验）：
      *   · 脚本直接请求搜索 URL        → 302 的 Location 里没有 rdrig → 不记账；
      *   · 页面内 sj_rra(url)          → 有请求，但服务端按普通搜索记账，卡片不翻转；
-     *   · 页面内 element.click()/open → 不产生 rdrig；
-     *   · CDP Input.dispatchMouseEvent（真实鼠标事件）→ 产生 rdrig → 卡片完成 +15。
-     * rdrig 是 Bing 在「浏览器级导航 + 真实输入」时才发的指针，HTTP 无法伪造。
+     *   · 页面内 element.click()      → 不产生 rdrig；
+     *   · 页面内派发完整 PointerEvent/MouseEvent 序列 → isTrusted 恒为 false，浏览器
+     *     直接拒绝导航（连页面都不打开）；
+     *   · CDP Input.dispatchMouseEvent（浏览器级输入）→ isTrusted=true → 产生 rdrig → 卡片完成。
      *
-     * 前提（脚本无法自行满足，必须由用户开机时带上）：
+     * 实测：合成事件 isTrusted=false，CDP 事件 isTrusted=true。
+     * isTrusted 是只读属性，页面内 JS 无法伪造 —— 所以「模拟点击」只有 CDP 这一条路。
+     *
+     * 前提（脚本无法自行满足，必须用户启动浏览器时带上）：
      *   Edge 以 --remote-debugging-port=<端口> + 独立 --user-data-dir 启动，并在该窗口登录 rewards。
-     * 端口从 Config.cdpPort 读取，默认 9224；连不上就静默跳过，不影响其它任务。
+     * 端口从 Config.cdpPort 读取，默认 9224；连不上就明确提示（不静默），不影响其它任务。
      */
     const CDP = {
         _ws: null,
         _id: 0,
         _pending: null,
+        // 每轮只提示一次，避免 20 分钟一轮的调度把日志刷满
+        _warnedAt: 0,
+        WARN_GAP: 30 * 60 * 1000,
 
         base() {
             const p = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
             return "http://127.0.0.1:" + p;
+        },
+
+        /* 给用户看的启动命令（照抄即可用）。用 %LOCALAPPDATA% 避免硬编码用户名。 */
+        /* 给用户看的启动命令（照抄即可用）。
+         * 关键点：必须用 --user-data-dir 指向**独立目录** —— Edge 136+ 禁止对默认配置目录
+         * 开远程调试（实测直接加端口不生效，进程起来了但端口不监听）。
+         * 独立目录首次需要登录一次微软账号。 */
+        launchCommand() {
+            const port = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
+            const profile = String(GM_getValue("Config.cdpProfileDir", "") || "%LOCALAPPDATA%\\Microsoft\\Edge\\CDPUserData");
+            const profDir = String(GM_getValue("Config.cdpProfileName", "") || "Profile 2");
+            return "& \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\""
+                + " --remote-debugging-port=" + port
+                + " --remote-allow-origins=* --user-data-dir=\""
+                + profile
+                + "\" --profile-directory=\""
+                + profDir
+                + "\"";
+        },
+
+        /* 醒目提示：日志 + 浏览器通知（通知里带命令，方便直接照做） */
+        warn(reason) {
+            const now = Date.now();
+            const first = !this._warnedAt || now - this._warnedAt > this.WARN_GAP;
+            const msg = [
+                "CDP 未连接：" + reason,
+                "应用内搜索型卡片（如「穿上你的舞鞋」「发光真菌」）需要浏览器级真实点击才能记账。",
+                "页面内 JS 模拟点击无效 —— isTrusted=false 时浏览器直接拒绝导航，这是安全边界。",
+                "",
+                "【启用方法】用桌面上的「Rewards Edge」快捷方式启动（或粘下面这条命令）：",
+                this.launchCommand(),
+                "",
+                "它会在一个独立小窗口打开（不影响你平时的 Edge）。首次需要在该窗口登录 rewards.bing.com。"
+            ].join(String.fromCharCode(10));
+            if (first) {
+                this._warnedAt = now;
+                Utils.log("🔴", msg, true);   // push=true → 系统通知 + webhook
+            } else {
+                Utils.log("🟡", "CDP 仍未连接：" + reason + "（30 分钟内不再重复提示）");
+            }
         },
 
         // 探测端口是否可用（独立短超时，避免没开调试时拖慢整轮）
@@ -1795,22 +1881,34 @@ const __scBgKeepAlive = (function() {
         },
 
         /* 对外主入口：用真实点击完成所有未完成的搜索型卡。
-         * 返回 { ok, handled, done, total, reason }；连不上 CDP 时 ok=false 且 reason 说明原因。 */
+         * 返回 { ok, handled, done, total, reason }。 */
         async claimAll(maxCards) {
             const cap = Number(maxCards) || 6;
             if (!(await this.available())) {
-                return { ok: false, reason: "CDP 端口未开放（需以 --remote-debugging-port 启动浏览器）" };
+                const reason = "端口 " + (Number(GM_getValue("Config.cdpPort", 9224)) || 9224) + " 上没有调试服务";
+                this.warn(reason);
+                return { ok: false, reason: reason };
             }
             let page = await this.earnPage();
-            if (!page) return { ok: false, reason: "打不开 earn 页" };
+            if (!page) {
+                this.warn("能连上端口，但打不开 earn 页");
+                return { ok: false, reason: "打不开 earn 页" };
+            }
             const result = { ok: true, handled: 0, done: 0, total: 0 };
             try {
                 await this.connect(page.webSocketDebuggerUrl);
                 const before = await this.progress();
                 result.done = before.done || 0;
                 result.total = before.total || 0;
-                Utils.log("🖱️", "CDP 已连接：当前已完成 " + before.done + "/" + before.total);
 
+                // 页面没登录时（rewards 会重定向到登录页），提前给出明确提示
+                const logged = await this.evaluate("document.cookie.indexOf('MUID') >= 0");
+                if (!logged) {
+                    this.warn("窗口里没有登录 rewards（该配置目录需要单独登录一次）");
+                    return { ok: false, reason: "CDP 窗口未登录" };
+                }
+
+                Utils.log("🖱️", "CDP 已连接：当前已完成 " + before.done + "/" + before.total);
                 const cards = await this.pendingCards();
                 if (cards.length === 0) {
                     Utils.log("✅", "CDP：没有待处理的应用搜索卡");
@@ -1819,7 +1917,6 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🖱️", "CDP：发现 " + cards.length + " 张待处理卡（用真实点击完成）");
 
                 for (const card of cards.slice(0, cap)) {
-                    // 真实点击会开新标签；每次重新定位并确保连接可用
                     page = await this.earnPage();
                     if (!page) break;
                     if (!this._ws || this._ws.readyState !== 1) {
@@ -1852,6 +1949,7 @@ const __scBgKeepAlive = (function() {
             }
         }
     };
+
 
 
     const API = {
@@ -2209,75 +2307,28 @@ const __scBgKeepAlive = (function() {
         },
 
         /* 「在 Rewards 应用内搜索」型卡片（href 带 form=ML2W4J/ML2Y2H 与 PUBL=RewardsDO）。
+        /* 「在 Rewards 应用内搜索」型卡片的完成通道。
+        /* 「在 Rewards 应用内搜索」型卡片的完成通道。
          *
-         * 为什么必须开真实标签页（这是 11 轮排查的最终结论）：
-         *  - 服务端只在**顶层文档导航**时才在 302 里追加 rdrig（它靠 sec-fetch-mode:navigate /
-         *    sec-fetch-dest:document 识别）。这两个头是浏览器的禁止修改头，GM_xmlhttpRequest
-         *    伪装不出来，所以纯 HTTP 永远拿不到 rdrig；
-         *  - reportActivity 返回的不是 JSON，而是一段客户端模块（ModernRewards...），
-         *    真正的记账由页面里的 JS 执行，后台上下文没有那套运行时。
-         * 结论：这类卡只能在真实页面里完成 —— 打开标签页，让页面自己的脚本跑一遍，然后关掉。
+         * 2026-11-03 在真实 Edge（CDP）里逐项验证：
+         *   · 页面内 element.click() / 派发 PointerEvent 序列 → isTrusted=false，浏览器拒绝导航；
+         *   · 直接请求搜索 URL → 302 的 Location 里没有 rdrig → 不记账；
+         *   · 页面内 sj_rra() → 有请求但按普通搜索记账，卡片不翻转；
+         *   · 只有 CDP Input.dispatchMouseEvent（isTrusted=true）会产生 rdrig 并完成卡片。
          *
-         * 与「不打开多余标签页」的设计冲突，但这是唯一能真正完成的方式，且只对这类卡生效。 */
+         * 实际点击由 doPromos 开头的 CDP.claimAll 统一完成（一次遍历所有待办卡），
+         * 这里只负责「CDP 在不在」的判定与提示，不再打开任何标签页。
+         * 返回 true = CDP 可用（本轮已完成点击），false = CDP 不可用。 */
         async reportDailyActivity(searchUrl) {
-            try {
-                const rawUrl = String(searchUrl || "").trim();
-                if (!rawUrl) return false;
-                const target = new URL(rawUrl.startsWith("http") ? rawUrl : `https://www.bing.com${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`);
-                const url = `https://www.bing.com${target.pathname}?${target.search.slice(1)}`;
+            const rawUrl = String(searchUrl || "").trim();
+            if (!rawUrl) return false;
 
-                /* 节流用**持久化、按卡片区分**的时间戳，不能用内存 Set：
-                 *  - 内存 Set 在 MV3 service worker 被挂起后不会释放，第二次调用 has(url) 恒为真，
-                 *    直接 return —— 日志里就只剩「打开标签页」而永远没有「已关闭」；
-                 *  - 用全局时间戳又会让不同卡片互相阻塞（第 2 张卡被第 1 张挡 20 秒）。
-                 * 所以 key 里带上查询词摘要，按卡区分。 */
-                const cardKey = (String(target.search).match(/[?&]q=([^&]{0,40})/) || [])[1] || String(target.pathname);
-                const lastKey = `Config.searchTabAt.${cardKey}`;
-                const last = Number(GM_getValue(lastKey, 0)) || 0;
-                if (Date.now() - last < 20 * 1000) {
-                    Utils.log("🟡", "刚刚已为该搜索卡开过标签页，稍后再试");
-                    return false;
-                }
-                GM_setValue(lastKey, Date.now());
-
-                let tab = null;
-                try {
-                    Utils.log("🌐", `打开标签页完成应用搜索：${target.pathname.slice(0, 40)}`);
-                    /* active:true —— 前台打开。
-                     * 后台标签页会被浏览器降频（定时器最小间隔被拉长到 1 秒甚至更多），
-                     * 微软页面里那套 rewards 记账脚本依赖定时器/事件，后台状态下经常跑不完整。
-                     * 这是完成这类卡必要的代价：会短暂抢一次焦点，约 12 秒后自动关闭。 */
-                    tab = GM_openInTab(url, { active: true, insert: true, setParent: true });
-                    GM_setValue("Config.searchTabOpenedAt", Date.now());
-                } catch (e) {
-                    Utils.log("🟡", `无法打开标签页: ${e.message}`);
-                    return false;
-                }
-
-                /* 等页面把自己的记账链路走完。
-                 * 前台标签页不会降频，但页面 JS 仍有自己的节奏（抓包里三步在 1 秒内完成，
-                 * 冷启动 + 网络慢会久一些）。分小段等待并保活，避免 MV3 把长定时器掐断。 */
-                const waitMs = Number(typeof __MP_TEST_TAB_WAIT__ !== "undefined" ? __MP_TEST_TAB_WAIT__ : 12000);
-                const step = 1000;
-                for (let waited = 0; waited < waitMs; waited += step) {
-                    await Utils.delay(step);
-                    try { GM_getValue("Config.searchTabTick", 0); GM_setValue("Config.searchTabTick", Date.now()); } catch (_) {}
-                }
-
-                try {
-                    if (tab && typeof tab.close === "function") {
-                        tab.close();
-                    } else if (tab && tab.tabId !== undefined && typeof GM_closeTab === "function") {
-                        GM_closeTab(tab.tabId);
-                    }
-                } catch (_) {}
-
-                Utils.log("📋", `应用搜索标签页已执行并关闭：${target.hostname}${target.pathname}`);
-                return true;
-            } catch (e) {
-                Utils.log("🟡", `应用搜索失败: ${e.message}`);
+            if (!(await CDP.available())) {
+                CDP.warn("端口 " + (Number(GM_getValue("Config.cdpPort", 9224)) || 9224) + " 上没有调试服务");
                 return false;
             }
+            // CDP 可用：点击已在 doPromos 的预扫里做完，这里不再重复遍历
+            return true;
         },
 
         // 小包装：给 reportDailyActivity 用，便于单测里替换
@@ -2912,7 +2963,7 @@ const __scBgKeepAlive = (function() {
                     RewardsAuto._dpl = dplMatch[1];
                     GM_setValue("Config.dpl", dplMatch[1]);
                 }
-                
+
                 const pushCard = (card) => {
                     if (!card || !card.offerId || !card.hash || card.points <= 0) return;
                     const key = `${card.offerId}:${card.hash}`;
@@ -3041,48 +3092,48 @@ const __scBgKeepAlive = (function() {
             } catch (e) {
                 Utils.log("🔴", `卡片解析失败: ${e.message}`);
             }
-            
-                // --- [桌面奖励应用专属任务检测与解析] ---
-                // 注意：此块必须留在 try 内，一旦引用 try 外的 html 会抛 ReferenceError 并被 catch 静默吞掉。
-                try {
-                    if (!earnHtml) return cards;
-                    const questMatch = earnHtml.match(/href="(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i)
-                        || earnHtml.match(/"(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i);
-                    if (questMatch) {
-                        const questPath = questMatch[1];
-                        const questUrl = "https://rewards.bing.com" + questPath;
-                        const questHtml = await Utils.xhr({
-                            url: questUrl,
-                            headers: RewardsAuto.desktopAppHeaders
-                        });
-                        if (questHtml) {
-                            for (const qItem of this._flightItems(this._flightText(questHtml), "WW_pcchild\\d+[^\"]+")) {
-                                // 这段请求走的就是 Rewards 应用 UA（desktopAppHeaders），所以 isLocked 在这里
-                                // 已经是「应用视角」的结论：只有真锁（明天才开 / isDisabled）才跳过。
-                                const qLock = CardLock.probe(qItem);
-                                if (qLock.locked) {
-                                    if (qItem.offerId && qItem.hash) {
-                                        lockStat.count++;
-                                        Utils.log("🔒", `桌面任务仍在锁定期：${qItem.title || qItem.offerId} [${qLock.reason}]`);
-                                    }
-                                } else if (qItem.offerId && qItem.hash && qItem.isCompleted !== true) {
-                                    Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
-                                    pushCard({
-                                        title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
-                                        points: 10,
-                                        offerId: qItem.offerId,
-                                        hash: qItem.hash,
-                                        kind: "desktop_app",
-                                        destination: qItem.destination || qItem.href || "",
-                                        url: "https://rewards.bing.com/earn"
-                                    });
+
+            // --- [桌面奖励应用专属任务检测与解析] ---
+            // 注意：此块必须留在 try 内，一旦引用 try 外的 html 会抛 ReferenceError 并被 catch 静默吞掉。
+            try {
+                if (!earnHtml) return cards;
+                const questMatch = earnHtml.match(/href="(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i)
+                    || earnHtml.match(/"(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i);
+                if (questMatch) {
+                    const questPath = questMatch[1];
+                    const questUrl = "https://rewards.bing.com" + questPath;
+                    const questHtml = await Utils.xhr({
+                        url: questUrl,
+                        headers: RewardsAuto.desktopAppHeaders
+                    });
+                    if (questHtml) {
+                        for (const qItem of this._flightItems(this._flightText(questHtml), "WW_pcchild\\d+[^\"]+")) {
+                            // 这段请求走的就是 Rewards 应用 UA（desktopAppHeaders），所以 isLocked 在这里
+                            // 已经是「应用视角」的结论：只有真锁（明天才开 / isDisabled）才跳过。
+                            const qLock = CardLock.probe(qItem);
+                            if (qLock.locked) {
+                                if (qItem.offerId && qItem.hash) {
+                                    lockStat.count++;
+                                    Utils.log("🔒", `桌面任务仍在锁定期：${qItem.title || qItem.offerId} [${qLock.reason}]`);
                                 }
+                            } else if (qItem.offerId && qItem.hash && qItem.isCompleted !== true) {
+                                Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
+                                pushCard({
+                                    title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
+                                    points: 10,
+                                    offerId: qItem.offerId,
+                                    hash: qItem.hash,
+                                    kind: "desktop_app",
+                                    destination: qItem.destination || qItem.href || "",
+                                    url: "https://rewards.bing.com/earn"
+                                });
                             }
                         }
                     }
-                } catch (eQuest) {
-                    Utils.log("🟡", `桌面应用专属任务解析跳过: ${eQuest.message}`);
                 }
+            } catch (eQuest) {
+                Utils.log("🟡", `桌面应用专属任务解析跳过: ${eQuest.message}`);
+            }
 
             if (lockStat.count > 0 || lockStat.app > 0) {
                 RewardsAuto.state.lockedCount = Math.max(RewardsAuto.state.lockedCount, lockStat.count);
@@ -3245,36 +3296,32 @@ const __scBgKeepAlive = (function() {
             if (!skipWeb && this._isAppSearchCard(card)) {
                 /* 「应用内搜索」型卡（href 带 PUBL=RewardsDO / form=ML2W4J|ML2Y2H）。
                  *
-                 * 实测（真实 Edge + CDP）说明这类卡有一个特殊性质：
-                 *   · 脚本可以打开页面并调用页面里的 sj_rra 完成上报，服务端也会记分；
-                 *   · 但卡片「已完成」状态只有用户从 earn 页真实点击才会翻转，脚本做不到。
-                 * 因此这里不再无谓地反复重试 3 次（每次都开标签页、等 60 秒，把整轮拖满），
-                 * 而是：上报一次 → 短暂等待 → 没完成就明确告知需要手动点击。 */
+                 * 这类卡只有浏览器级真实点击才能完成（isTrusted=true 才产生 rdrig）。
+                 * 现在统一交给 CDP：它在已有的 earn 页上派发鼠标事件，**不打开新标签页**。
+                 * CDP 不可用时 reportDailyActivity 返回 false 并发一次醒目提示。 */
                 const searchOk = await this.reportDailyActivity(card.destination);
-                diag.push(searchOk ? "search(已上报)" : "search(失败)");
+                diag.push(searchOk ? "search(CDP已点击)" : "search(未处理)");
                 if (searchOk) {
-                    // 短暂等待：服务端记账可能比标签页加载慢，但不必等到 60 秒
+                    // CDP 点完到服务端记账有一小段延迟，短暂轮询即可
                     const deadline = Date.now() + 25 * 1000;
                     while (Date.now() < deadline) {
                         if (await this.isOfferCompleteAny(offerId, true) === true) {
-                            Utils.log("🟢", `应用搜索领取成功：${name}`);
+                            Utils.log("🟢", "应用搜索领取成功：" + name);
                             return true;
                         }
                         await Utils.delay(5000);
                     }
-                    diag.push("search(已上报未标记完成)");
-                    Utils.log("🟡", "「" + name + "」已自动上报搜索，但卡片状态需手动确认："
-                        + "请在 rewards.bing.com/earn 点一次这张卡", true);
+                    diag.push("search(已点击未标记完成)");
                 }
-                // 无论成败都不再重试：这类卡重试多少次结果都一样，只会占满整轮时间
+                // 这类卡重试无意义（CDP 已遍历处理过），标记后交给下一轮/明天
                 this._markManualCard(offerId, name);
             } else if (!skipWeb && !card.hash) {
                 // DAPI 发现的日常卡没有 hash（网页通道拿不到交卷标识），直接走 DAPI
                 diag.push("web(无hash)");
             } else if (!skipWeb && card.appOnly) {
                 // 带锁徽标的 App 卡：普通 UA 交卷一定被拒，直接用 Rewards 应用 UA 交卷。
-                // 这条分支不受 webNoAuth / webFailStreak 熔断影响 —— 熔断是针对「浏览器会话」的，
-                // 应用通道是另一套身份，被 401 熔断连坐就会让这类卡永远做不成。
+                // 这条分支不受 webNoAuth / webFailStreak 熔断影响 —— 熔断针对「浏览器会话」，
+                // 应用通道是另一套身份，被 401 连坐会让这类卡永远做不成。
                 await this._claimViaAppChannel(card, { diag, name });
                 if (await this.isOfferCompleteAny(offerId, true) === true) return true;
             } else if (!skipWeb && RewardsAuto.state.webNoAuth) {
@@ -4256,19 +4303,15 @@ const __scBgKeepAlive = (function() {
             }
             Utils.log("🧩", "扫描活动卡片...");
             const cards = await API.discoverCards();
-            // 登录态诊断：直接回答「网页通道到底有没有登录 Cookie」。
-            // 以前只能靠日志里 web(HTTP 401) 还是 web(已发出…) 反推，绕了一大圈。
+            /* 登录态核对：启动时的 probeCookiePermission 只跑一次（避免反复弹授权），
+             * 这里每轮轻量确认一次，但**只在异常时出声** —— 正常登录不再刷屏。 */
             try {
                 const ck = await Utils.loginCookies();
                 if (ck === null) {
-                    Utils.log("🔑", "登录态：无法读取 Cookie（脚本管理器未授予 GM_cookie 或超时），按未确认处理");
-                } else if (ck.hasSession) {
-                    // 判定依据是 .bing.com 下真实存在的 cookie（MUID/_EDGE_S/SRCHHPGUSR 等），
-                    // 不是 login.live.com 的 ACCS_ 那套 —— 后者在 bing.com 域下永远读不到。
-                    Utils.log("🔑", `登录态：已登录（Bing cookie 齐全，MUID=${ck.hasMuid}）：${ck.names.slice(0, 8).join(",")}`);
-                } else {
-                    Utils.log("🟡", `登录态：Cookie 里没有 Bing 登录标识（MUID=${ck.hasMuid}）：${ck.names.slice(0, 8).join(",") || "空"}；`
-                        + `网页通道可能不记账`, true);
+                    // probeCookiePermission 已经提示过授权问题，这里不再重复打扰
+                } else if (!ck.hasSession) {
+                    Utils.log("🟡", "Cookie 里没有 Bing 登录标识（MUID=" + ck.hasMuid + "）："
+                        + (ck.names.slice(0, 6).join(",") || "空") + "；网页通道可能不记账", true);
                 }
             } catch (_) {}
             if (cards.length === 0) {
@@ -4281,17 +4324,21 @@ const __scBgKeepAlive = (function() {
             }
             Utils.log("🧩", `发现 ${cards.length} 个卡片`);
 
-            /* 先用 CDP 真实点击把「应用内搜索」型卡做掉 —— 这类卡只有真实鼠标事件
-             * 才能产生 rdrig（详见 CDP 模块注释）。CDP 不可用时静默跳过，不影响后续流程。 */
+            /* 先用 CDP 真实点击把「应用内搜索」型卡做掉 —— 这类卡只有浏览器级输入
+             * 才能产生 rdrig（详见 CDP 模块注释）。CDP 不可用时会给出醒目提示，
+             * 但不中断其它任务。 */
             try {
                 const cdp = await CDP.claimAll(6);
                 if (cdp.ok && cdp.handled > 0) {
                     Utils.log("🖱️", "CDP 真实点击完成 " + cdp.handled + " 张（当前 " + cdp.done + "/" + cdp.total + " 已完成）");
-                } else if (!cdp.ok) {
-                    Utils.log("🟡", "CDP 跳过：" + cdp.reason);
+                } else if (cdp.ok) {
+                    Utils.log("🖱️", "CDP 已连接，但没有待处理的应用搜索卡（" + cdp.done + "/" + cdp.total + "）");
+                } else {
+                    // CDP.warn() 已经在内部发过醒目通知（含启动命令），这里补一条简短汇总
+                    Utils.log("🔴", "CDP 不可用（" + cdp.reason + "）：应用内搜索型卡本轮跳过，详见上方提示");
                 }
             } catch (e) {
-                Utils.log("🟡", "CDP 异常：" + e.message);
+                Utils.log("🔴", "CDP 异常：" + e.message);
             }
 
             // 用户关掉 Quiz 时，Quiz 卡片本轮本来就不处理，判定「是否还有未完成」时也不该算它，
@@ -5412,6 +5459,15 @@ const __scBgKeepAlive = (function() {
         bootstrapped = true;
         TaskManager.init();
 
+        /* 首次运行就把 GM_cookie 探测掉。
+         * 原因：GM_cookie 是**需要用户授权的权限**，ScriptCat 第一次调用时会弹权限框。
+         * 以前这个调用藏在 doPromos 深处（要等跑到「活动卡片」阶段才触发），
+         * 用户根本不知道该点什么，日志里只剩一句「无法读取 Cookie」。
+         * 现在放在启动最前面：一运行就会弹出授权提示，点了「允许」之后一切正常；
+         * 若是用户明确拒绝过，则记下来避免每轮刷错误日志。 */
+        Utils.probeCookiePermission().catch(() => {});
+
+
         // 后台点「📋 粘贴授权码」时会置 Config.pendingPaste 并打开页面，
         // 页面侧在加载 / 获得焦点时把输入框补弹出来。
         const consumePendingPaste = () => {
@@ -5454,11 +5510,11 @@ const __scBgKeepAlive = (function() {
             || !GM_getValue("Config.token", false)   // 没授权时它本来也跑不了，别让调度空转
             || (() => { const st = EdgeStreak.state(); return st.complete || st.giveUp; })();
         return checkDone(GM_getValue("Tasks.sign"), TaskManager.signDate) &&
-               checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
-               checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
-               checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
-               dailySetDone &&
-               edgeDone;
+            checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
+            checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
+            checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
+            dailySetDone &&
+            edgeDone;
     };
 
     /** 落「今日已完成」标记（Sched.tick 看到它就不再触发新一轮），只打一次日志，不刷屏 */
