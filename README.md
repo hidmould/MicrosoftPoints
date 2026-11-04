@@ -110,7 +110,7 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 | 类型 | 判据 | 完成方式 |
 | --- | --- | --- |
 | **应用内搜索型** | `href` 是 `bing.com/search?...&PUBL=RewardsDO`（`form=ML2W4J`/`ML2Y2H`） | **开真实标签页**，让页面自己的 JS 完成记账（见下） |
-| **等级门槛型** | `offerId` 含 `locked_level2` / `unlockCriteria=newLevel2` | 等级达标（`isLocked:false`+`isUnlocked:true`）就照常交卷；未达标则跳过 |
+| **等级门槛型** | `offerId` 含 `locked_level2` / `unlockCriteria=newLevel2` | 等级达标（`isLocked:false`+`isUnlocked:true`）就照常交卷；未达标则跳过；**已解锁时先走「应用内搜索三步上报」再走 CDP**（见下方「关于 503」） |
 
 ### 为什么应用内搜索型必须开标签页
 
@@ -613,6 +613,40 @@ const re = /\/earn\/quest\/(...punchcard...)/g;
 
 现在 503 一律按普通失败处理、交给外层重试，不做任何 ID 级别的拉黑。
 `isUnoffered` 读写通道保留，但当前没有任何触发点。
+
+### 等级门槛卡（已解锁）优先走「应用内搜索上报」（2026-11-04 补）
+
+这类卡的 `href` 是 `bing.com/search?q=…&form=ML2Y2H&PUBL=RewardsDO`，网页上就是一张
+「去搜一次」的卡。服务端对它的 503 / 「已受理未记账」，真实原因往往不是等级不够，
+而是**没看到那次应用内搜索**。
+
+所以领取顺序改成两级，新增的在前、原有 CDP 通道保留在后：
+
+| 顺序 | 通道 | 条件 | 失败后果 |
+| --- | --- | --- | --- |
+| 1 | **应用内搜索三步上报**（`API._claimLevelGatedViaAppSearch`，从「商城签到改进加强版」的 punchcard 子项做法搬来） | `offerId` 含 `locked_level2` / `unlockCriteria=newLevel2` 且已解锁 | 记 `lev2search(未标记完成)`，继续下一步 |
+| 2 | 原有 **CDP 真实点击**（`reportDailyActivity` → `CDP.claimAll`） | 只要是「应用内搜索型」卡 | 标「需手动」，交给下一轮 |
+| 3 | DAPI 兜底 | 以上都没成 | 按普通失败重试 |
+
+三步上报的细节（全部是 `bing.com` 域下的普通接口，不受 server action 的 Origin 限制）：
+
+1. GET 卡片 `href` 拿 SERP，并从响应里抠出服务端分配的 `IG`；
+2. POST `rewardsapp/ncheader?…&IG=…` —— 告知这次搜索的上下文；
+3. POST `rewardsapp/reportActivity?…&<卡片原始签名参数>` —— 真正记账的那一下；随后才补交卷。
+
+日志标记：
+
+```
+🔓 等级门槛卡（已解锁），领取时先走应用内搜索上报：… +15p [已解锁]
+🔎 等级门槛卡已按应用内搜索签名上报：…
+🟢 等级门槛卡完成（应用内搜索通道）：…
+🟡 等级门槛卡：应用内搜索通道未记账，改走 CDP 通道：…    ← 完不成就回落，CDP 没被删
+```
+
+> 范围只限「等级锁且已解锁」这一类卡，其它日常卡维持原样（应用内搜索型仍交给 CDP）。
+> 补 hash 的环节会一并把 `levelGated` / `destination` 带过来，否则 DAPI 发现、网页补 hash 之后
+> 会丢掉标记、退回 503 的老路。
+
 
 ## 自动领取「待领积分」（1.10.0 起）
 

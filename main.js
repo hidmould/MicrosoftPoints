@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.10.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务（纯 HTTP，一周一次做满 8/8）、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）、✅同源通道自适应（新版 Edge 可跑）
+// @version      1.10.1
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务（纯 HTTP，一周一次做满 8/8）、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅等级门槛卡（已解锁）优先走应用内搜索上报、失败再走 CDP 真实点击（全程后台运行）、✅同源通道自适应（新版 Edge 可跑）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -3339,7 +3339,8 @@ const __scBgKeepAlive = (function() {
                     url: "https://rewards.bing.com/earn",
                     destination: item.destination || "",
                     source: "dapi",
-                    ...(lock.appOnly ? { appOnly: true } : {})
+                    ...(lock.appOnly ? { appOnly: true } : {}),
+                    ...(lock.levelGated ? { levelGated: true } : {})
                 });
             }
             if (lockedCount > 0) {
@@ -3557,21 +3558,29 @@ const __scBgKeepAlive = (function() {
             /* 判断一张卡要被怎么处理：
              *   null        → 正常卡，走「网页通道 → DAPI」；
              *   skip=true   → 今天真做不了（明天才开 / isDisabled），别放进队列，否则永远判不成完成；
-             *   appOnly=true→ 普通 UA 下带锁徽标，必须换 Rewards 应用 UA 交卷（见 claimCardWeb）。 */
+             *   appOnly=true→ 普通 UA 下带锁徽标，必须换 Rewards 应用 UA 交卷（见 claimCardWeb）；
+             *   levelGated=true → 等级门槛卡（locked_level2/newLevel2）且**已解锁**：
+             *     领取时先走「应用内搜索三步上报」（从商城签到加强版搬来），不行再走 CDP。 */
             const classify = (item, points = 0) => {
                 const lock = CardLock.probe(item);
                 if (lock.locked) {
                     lockStat.count++;
                     lockStat.points += Number(points) || 0;
                     Utils.log("🔒", `跳过锁卡：${item.title || item.name || item.offerId || "活动卡片"} +${points}p [${lock.reason}]`);
-                    return { skip: true, appOnly: false };
+                    return { skip: true, appOnly: false, levelGated: false };
                 }
                 if (lock.appOnly) {
                     lockStat.app++;
                     Utils.log("🔓", `带锁徽标的 App 卡，改用 Rewards 应用通道：${item.title || item.name || item.offerId} +${points}p [${lock.reason}]`);
-                    return { skip: false, appOnly: true };
+                    return { skip: false, appOnly: true, levelGated: !!lock.levelGated };
                 }
-                return { skip: false, appOnly: false };
+                // 等级门槛卡走到这里说明页面/服务端已给了解锁态（isLocked:false 或 isUnlocked:true），
+                // 但这类卡的服务端交卷常回 503：它的真实完成前奏是「按 href 做一次应用内搜索上报」。
+                if (lock.levelGated) {
+                    Utils.log("🔓", `等级门槛卡（已解锁），领取时先走应用内搜索上报：${item.title || item.name || item.offerId} +${points}p [${lock.reason || "已解锁"}]`);
+                    return { skip: false, appOnly: false, levelGated: true };
+                }
+                return { skip: false, appOnly: false, levelGated: false };
             };
             try {
                 const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
@@ -3594,12 +3603,17 @@ const __scBgKeepAlive = (function() {
                     cards.push(card);
                 };
 
-                // 带锁徽标的卡按 appOnly 标记下发；真锁卡丢弃
+                // 带锁徽标的卡按 appOnly 标记下发；真锁卡丢弃；等级门槛（已解锁）卡带 levelGated 标记
                 const pushWithLock = (item, card, points) => {
                     if (!card) return false;
                     const verdict = classify(item, points);
                     if (verdict.skip) return false;
-                    pushCard(verdict.appOnly ? { ...card, appOnly: true } : card);
+                    const marked = {
+                        ...card,
+                        ...(verdict.appOnly ? { appOnly: true } : {}),
+                        ...(verdict.levelGated ? { levelGated: true } : {})
+                    };
+                    pushCard(marked);
                     return true;
                 };
 
@@ -3855,6 +3869,64 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
+        /** 等级门槛卡（`WW_Rewards_locked_level2_*` / `unlockCriteria=newLevel2`）且已解锁时，
+         * 先走「应用内搜索三步上报」再交卷 —— 这条通道是从「微软积分商城签到（改进加强版）」
+         * 的 taskPunchcard 子项处理里搬过来的，原脚本据此把同类子项做通了。
+         *
+         * 为什么对它优先级最高：这类卡在网页上就是一张「去搜一次」的卡，服务端 503 的
+         * 真实含义往往不是「等级不够」，而是「没看到那次应用内搜索」。先按 href 上报，
+         * 再交卷，通常就能记账；三步都是 bing.com 域的普通接口，不受 server action 的
+         * Origin 限制，也不需要浏览器级输入（所以不必依赖 CDP）。
+         *
+         * 返回 true = 已通过该通道完成（服务端状态已复核）。false = 没成，调用方继续走
+         * 原有的 CDP 通道（不删除、不降级）。
+         */
+        async _claimLevelGatedViaAppSearch(card, { diag = [], name = "" } = {}) {
+            const label = name || card.title || card.offerId;
+            const offerId = card.offerId;
+            const href = String(card.destination || "");
+            if (!href || !/bing\.com\/search/i.test(href)) {
+                diag.push("lev2search(无搜索href)");
+                return false;
+            }
+            let searched = false;
+            try {
+                searched = await this.reportAppSearchForCard(href);
+                diag.push(searched ? "lev2search(已上报)" : "lev2search(上报失败)");
+            } catch (e) {
+                diag.push(`lev2search(${e.message})`);
+            }
+            if (!searched) return false;
+            Utils.log("🔎", `等级门槛卡已按应用内搜索签名上报：${label}`);
+
+            // 上报后给服务端一点时间，再补一次交卷（普通 UA；带 hash 才发）
+            await Utils.randomDelay(2000, 4000);
+            if (card.hash) {
+                try {
+                    const accepted = await this.claimCardWeb(card);
+                    diag.push(accepted ? "lev2search(已交卷)" : "lev2search(交卷未受理)");
+                } catch (e) {
+                    diag.push(`lev2search(交卷 ${e.message})`);
+                }
+            } else {
+                diag.push("lev2search(无hash跳过交卷)");
+            }
+
+            // 记账可能延迟，短暂轮询（最多 25 秒）确认是否真的完成
+            const deadline = Date.now() + 25 * 1000;
+            while (Date.now() < deadline) {
+                const st = await this.isOfferCompleteAny(offerId, true);
+                if (st === true) {
+                    Utils.log("🟢", `等级门槛卡完成（应用内搜索通道）：${label}`);
+                    return true;
+                }
+                await Utils.delay(5000);
+            }
+            diag.push("lev2search(未标记完成)");
+            Utils.log("🟡", `等级门槛卡：应用内搜索通道未记账，改走 CDP 通道：${label}`);
+            return false;
+        },
+
         /** 领取单张卡片（统一入口：先网页通道 → 网页完成不了再换 DAPI → 一律用服务端状态复核是否真的加分）。
          *  服务端可能要 1~3 分钟才把上报记入 progress，单次失败不等于真失败，故做多轮重试。
          */
@@ -3946,6 +4018,16 @@ const __scBgKeepAlive = (function() {
             }
 
             // ---------- 1) 网页通道（优先） ----------
+            /* 等级门槛卡（已解锁）专属前哨：先走「应用内搜索三步上报」（从「微软积分商城签到
+             * （改进加强版）」的 taskPunchcard 子项做法搬来）。这类卡的 href 是
+             * `bing.com/search?q=..&form=ML2Y2H&PUBL=RewardsDO`，服务端只看到交卷、没看到
+             * 那次搜索时就不记账（表现为 503 或「已受理但未生效」）。
+             * 顺序按用户要求：新增通道优先，完不成再落到下面原有的 CDP 通道（CDP 不删）。 */
+            if (!skipWeb && card.levelGated && !card.appOnly) {
+                const viaSearch = await this._claimLevelGatedViaAppSearch(card, { diag, name });
+                if (viaSearch) return true;
+            }
+
             /* 分支顺序很重要：搜索型卡靠 destination 完成，不由 hash 驱动，
              * 必须排在「无 hash」分支之前，否则 DAPI 发现的搜索卡会被误判成走 DAPI。 */
             if (!skipWeb && this._isAppSearchCard(card)) {
@@ -6285,9 +6367,17 @@ const __scBgKeepAlive = (function() {
                             cards = cards.map(c => {
                                 const w = byId.get(c.offerId);
                                 if (!w) return c;
-                                // appOnly 一并带过来：网页端也认为它是「带锁徽标的 App 卡」时，
-                                // 交卷要走应用 UA 通道，而不是普通网页通道
-                                return { ...c, hash: w.hash, url: w.url || c.url, ...(w.appOnly || c.appOnly ? { appOnly: true } : {}) };
+                                // appOnly / levelGated 一并带过来：网页端也认为它是「带锁徽标的 App 卡」
+                                // 时交卷要走应用 UA 通道；等级门槛卡则要保住「先走应用内搜索上报」的标记，
+                                // 否则补完 hash 反而退回普通网页通道（503 的老路）。
+                                return {
+                                    ...c,
+                                    hash: w.hash,
+                                    url: w.url || c.url,
+                                    destination: c.destination || w.destination || "",
+                                    ...(w.appOnly || c.appOnly ? { appOnly: true } : {}),
+                                    ...(w.levelGated || c.levelGated ? { levelGated: true } : {})
+                                };
                             });
                             const enriched = cards.filter(c => c.hash).length;
                             if (enriched > 0) Utils.log("🧩", `已为 ${enriched} 张日常卡补上网页交卷标识（hash）`);
