@@ -614,6 +614,80 @@ const re = /\/earn\/quest\/(...punchcard...)/g;
 现在 503 一律按普通失败处理、交给外层重试，不做任何 ID 级别的拉黑。
 `isUnoffered` 读写通道保留，但当前没有任何触发点。
 
+## 自动领取「待领积分」（1.10.0 起）
+
+以前日志里那句
+
+```
+🎁 发现 6 积分待领取（请手动前往 dashboard 领取）
+```
+
+只是**读**了 dashboard 上的角标，`doClaimPoints()` 全程没有任何写操作。现在它会真的领：
+
+```
+🎁 已自动领取 25 积分（当前余额：1035）
+✅ 无可领取积分（待领池为空（15 分钟内已确认过））
+```
+
+### 协议（对齐「商城签到加强版」的实测结论）
+
+| 步骤 | 细节 |
+| --- | --- |
+| 判断有没有得领 | 页面 flight 里的 `"pointClaim"`：`null` = 空池；`{…}`/`[…]` = 有待领 |
+| 领取请求 | `POST https://rewards.bing.com/earn`，`next-action: <reportClaimAllPoints>`，body `[]` |
+| 必备头 | `next-router-state-tree`（earn 段）+ `x-deployment-id`（有 dpl 就带） |
+| 是否入账 | 接口**不回 JSON**，唯一证据是余额变化（再兜一层「池子是否已清空」） |
+
+领取接口幂等：空池时发过去没有副作用，所以「多发一次」是安全代价，不会重复加分。
+
+> 与「今日已完成」的判定解耦：领没领成都不影响 `isDayComplete`。否则领取接口抽风一次，
+> 持续检测就永远停不下来。
+
+### 关于新版 Edge（这条是这一版的重点）
+
+server action 的 `Origin` 由**浏览器强制注入**，脚本改不了：
+
+| 发送方 | Origin | 结果 |
+| --- | --- | --- |
+| rewards 页面里的 `fetch` / CDP | `https://rewards.bing.com` | 200，记账 |
+| 扩展后台 `GM_xmlhttpRequest` | `chrome-extension://<扩展ID>` | 常 500（风控页） |
+
+新版 Edge 对「扩展源 origin」的 server action 拒得更死，所以以前那套后台直发在
+Edge 156 上会哑火 —— 这不是参数写错了。**现在不再依赖单一通道**：
+
+```
+page  → CDP 在真实 rewards 页面里用原生 fetch（同源，跨版本最稳）
+proxy → 页面代发服务（页面自己的 fetch）
+xhr   → 扩展后台直发（Chrome / 旧版 Edge 上通常能过，作为兜底）
+```
+
+顺序固定（同源优先），**哪一条真的被受理就把结论记进 `Config.claimVariant`**，
+下一轮直接复用，不再每次试三遍。三条都不通时日志会逐条写状态，并提示怎么把同源通道架起来
+（用「Rewards Edge」快捷方式启动 + 留一个 rewards 页面）。
+
+浏览器版本只用于**日志与诊断**，不再是开关：脚本读 `navigator.userAgent` 得到
+`Edge 156` / `Chrome 156` 这类结论，`BrowserEnv.info()` 里的 `extOriginRisky`
+只决定要不要多打一句提示。真正决定走哪条通道的永远是「请求能不能被受理」。
+
+### Server Action 标识表
+
+交卷和领取都是 Next.js Server Action，ID 形如 40~64 位 hex，**微软每次重新部署都会换**。
+旧版只探测 `reportActivity` 一个 ID，领取要的是另一个（`reportClaimAllPoints`）。
+现在补了一张完整的表（`ActionMap`）：
+
+1. 从 rewards 页面引用的分包里扫 `createServerReference("<hex>"…"<函数名>")`，
+   还原成「函数名 → ID」；
+2. 优先扫页面直接引用的分包，再用 webpack 运行时清单枚举**按需分包**
+   （领取组件不在初始分包里 —— 这是参考脚本的关键发现），最后用历史分包兜底；
+3. 按 `dpl`（部署号）缓存，部署变了才重扫；有「个数 + 总耗时」双重上限，不会把一轮拖死；
+4. 交卷 404 时整张表作废重扫（`ActionMap.clear()`），并退回已知兜底标识。
+
+### 开关与诊断
+
+- 配置项 `Tasks.claimPoints`（默认开）：关掉后完全不碰 rewards。
+- 控制台 `__MPDiagnostics.claim()`：一次打印当前浏览器、已记住的通道、CDP/页面代发是否在线、
+  标识表缓存情况，并立刻跑一次领取。
+
 ## 测试
 
 ```bash
@@ -633,6 +707,7 @@ node tests/questparse.test.mjs    # quest 入口解析五重兜底：转义/渲�
 node tests/questvariant.test.mjs  # 交卷形态自动探测：哪一形态能过就记住它
 node tests/pagechannel.test.mjs  # 页面通道：让 rewards 页面代发，绕开扩展 Origin
 node tests/pageautoserve.test.mjs # 纯后台自动开代发页面：能接上就用，接不上退回直发
+node tests/claimpoints.mjs      # 待领积分自动领取：pointClaim 判定、三通道降级、标识表、浏览器自适应
 ```
 
 测试用 `tests/harness.mjs` 在 Node 里加载 `main.js`，用假的 `GM_*` 顶替油猴 API，

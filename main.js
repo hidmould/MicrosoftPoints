@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.9.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务（纯 HTTP，一周一次做满 8/8）、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）
+// @version      1.10.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务（纯 HTTP，一周一次做满 8/8）、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）、✅同源通道自适应（新版 Edge 可跑）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -105,6 +105,10 @@ Tasks:
         default: true
     desktopWeekly:
         title: 桌面应用每周专属任务（每轮检测，按星期逐日解锁）
+        type: checkbox
+        default: true
+    claimPoints:
+        title: 自动领取待领积分（搜索打卡/每日活动的奖励需点一次才入账）
         type: checkbox
         default: true
 Notice:
@@ -363,6 +367,8 @@ const __scBgKeepAlive = (function() {
     const NEXT_ACTION_SCAN_MAX = 8;               // 探测 Server Action ID 时最多扫几个 chunk
     const NEXT_ACTION_SCAN_BUDGET = 45 * 1000;    // 探测 Server Action ID 的总耗时上限
     const WEB_FAIL_LIMIT = 3;                     // 网页通道连续失败几次后，本轮改为只用 DAPI
+    const ACTION_SCAN_MAX = 24;                   // 提取 Server Action 标识表时最多抓几个分包
+    const ACTION_SCAN_BUDGET = 60 * 1000;         // 提取标识表的总耗时上限（领取标识常在按需分包里）
 
     /* ===== 卡片锁态语义（从「微软积分商城签到（改进加强版）.user.js」迁移） =====
      * 网页端下发的活动卡片带 isLocked / isUnlocked / unlockCriteria 三个字段，
@@ -2173,7 +2179,401 @@ const __scBgKeepAlive = (function() {
         }
     };
 
+    /* ===== 浏览器环境识别（为什么需要它） =====
+     * 交卷/领取都是 Next.js Server Action，而 `Origin` 这个头由浏览器强制注入 ——
+     * 扩展后台发请求时恒为 `chrome-extension://<扩展ID>`。必应对这类 origin 的 server action
+     * 会直接回 500（风控页），而脚本改不了它。不同浏览器/版本对扩展请求的指纹宽容度不一样：
+     * 实测在旧版 Edge（≤151）和 Chrome 上后台直发能过，新版 Edge 上就常被拒。
+     *
+     * 所以脚本不该假设「后台直发一定行」，也不该把版本写死。这里只做两件事：
+     *   1) 读出当前浏览器的名字与大版本（供日志/诊断与通道选择参考）；
+     *   2) 给出「当前环境最可能可用的发送通道」顺序 —— 页面/CDP 优先，后台直发兜底。
+     * 版本号只是证据，不是开关：真正决定走哪条通道的是**请求能不能被受理**（见 ClaimPoints）。 */
+    const BrowserEnv = {
+        _cache: null,
+        info() {
+            if (this._cache) return this._cache;
+            let ua = "";
+            try {
+                ua = (typeof navigator !== "undefined" && navigator && navigator.userAgent) ? String(navigator.userAgent) : "";
+            } catch (_) { ua = ""; }
+            if (!ua) {
+                try {
+                    const saved = String(GM_getValue("Config.uaEdge", "") || "");
+                    if (saved) ua = saved;
+                } catch (_) {}
+            }
+            let name = "未知";
+            if (/Edg\//.test(ua)) name = "Edge";
+            else if (/EdgA\//.test(ua)) name = "Edge(App)";
+            else if (/OPR\//.test(ua)) name = "Opera";
+            else if (/Firefox\/|FxiOS\//.test(ua)) name = "Firefox";
+            else if (/Chrome\//.test(ua)) name = "Chrome";
+            else if (/Safari\//.test(ua)) name = "Safari";
+            // 大版本：Edge 用 Edg/ 的号（与 Chromium 同号），其它用 Chrome/ 的号
+            const vm = ua.match(/(?:Edg|EdgA|Chrome|Firefox)\/(\d+)/);
+            const major = vm ? Number(vm[1]) : 0;
+            // 「后台直发能否过」不看版本号，但版本号够新时先把提示写好，避免用户误以为脚本坏了
+            const extOriginRisky = name === "Edge" && major >= 152;
+            this._cache = { ua, name, major, extOriginRisky };
+            return this._cache;
+        },
+        /* 发送通道的优先顺序。页面/CDP = 同源请求（Origin 天然正确）；
+         * xhr = 扩展后台直发（Origin 是扩展源，风险最高）。
+         * 顺序不随浏览器/版本变化：同源通道永远更稳，版本号只用来决定日志怎么提示。 */
+        channelOrder() {
+            return ["page", "proxy", "xhr"];
+        },
+        summary() {
+            const i = this.info();
+            return `${i.name}${i.major ? " " + i.major : ""}`;
+        }
+    };
 
+    /* ===== Server Action 标识表（从「商城签到加强版」迁移） =====
+     * 交卷和领取都是 Next.js Server Action：POST 带 `next-action: <40~64 位 hex>`。
+     * 微软**每次重新部署站点都会换这一批 ID**，所以写字面量迟早会 404。
+     *
+     * 参考脚本的做法：从 rewards.bing.com 引用的 JS 分包里扫
+     * `createServerReference("<hex>"…"<函数名>")` / `registerServerReference(…,"<hex>"…"<名>")`，
+     * 直接还原出一张「函数名 → ID」的表，还按 dpl（部署号）缓存，部署变了才重扫。
+     *
+     * 本脚本原本只探测 `reportActivity` 一个 ID（getNextActionHash），够用但不完整：
+     * 领取全部待领积分要的是另一个 action（reportClaimAllPoints）。所以这里补一张完整的表：
+     *   · 先查缓存（dpl 变了就算过期，因为 ID 与部署一一对应）；
+     *   · 没缓存才抓分包，抓取有「个数 + 总耗时」双重上限，不会把一轮拖死；
+     *   · 全失败时退回调用方给的已知 ID，并打一条明确日志（不再静默 404）。
+     */
+    const ActionMap = {
+        KEY_MAP: "Config.actionMap",
+        KEY_BUILD: "Config.actionBuild",
+        KEY_DPL: "Config.actionDpl",
+        // 已知兜底标识（参考脚本实测跨部署仍有效，直到微软彻底换掉它们）
+        FALLBACK: {
+            reportActivity: "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce",
+            reportClaimAllPoints: "00491296f1d668ad46b65342c95cb9d72a62c1fa9d"
+        },
+        // 结果帧/缓存宽松匹配：只要交卷和领取两个都在，就算可用
+        REQUIRED: ["reportActivity"],
+
+        _cachedDpl() { return String(GM_getValue("Config.dpl", "") || ""); },
+
+        _readMap() {
+            const raw = GM_getValue(this.KEY_MAP, "");
+            if (!raw) return {};
+            try {
+                const j = JSON.parse(raw);
+                return (j && typeof j === "object") ? j : {};
+            } catch (_) { return {}; }
+        },
+
+        /* 清缓存：探测到 404 时用（ID 失效说明部署换了，缓存必须一起作废）。 */
+        clear() {
+            GM_setValue(this.KEY_MAP, "");
+            GM_setValue(this.KEY_BUILD, "");
+            GM_setValue(this.KEY_DPL, "");
+        },
+
+        /* 直接按名字取：缓存命中就返回，没有就用兜底值。
+         * 交卷路径全程走这里，保持同步语义（原来 _nextAction 的用法不变）。 */
+        get(name) {
+            const map = this._readMap();
+            const cached = map[name];
+            return cached || this.FALLBACK[name] || "";
+        },
+
+        /* 扫一张表，找不到就按 dpl 抓分包。返回 { ids, dpl, fresh }。
+         * pages 是已抓到的 rewards 页面 HTML（给了就不必重复抓），没给会自己抓 dashboard/earn。 */
+        async ensure(pages, opts = {}) {
+            const dplNow = this._cachedDpl();
+            const cachedMap = this._readMap();
+            const cachedDpl = GM_getValue(this.KEY_DPL, "");
+            // 部署号一致且关键 action 齐 → 直接复用（避免每轮都抓几十个分包）
+            if (this.REQUIRED.every(k => cachedMap[k]) && cachedDpl && (!dplNow || cachedDpl === dplNow)) {
+                return { ids: cachedMap, dpl: cachedDpl, fresh: false };
+            }
+            // 缓存里连交卷都没有：说明从没扫成过，下面走完整扫描
+            const budgetMs = Number(opts.budgetMs) || ACTION_SCAN_BUDGET;
+            const maxFetch = Number(opts.maxFetch) || ACTION_SCAN_MAX;
+            const deadline = Date.now() + budgetMs;
+
+            let combined = (pages || []).filter(Boolean).join("\n");
+            if (!combined) {
+                try {
+                    combined = [(await Utils.xhr({ url: "https://rewards.bing.com/dashboard" })),
+                        (await Utils.xhr({ url: "https://rewards.bing.com/earn" }))]
+                        .filter(Boolean).join("\n");
+                } catch (_) { combined = ""; }
+            }
+            if (!combined) {
+                const ids = Object.assign({}, this.FALLBACK, cachedMap);
+                return { ids, dpl: cachedDpl, fresh: false };
+            }
+            const dpl = dplNow || (combined.match(/[?&](?:amp;)?dpl=([A-Za-z0-9._-]+)/i) || [])[1] || "";
+
+            /* 分包候选：① 页面里直接引用的 static/chunks；② webpack 运行时清单里的动态分块
+             * （领取组件按需加载，不在初始分包里 —— 这一条正是参考脚本的关键发现）；
+             * ③ 已知历史分包兜底（CDN 会保留旧分包，新清单枚举不到时还能从它里面取。 */
+            const queue = [];
+            const seen = new Set();
+            const push = p => { if (p && !seen.has(p)) { seen.add(p); queue.push(p); } };
+            const rel = new Set();
+            for (const m of combined.matchAll(/(?:\/_next\/)?(static\/(?:chunks|immutable|media)\/[^\s"'\\]+?\.js)/g)) {
+                rel.add("/_next/" + m[1]);
+            }
+            // 页面相关分包优先（dashboard/earn/page/layout/nav 的加载概率最高）
+            [...rel].sort((a, b) => ((/(dashboard|earn|page|layout)/i.test(a) ? 0 : 1) - (/(dashboard|earn|page|layout)/i.test(b) ? 0 : 1)))
+                .forEach(push);
+            const addDynamic = text => {
+                // 新版分块哈希已不是纯十六进制（如 4ds1xh5s3），字符集要放宽
+                for (const m of String(text || "").matchAll(/\b(\d{2,6}):"([a-z0-9_-]{8,})"/g)) {
+                    push(`/_next/static/chunks/${m[1]}-${m[2]}.js`);
+                    push(`/_next/static/chunks/${m[1]}.${m[2]}.js`);
+                }
+            };
+            addDynamic(combined);
+
+            const hex = "[a-f0-9]{40,64}";
+            /* 分包是独立的 .js，正常形态里没有多余转义；但页面内联/flight 片段里的同一段代码
+             * 会多一层 `\"`。两种形态都认，少一类漏抓。 */
+            const q = '\\\\?"';
+            const reCreate = new RegExp(`createServerReference\\s*\\)?\\s*\\(\\s*${q}(${hex})${q}([\\s\\S]{0,800}?)\\)`, "g");
+            const reRegister = new RegExp(`registerServerReference\\s*\\)?\\s*\\([^,]+,\\s*${q}(${hex})${q}([\\s\\S]{0,800}?)\\)`, "g");
+            const SKIP = ["callServer", "findSourceMapURL", "encodeFormAction", "default"];
+            const reName = new RegExp(`${q}([A-Za-z_$][\\w$]*)${q}`, "g");
+            const scan = (js, map) => {
+                for (const re of [reCreate, reRegister]) {
+                    re.lastIndex = 0;
+                    let m;
+                    while ((m = re.exec(js)) !== null) {
+                        // 标识后面跟着一串字符串字面量，函数名是最后一个（参考脚本的还原方式）
+                        const names = [...(m[2] || "").matchAll(reName)];
+                        const list = names.map(x => x[1]).filter(n => n.length > 3 && !SKIP.includes(n));
+                        const name = list[list.length - 1];
+                        if (name && !map[name]) map[name] = m[1];
+                    }
+                }
+            };
+
+            const map = Object.assign({}, cachedMap);
+            let fetched = 0;
+            while (queue.length && fetched < maxFetch && Date.now() < deadline) {
+                const path = queue.shift();
+                fetched++;
+                try {
+                    const js = await Utils.xhr({ url: "https://rewards.bing.com" + path, timeout: 8000 });
+                    if (!js) continue;
+                    scan(js, map);
+                    if (!this.REQUIRED.every(k => map[k])) addDynamic(js);
+                    if (this.REQUIRED.every(k => map[k]) && map.reportClaimAllPoints) break;
+                } catch (_) {}
+            }
+
+            const merged = Object.assign({}, this.FALLBACK, map);
+            const ok = Object.keys(map).length > 0;
+            if (ok) {
+                GM_setValue(this.KEY_MAP, JSON.stringify(map));
+                GM_setValue(this.KEY_DPL, dpl || dplNow || "");
+                GM_setValue(this.KEY_BUILD, dpl || "");
+                Utils.log("🧩", `服务端标识表已更新（部署 ${dpl || "未知"}，动作 ${Object.keys(map).length} 个`
+                    + `${map.reportClaimAllPoints ? "，含领取" : "，缺领取用兜底"}）`);
+                return { ids: merged, dpl: dpl || dplNow, fresh: true };
+            }
+            Utils.log("🟡", `未能从页面分包中提取服务端标识（扫了 ${fetched} 个），使用缓存/兜底标识`);
+            return { ids: merged, dpl: dpl || dplNow, fresh: false };
+        }
+    };
+
+    /* ===== 待领积分（自动领取） =====
+     * 新版 Rewards 把部分奖励先放进「待领池」，要单独点一次「领取积分」才入账
+     * （搜索打卡、每日活动、限时 Quest 的奖励都会先进池子）。脚本原来只读 dashboard
+     * 上的「可领取 N 积分」然后提示用户手动去点 —— 这一步现在改成自动完成。
+     *
+     * 参考脚本（商城签到加强版）的做法已经实测可用：
+     *   1) 待领数据标记在页面 flight 负载里：`"pointClaim": null` 表示空池，非 null 才是有得领；
+     *   2) 领取是同一个 Server Action 通道：POST https://rewards.bing.com/earn
+     *      `next-action: <reportClaimAllPoints>`，body 是 `[]`（空数组，服务端自己知道领哪些）；
+     *   3) 领取接口幂等：没有可领的积分时发过去不会有副作用，所以「多发一次」是安全代价。
+     *
+     * 两个环境差异（就是这轮要解决的「新版 Edge 跑不通」问题）：
+     *   · 扩展后台发请求时 `Origin` 由浏览器强制注入成 `chrome-extension://<id>`，
+     *     必应 WAF 对这种 origin 的 server action 会直接回 500 —— 且这个头**脚本改不了**；
+     *   · 因此在 Edge 上必须优先走「页面上下文同源」通道：CDP（真实浏览器级请求）
+     *     → 页面代发服务（页面自己的 fetch）→ 最后才是后台直发（在 Chrome 上通常能过）。
+     *   首次成功的方式记在 Config.claimVariant，后续直接复用，不再每次试三种。
+     */
+    const ClaimPoints = {
+        KEY_VARIANT: "Config.claimVariant",
+        KEY_EMPTY_AT: "Config.claimEmptyAt",     // 「空池」的负缓存时间戳（省掉每轮一次空转）
+        EMPTY_TTL: 15 * 60 * 1000,               // 空池 15 分钟内不再请求（打卡奖励不会这么快又出现）
+
+        /* 从页面 HTML / flight 负载里判断待领池是否为空。
+         * 微软在 flight 里把它序列化成 `"pointClaim":null`（空）或 `"pointClaim":{...}` / `[...]`（非空）。
+         * 反斜杠转义层数随部署变化，所以两种形态都认。 */
+        parse(html) {
+            const raw = String(html || "");
+            if (!raw) return { known: false, has: false, amount: 0 };
+            const clean = raw.replace(/\\"/g, '"');
+            // 1) flight 字段（最权威）
+            const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/i);
+            if (m) {
+                const has = m[1] !== "null";
+                return { known: true, has, amount: has ? this._amount(clean) : 0, source: "pointClaim" };
+            }
+            // 2) 页面上的「可领取 N 积分」文案兜底（点不出来但能读到时也认）
+            const alt = clean.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
+            if (alt) {
+                const amount = parseInt(String(alt[1]).replace(/,/g, ""), 10) || 0;
+                return { known: true, has: amount > 0, amount, source: "badge" };
+            }
+            return { known: false, has: false, amount: 0 };
+        },
+
+        // 顺带读余额，用来报告「这一下领到了多少」
+        _balance(html) {
+            const clean = String(html || "").replace(/\\"/g, '"');
+            const m = clean.match(/"balance"\s*:\s*(\d+)/i);
+            return m ? (parseInt(m[1], 10) || 0) : 0;
+        },
+
+        _amount(html) {
+            const clean = String(html || "").replace(/\\"/g, '"');
+            // pointClaim 结构里有 points/amount/availablePoints 几种写法，取第一个能读到的数字
+            const win = clean.slice(Math.max(0, clean.search(/"pointClaim"/i)), clean.search(/"pointClaim"/i) + 1200);
+            const m = win.match(/"(?:points|amount|availablePoints|totalPoints)"\s*:\s*(\d+)/i);
+            return m ? (parseInt(m[1], 10) || 0) : 0;
+        },
+
+        /* 构建领取请求：和交卷一样打 earn 页 + earn 路由树（参考脚本实测形态）。 */
+        _request(actionMap) {
+            const id = (actionMap && actionMap.reportClaimAllPoints) || ActionMap.FALLBACK.reportClaimAllPoints;
+            const dpl = (actionMap && actionMap.dpl) || RewardsAuto._dpl || GM_getValue("Config.dpl", "");
+            return {
+                url: "https://rewards.bing.com/earn",
+                headers: {
+                    "content-type": "text/plain;charset=UTF-8",
+                    "next-action": id,
+                    "next-router-state-tree": Utils.routerStateTree("earn"),
+                    "referer": "https://rewards.bing.com/earn",
+                    "accept": "text/x-component",
+                    "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    // 显式同源 origin：后台直发时这个头留不住（浏览器覆盖成扩展源），
+                    // 但对页面/CDP 通道有效；API._rawXhr 的说明里写过代价，这里按参考脚本写法保持一致。
+                    "origin": "https://rewards.bing.com",
+                    ...(dpl ? { "x-deployment-id": dpl } : {}),
+                    "user-agent": RewardsAuto.ua.pc
+                },
+                body: "[]"
+            };
+        },
+
+        /* 发一次领取。通道选择与「受理判定」完全交给 API.postAction —— 那边是全脚本唯一
+         * 的 Server Action 发送层（交卷也用它），这样两条链路的降级行为不会各自跑偏。 */
+        async _sendOnce(req) {
+            return await API.postAction(
+                { url: req.url, headers: req.headers, data: req.body },
+                { savedKey: this.KEY_VARIANT }
+            );
+        },
+
+        /* CDP 页面：优先 earn 页，其次任意 rewards 页（领取对页面没有依赖，任何同源页面都行）。 */
+        async _cdpPage() {
+            return await API._anyRewardsPage();
+        },
+
+        /* 主流程：读池子 → 领取 → 用余额差确认 → （必要时）重扫标识表重试一次。
+         * 返回 { claimed, before, after, empty, variant, reason }；claimed 为 0 时也说明原因。 */
+        async run({ name = "领取积分" } = {}) {
+            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "" };
+            // 页面 HTML 优先用 CDP 读：后台 xhr 在部分环境里拿回登录页 / 精简页，读不到 pointClaim
+            let dashHtml = "";
+            try {
+                if (await CDP.available()) {
+                    const page = await this._cdpPage();
+                    if (page) {
+                        if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
+                        dashHtml = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
+                    }
+                }
+            } catch (_) { dashHtml = ""; }
+            if (!dashHtml) {
+                try { dashHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" }); } catch (_) { dashHtml = ""; }
+            }
+
+            const pool = this.parse(dashHtml);
+            out.before = this._balance(dashHtml);
+            if (!pool.known) {
+                out.reason = "读不到待领池标记（页面可能是登录页或结构已变）";
+                return out;
+            }
+            if (!pool.has) {
+                // 空池负缓存：连续多轮空池时不必每次都打一次领取请求（接口幂等但没必要刷）
+                const last = Number(GM_getValue(this.KEY_EMPTY_AT, 0)) || 0;
+                if (Date.now() - last < this.EMPTY_TTL && !pool.amount) {
+                    out.empty = true;
+                    out.reason = "待领池为空（15 分钟内已确认过）";
+                    return out;
+                }
+                GM_setValue(this.KEY_EMPTY_AT, Date.now());
+                out.empty = true;
+                out.reason = "待领池为空";
+                return out;
+            }
+            GM_setValue(this.KEY_EMPTY_AT, 0);
+
+            const actionMap = await ActionMap.ensure([dashHtml]);
+            const req = this._request(actionMap);
+            const accepted = await this._sendOnce(req);
+            out.variant = accepted.ok ? accepted.variant : "";
+            out.reason = accepted.ok
+                ? ""
+                : `三种通道都没受理（${(accepted.tried || []).join(" ")}）`;
+            if (!accepted.ok) return out;
+
+            // 受理 ≠ 入账：余额变化才是唯一证据（领取接口不回 JSON，只有页面余额能看）
+            await Utils.delay(1200);
+            let afterHtml = "";
+            try {
+                if (accepted.variant === "page") {
+                    const page = await this._cdpPage();
+                    if (page) afterHtml = await CDP.fetchPageText("https://rewards.bing.com/earn") || "";
+                }
+                if (!afterHtml) afterHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+            } catch (_) { afterHtml = ""; }
+            out.after = this._balance(afterHtml);
+            out.claimed = (out.before > 0 && out.after > out.before) ? (out.after - out.before) : 0;
+            /* 受理 ≠ 入账。领取接口不回 JSON，唯一证据是余额变化。
+             * 受理了但余额没动有两种可能：① 服务端还没算完（分批入账，慢几秒）；
+             * ② pointClaim 字段过时（池子其实已经空了）。两种都不该当失败处理，
+             * 但也不该假装成功 —— 稍等再读一次余额，仍然没变就写明原因交给下一轮。 */
+            if (out.claimed <= 0) {
+                await Utils.delay(2500);
+                try {
+                    let again = "";
+                    if (accepted.variant === "page") {
+                        const page = await this._cdpPage();
+                        if (page) again = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
+                    }
+                    if (!again) again = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
+                    const later = this._balance(again);
+                    if (out.before > 0 && later > out.before) {
+                        out.after = later;
+                        out.claimed = later - out.before;
+                    }
+                    // 再读一次池子：已经空了说明那一笔就是这么领掉的（余额差读不到的账号会遇到）
+                    const poolAgain = this.parse(again);
+                    if (out.claimed <= 0 && poolAgain.known && !poolAgain.has) {
+                        out.reason = "已受理，池子已清空（该账号余额差读不到，按已领取处理）";
+                        out.claimed = pool.amount;
+                    }
+                } catch (_) {}
+            }
+            if (out.claimed <= 0) {
+                out.reason = `已受理但余额未变（页面可领取 ${pool.amount}）`;
+            }
+            return out;
+        }
+    };
 
     const API = {
         /* 统一走 POST 表单请求 token 端点，并解析 400 响应里的 JSON 错误体，
@@ -3334,7 +3734,17 @@ const __scBgKeepAlive = (function() {
         },
 
         async getNextActionHash(html) {
-            let cached = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+            // 先问标识表：ActionMap 扫的是**按需分包**（交卷/领取组件常在里面），
+            // 且按部署号缓存。缓存命中就直接复用，不必再走下面这套只认 reportActivity 的老探测。
+            let cached = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
+            try {
+                const fromTable = ActionMap.get("reportActivity");
+                if (fromTable && fromTable !== cached) {
+                    cached = fromTable;
+                    RewardsAuto._nextAction = cached;
+                    GM_setValue("Config.nextAction", cached);
+                }
+            } catch (_) {}
             // 探测有代价：每个 chunk 都是一次 15 秒超时的网络请求，顺序扫几十个 chunk 会让整轮
             // 长时间没有任何日志（看起来就像卡死）。所以这里加三重限制：
             //   1) 最多扫 NEXT_ACTION_SCAN_MAX 个 chunk；
@@ -4096,7 +4506,7 @@ const __scBgKeepAlive = (function() {
          * 说明「quest 页 vs earn 页」不是成败关键，真正卡住的是**发送层**（见 _rawXhr 的注释）。
          * 既然参考脚本在 service_worker 里能跑通，就按它们的形态发，少一个变量。 */
         async _submitQuestOnce(pageUrl, parentId, card, variant) {
-            const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+            const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
             const dpl = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
             const payload = JSON.stringify([card.hash, 11, {
                 offerid: card.offerId,
@@ -4155,7 +4565,7 @@ const __scBgKeepAlive = (function() {
 
         async submitQuestCard(parentId, card) {
             const pageUrl = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
-            const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+            const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
             const dpl = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
             const payload = JSON.stringify([card.hash, 11, {
                 offerid: card.offerId,
@@ -4460,6 +4870,89 @@ const __scBgKeepAlive = (function() {
             return t.replace(/\s+/g, " ").slice(0, 110);
         },
 
+        /* 发一次请求，按「同源优先」的顺序逐个试，返回 { ok, status, text, variant }。
+         *
+         * 这是全脚本唯一需要 Server Action 的地方都共用的发送层（交卷 + 领取）。
+         * 之所以要抽出来：Origin 是浏览器强制的，后台直发在新版 Edge 上会被 WAF 拒；
+         * 而「哪条通道此刻有效」是环境事实，不该每个调用点各写一遍猜测逻辑。
+         *
+         * ok = HTTP 2xx **且** 响应是受理帧（1:true），不只是 2xx ——
+         * 失败帧 `1:false` 也是 2xx，把它当成功会让脚本跳过重试。
+         * 401/403 是登录态问题，换通道没用，立刻停。
+         * 首次成功的方式记进 savedKey，下一轮直接复用。 */
+        async postAction(req, { savedKey = "Config.actionVariant" } = {}) {
+            const saved = String(GM_getValue(savedKey, "") || "");
+            const order = (saved && BrowserEnv.channelOrder().includes(saved))
+                ? [saved, ...BrowserEnv.channelOrder().filter(v => v !== saved)]
+                : BrowserEnv.channelOrder();
+            const tried = [];
+            let accepted = null;
+            let last = null;   // 全失败时把最后一次的真实响应带回去（排障只看得到它）
+            for (const v of order) {
+                let r;
+                try {
+                    r = await this._postVia(v, req);
+                } catch (e) {
+                    r = { ok: false, status: 0, text: String((e && e.message) || e), variant: v };
+                }
+                tried.push(`${v}=${r.status}${r.ok ? "✓" : "✗"}`);
+                // 「通道不可用」（CDP 没开、页面不在线）没有响应体，不该盖掉真正发出去的那次
+                if (r.status > 0) last = r;
+                if (r.ok) { accepted = r; break; }
+                if (r.status === 401 || r.status === 403) break;
+            }
+            if (accepted && accepted.variant !== saved) {
+                GM_setValue(savedKey, accepted.variant);
+                if (saved) Utils.log("🎁", `动作请求通道已切换：${saved} → ${accepted.variant}`);
+            }
+            return accepted || {
+                ok: false,
+                status: last ? last.status : 0,
+                text: last ? last.text : "",
+                variant: last ? last.variant : "",
+                tried
+            };
+        },
+
+        /* 按通道发一次。三条路都返回同一形状，调用方不必关心差异。 */
+        async _postVia(variant, req) {
+            if (variant === "page") {
+                if (!(await CDP.available())) return { ok: false, status: 0, text: "CDP 不可用", variant };
+                const page = await this._anyRewardsPage();
+                if (!page) return { ok: false, status: 0, text: "没有可用的 rewards 页面", variant };
+                if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
+                const r = await CDP.claimInPage(req.url, req.headers, req.data);
+                return {
+                    ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
+                    status: r.status, text: r.text, variant
+                };
+            }
+            if (variant === "proxy") {
+                if (!this._pageChannelAlive()) return { ok: false, status: 0, text: "页面代发服务不在线", variant };
+                const r = await this.viaPageChannel(req.url, req.headers, req.data, 20000);
+                if (!r) return { ok: false, status: 0, text: "页面代发超时", variant };
+                return {
+                    ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
+                    status: r.status, text: r.text || r.error || "", variant
+                };
+            }
+            const r = await this._rawXhr({ method: "POST", url: req.url, headers: req.headers, data: req.data });
+            return {
+                ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
+                status: r.status, text: r.text, variant
+            };
+        },
+
+        /* 任意一个 rewards 页面都可以当同源发送方（交卷/领取对页面本身没有依赖）。
+         * 优先 earn 页，其次其它 rewards 页；没有就返回 null，安静降级。 */
+        async _anyRewardsPage() {
+            const list = await CDP.targets();
+            if (!list) return null;
+            const pages = list.filter(t => t.type === "page" && t.url && /^https:\/\/rewards\.bing\.com\//i.test(t.url));
+            if (!pages.length) return null;
+            return pages.find(t => /\/earn/i.test(t.url)) || pages[0];
+        },
+
         async claimCardWeb(card, { appChannel = false } = {}) {
             // Server Action 的 POST 目标必须是带 action 路由的页面：日常/连签卡在 dashboard，其余在 earn。
             // 旧版直接用 card.url 当目标，而 getuserinfo 卡的 url 可能是 destinationUrl（指向 bing.com 搜索页），
@@ -4471,7 +4964,7 @@ const __scBgKeepAlive = (function() {
                 : (isDash ? "https://rewards.bing.com/dashboard" : "https://rewards.bing.com/earn");
             const referer = card.url || pageUrl;
             const segment = isDash ? "dashboard" : "earn";
-            let nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+            let nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
 
             // desktop_app（桌面应用每周专属）历史上用的是带 X-MSRewards-App 那套头；
             // appOnly 卡只需要「Rewards 应用 UA」，不该再套 X-MSRewards-App 头（那会让服务端按另一种客户端渲染）。
@@ -4501,23 +4994,55 @@ const __scBgKeepAlive = (function() {
 
             // 策略 1: Next.js Server Action (最稳妥、官方核心)
             try {
-                const res = await Utils.xhr({ method: "POST", url: pageUrl, headers: buildHeaders(), data: payload });
+                /* 走公共发送层：同源（CDP/页面）优先，后台直发兜底。
+                 * 以前这里只有一句 Utils.xhr（后台直发），在新版 Edge 上恒 500 ——
+                 * 而「换发送方」这件事已经把 500 变成了可恢复的环境问题，不该每张卡都硬撞。 */
+                const hit = await this.postAction(
+                    { url: pageUrl, headers: buildHeaders(), data: payload },
+                    { savedKey: "Config.claimActionVariant" }
+                );
+                const accepted = !!hit.ok;
                 /* 诊断：交卷响应是排查「已发出但服务端未生效」的唯一依据。
                  * 上一版加了「全局最多 12 条」的采样上限，结果关键的那张卡被静默跳过，
                  * 排查时反而看不到证据。现在改成「受理了就不打，没受理每张都打」：
                  * 正常完成的卡不产生噪音，失败的卡一条不漏。 */
-                const accepted = res && this._actionLooksAccepted(res);
                 if (!accepted || GM_getValue("Config.debugDAPI", false)) {
                     Utils.log("🔬", `交卷响应(${String(card.offerId).slice(0, 36)})：`
-                        + `受理=${!!accepted} ua=${useAppUA ? "app" : "pc"} dpl=${dpl || "无"} `
+                        + `受理=${accepted} 通道=${hit.variant || "无"}${hit.tried ? `(${hit.tried})` : ""} `
+                        + `ua=${useAppUA ? "app" : "pc"} dpl=${dpl || "无"} `
                         + `hash=${String(card.hash || "").slice(0, 20)} appOnly=${!!card.appOnly} `
                         + `src=${card.source || "-"} kind=${card.kind || "-"} `
-                        + `body=${JSON.stringify(String(res || "").replace(/\s+/g, " ").slice(0, 240))}`);
+                        + `body=${JSON.stringify(String(hit.text || "").replace(/\s+/g, " ").slice(0, 240))}`);
                 }
                 if (accepted) {
                     // 交卷已受理：网页侧缓存里的完成状态已经过期，下次判定要重新拉取
                     this._webCompleteCache = null;
                     return true;
+                }
+                // 没受理但拿回了 401/403：按登录态问题处理，和以前一样让外层改走 DAPI
+                if (hit.status === 401 || hit.status === 403) {
+                    if (!RewardsAuto.state.webNoAuth) {
+                        RewardsAuto.state.webNoAuth = true;
+                        Utils.log("🟡", `网页通道未登录或无权限（HTTP ${hit.status}），后续卡片改用 DAPI 通道`);
+                    }
+                    return false;
+                }
+                if (hit.status === 503) return false;
+                if (String(hit.text || "").includes("404") || hit.status === 404) {
+                    Utils.log("🟡", "Server Action ID 可能已更新，尝试动态探测...");
+                    try {
+                        ActionMap.clear();
+                        const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+                        nextAction = await this.getNextActionHash(earnHtml);
+                        const retry = await this.postAction(
+                            { url: pageUrl, headers: buildHeaders(), data: payload },
+                            { savedKey: "Config.claimActionVariant" }
+                        );
+                        if (retry.ok) {
+                            this._webCompleteCache = null;
+                            return true;
+                        }
+                    } catch (_) {}
                 }
             } catch (e2) {
                 /* 请求整个抛异常时响应体根本没拿到 —— 这恰恰最需要看到，以前只在 401/404 分支留日志。 */
@@ -4544,6 +5069,8 @@ const __scBgKeepAlive = (function() {
                 if (e2.message.includes("404")) {
                     Utils.log("🟡", "Server Action ID 可能已更新，尝试动态探测...");
                     try {
+                        // 404 说明缓存里的标识已和当前部署对不上：整张表作废，重新扫描
+                        ActionMap.clear();
                         const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                         nextAction = await this.getNextActionHash(earnHtml);
                         const retryRes = await Utils.xhr({ method: "POST", url: pageUrl, headers: buildHeaders(), data: payload });
@@ -5844,31 +6371,56 @@ const __scBgKeepAlive = (function() {
             return remain === 0;
         },
 
-        /** 只是读一下 dashboard 上「可领取」的积分并提示手动领取：
-         *  纯读操作，不写任何任务日期，也不参与 isAllDone 的完成判定 ——
-         *  这些积分无论领没领，都不影响「今日任务已全部完成、停止检测」的判断。 */
+        /** 自动领取「待领积分」。
+         *
+         *  新版 Rewards 会把部分奖励先放进待领池（搜索打卡 / 每日活动 / 限时 Quest 都走这条路），
+         *  要单独点一次「领取积分」才入账。旧版这里只读 dashboard 上的「可领取 N 积分」
+         *  然后提示用户手动去点 —— 现在改成自动完成（实现见 ClaimPoints）。
+         *
+         *  仍然不参与 isDayComplete 的判定：领没领到不影响「今日任务全部完成」的结论，
+         *  否则一次领取接口抽风就会让持续检测永远停不下来。 */
         async doClaimPoints() {
             await RegionGuard.guard("领取积分");
+            if (!GM_getValue("Tasks.claimPoints", true)) {
+                Utils.log("✅", "自动领取待领积分已关闭（Config：Tasks.claimPoints）");
+                return;
+            }
             try {
-                const dashboardHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
-                if (!dashboardHtml) {
-                    Utils.log("✅", "无法获取 dashboard 页面");
+                // 领之前先把 cookie 预热好（后台 xhr 拿真实登录态的前提）
+                try { await API.getCookieHeader(); } catch (_) {}
+                const res = await ClaimPoints.run();
+                if (res.empty) {
+                    Utils.log("✅", `无可领取积分（${res.reason}）`);
                     return;
                 }
-                const claimableMatch = dashboardHtml.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
-                if (!claimableMatch) {
-                    Utils.log("✅", "无可领取积分");
-                    return;
-                }
-                const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
-                if (amount > 0) {
-                    Utils.log("🎁", `发现 ${amount} 积分待领取（请手动前往 dashboard 领取）`, true);
+                if (res.claimed > 0) {
+                    Utils.log("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`, true);
+                } else if (res.variant) {
+                    Utils.log("🟡", `积分领取请求已受理，但余额没有变化（${res.reason}）；下一轮再复核`);
                 } else {
-                    Utils.log("✅", "可领取积分为 0");
+                    // 三种通道都没过：把每条的状态写出来，并给出「怎样才有同源通道」的具体做法
+                    Utils.log("🟡", `待领积分自动领取未成功：${res.reason}`, true);
+                    this._explainClaimChannels();
                 }
             } catch (e) {
-                Utils.log("🟡", `检测可领取积分失败: ${e.message}`);
+                Utils.log("🟡", `领取积分执行异常: ${e.message}`);
             }
+        },
+
+        /* 领取通道全失败时，说明「为什么」和「怎么办」。
+         * 只在真失败时打一次，避免刷日志；核心信息是：新版 Edge 上后台直发被拒是已知问题，
+         * 补上门同源通道（CDP 或页面）即可，不需要改脚本。 */
+        _explainClaimChannels() {
+            const env = BrowserEnv.info();
+            const lines = [`当前浏览器：${BrowserEnv.summary()}；后台直发请求的 Origin 是扩展源`];
+            if (env.extOriginRisky) {
+                lines.push(`Edge ${env.major} 对扩展源 origin 的 server action 会回 500 —— 这不是脚本参数错了，是浏览器强制的头。`);
+            }
+            const cdpPort = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
+            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），并留一个 rewards 页面开着；`);
+            lines.push(`② 页面代发通道：在 rewards.bing.com 页面里跑过一次脚本后自动可用（Config.usePageChannel 打开）；`);
+            lines.push(`③ 后台直发：Chrome / 旧版 Edge 上通常能过，新版 Edge 上常被拒。`);
+            Utils.log("🟡", lines.join("\n"));
         },
 
         async doStreak() {
@@ -6185,6 +6737,34 @@ const __scBgKeepAlive = (function() {
 
     // 原「🌐 Edge 连签状态」菜单已移除：不再注册菜单按钮、不再弹窗，逻辑照旧（仍会立刻推进一次上报），
     // 需要看这段状态文本时在控制台调用 __MPDiagnostics.edgeStreak()。
+    /* ===== 诊断：待领积分 / 领取通道 =====
+     * 新版 Edge 上「后台直发被 WAF 500」是已知的、由浏览器强制 Origin 造成的问题，
+     * 不是参数写错。所以这里把三件事一次说清：当前浏览器、已记住的通道、每条通道此刻通不通。
+     * 需要时在控制台调用 __MPDiagnostics.claim()。 */
+    const diagClaim = async () => {
+        const env = BrowserEnv.info();
+        const saved = String(GM_getValue("Config.claimVariant", "") || "");
+        const cdpPort = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
+        let text = "🎁 待领积分 / 领取通道诊断\n\n";
+        text += `任务开关：${GM_getValue("Tasks.claimPoints", true) ? "开启" : "关闭"}\n`;
+        text += `当前浏览器：${BrowserEnv.summary()}${env.extOriginRisky ? "（新版本，后台直发大概率被拒）" : ""}\n`;
+        text += `已记住通道：${saved || "未记录（会按 page → proxy → xhr 逐个试）"}\n`;
+        text += `CDP 调试端口 ${cdpPort}：${(await CDP.available()) ? "✅ 可连" : "❌ 不可连"}\n`;
+        text += `页面代发服务：${API._pageChannelAlive() ? "✅ 在线" : "❌ 不在线"}\n`;
+        const table = ActionMap._readMap();
+        text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
+        text += `领取标识：${ActionMap.get("reportClaimAllPoints").slice(0, 12)}…\n\n`;
+        const pool = await ClaimPoints.run();
+        text += `待领状态：${pool.empty ? "空池" : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
+        text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
+        if (!pool.variant && !pool.empty) {
+            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）并留一个 rewards 页面，`
+                + "这样领取会走页面同源请求；Chrome 上后台直发通常也能过。";
+        }
+        if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
+        return text;
+    };
+
     const diagEdgeStreak = () => {
         const enabled = GM_getValue("Tasks.edge", true);
         const st = EdgeStreak.state();
@@ -6264,7 +6844,7 @@ const __scBgKeepAlive = (function() {
         const EARN = "https://rewards.bing.com/earn";
         const QUEST = "https://rewards.bing.com/earn/quest/" + PARENT;
         const APP_UA = RewardsAuto.desktopAppHeaders["user-agent"];
-        const ACTION = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+        const ACTION = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
         const DPL = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
 
         Utils.log("🧪", "=== 交卷诊断开始 ===");
@@ -6862,7 +7442,8 @@ const __scBgKeepAlive = (function() {
             region: diagRegion,
             schedule: diagSchedStatus,
             resetSchedule: diagResetSchedule,
-            releaseLock: diagReleaseLock
+            releaseLock: diagReleaseLock,
+            claim: diagClaim
         };
     } catch (_) {}
 
@@ -6876,7 +7457,8 @@ const __scBgKeepAlive = (function() {
     if (typeof __MP_TEST_HOOK__ === "function") {
         try {
             __MP_TEST_HOOK__({ Utils, API, RewardsAuto, RegionGuard, Webhooks, Sched, TaskManager, Auth,
-                CardLock, SEARCH_PACER, EdgeStreak, EdgePacer, UA, EDGE, CDP });
+                CardLock, SEARCH_PACER, EdgeStreak, EdgePacer, UA, EDGE, CDP,
+                BrowserEnv, ActionMap, ClaimPoints });
         } catch (_) {}
     }
 
