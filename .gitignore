@@ -1,2 +1,5 @@
 .idea
 other/
+.debug/
+.debug-edge-profile/
+.debug-edge-profile2/

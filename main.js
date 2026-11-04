@@ -2,7 +2,7 @@
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
 // @version      1.9.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务（纯 HTTP，一周一次做满 8/8）、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅CDP 真实点击完成应用搜索卡（全程后台运行）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -39,12 +39,14 @@
 // @grant        GM_closeTab
 // @grant        GM_info
 // @grant        GM_log
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_registerMenuCommand
 // @storageName  BingRewardsAuto_Shared
 // @tips         此脚本为开源免费使用，请勿购买
 // ==/UserScript==
 
-/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab */
+/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab, GM_addValueChangeListener, GM_removeValueChangeListener */
 
 /* ==UserConfig==
 Config:
@@ -99,6 +101,10 @@ Tasks:
         default: true
     edge:
         title: Edge 浏览连签（后台分次上报，累计 30 分钟）
+        type: checkbox
+        default: true
+    desktopWeekly:
+        title: 桌面应用每周专属任务（每轮检测，按星期逐日解锁）
         type: checkbox
         default: true
 Notice:
@@ -201,10 +207,26 @@ const __scBgKeepAlive = (function() {
         // 之后，脚本发出的请求特征反而变成「一年前的浏览器」，Edge 通道的请求也和真机对不上。
         // 现在每次访问都按当前浏览器动态生成，见下面的 UA 模块。
         get ua() { return UA.all(); },
-        desktopAppHeaders: {
-            "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) MSRewards/Desktop/1.4.56",
-            "X-MSRewards-App": "1",
-            "X-Rewards-Source": "msrewards-desktop"
+        /* Rewards 桌面应用（WebView2 / Tauri）通道的请求头。
+         *
+         * 2026-11-03 用 CDP 挂进真实应用（Microsoft.24183918CCDA 1.13.0）逐项抓包，
+         * 应用真正发出的头是这些，旧版三行全是错的：
+         *   1) UA 必须是 **Windows + Edg/** 结尾再拼 `MSRewards/Desktop/<版本>`；
+         *      应用源码里就是 `MSRewards/MSRewards/Desktop/` + 版本号拼接，
+         *      而且页面脚本用 navigator.userAgent.includes("MSRewards/Desktop/") 判断
+         *      「我是不是在奖励应用里」。旧版用 Macintosh + Safari 的 UA，
+         *      既不是 WebView2，也过不了这个判断 —— 服务端和页面都不认。
+         *   2) X-MSRewards-App 应用根本不发（抓包 33 个请求里一次都没出现），
+         *      旧版写死的 "1" 是凭空发明的。
+         *   3) 真正决定「这是应用请求」的是小写头 `x-rewards-source: msrewards-desktop`。
+         *
+         * 这里的 UA 版本号跟随真实浏览器主版本（与 UA.all().rewardsApp 同源），
+         * 避免长期停在一年前的客户端版本上。 */
+        get desktopAppHeaders() {
+            return {
+                "user-agent": UA.all().rewardsApp,
+                "x-rewards-source": "msrewards-desktop"
+            };
         },
         appConfig: {
             rewardsAppId: "SAAndroid/32.6.2110003560",
@@ -472,6 +494,11 @@ const __scBgKeepAlive = (function() {
          * 156.0.4314.50）。它不影响正常浏览器里的请求，那里一律用真实 UA。 */
         FALLBACK_CHROME: "156.0.0.0",
         FALLBACK_EDGE: "156.0.4314.50",
+        /* Rewards 桌面应用版本号（拼进 UA 的 MSRewards/Desktop/<ver>）。
+         * 2026-11-03 实测装的是 Microsoft.24183918CCDA 1.13.0，抓包 UA 后缀就是 1.13.0。
+         * 用户装新版应用后这里可以跟着改，但服务端并不校验它 —— 它只用于
+         * 页面脚本的 navigator.userAgent.includes("MSRewards/Desktop/") 判定。 */
+        REWARDS_APP_VER: "1.13.0",
         DESKTOP: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)",
         ANDROID: "Mozilla/5.0 (Linux; Android 16; Redmi K20 Pro Build/BP4A.251205.006; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Mobile Safari/537.36",
         _cache: null,
@@ -519,14 +546,17 @@ const __scBgKeepAlive = (function() {
                 edge: edgeUA,
                 mobile: `${this.ANDROID} EdgA/144.0.0.0`,
                 app: `${this.ANDROID} BingSapphire/32.6.2110003560`,
-                // Rewards 桌面应用（WebView2）通道：带锁徽标的 App 专属卡只有在这个 UA 下
-                // 才会被服务端渲染成 isLocked:false / isUnlocked:true。Chromium 版本跟随真实浏览器，
-                // 免得版本串看起来像一年前的客户端。
+                // Rewards 桌面应用（WebView2）通道。
+                // 2026-11-03 在真实应用（Microsoft.24183918CCDA 1.13.0）里抓包确认的形态是：
+                //   原始 WebView2 UA + " MSRewards/Desktop/1.13.0"
+                // 应用自己的页面脚本用 navigator.userAgent.includes("MSRewards/Desktop/")
+                // 判断「是否运行在奖励应用内」，所以这个后缀必须原样保留；
+                // 版本号取真实浏览器主版本，避免长期停留在旧客户端版本上被当成过期端。
                 rewardsApp: (() => {
                     const ver = [real, saved]
                         .map(s => (String(s).match(/Chrome\/([\d.]+)/) || [])[1])
                         .find(Boolean) || this.FALLBACK_CHROME;
-                    return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${ver} Safari/537.36 Edg/${ver} MSRewards/Desktop/1.3.0`;
+                    return `${this.DESKTOP} Chrome/${ver} Safari/537.36 Edg/${ver} MSRewards/Desktop/${this.REWARDS_APP_VER}`;
                 })(),
             };
             this._cacheAt = now;
@@ -713,7 +743,6 @@ const __scBgKeepAlive = (function() {
             return new Promise((resolve, reject) => {
                 const start = Date.now();
                 GM_xmlhttpRequest({
-                    anonymous: false,
                     ...options,
                     timeout: Number(options && options.timeout) || 15000,
                     onload: (res) => {
@@ -739,9 +768,25 @@ const __scBgKeepAlive = (function() {
         xhr(options) {
             return new Promise((resolve, reject) => {
                 const start = Date.now();
+                /* 微软域名请求自动补 Cookie 头（实测必需，见 API.getCookieHeader 的注释）：
+                 * 这个环境里 GM_xmlhttpRequest 后台发请求**不带登录 cookie**，
+                 * 服务端当匿名用户处理 —— 表现就是 earn 页拿回登录页、quest 页解析出 0 张子卡、
+                 * server action 一律 500。所以对 bing/live/microsoft 域，若调用方没显式给 cookie，
+                 * 就用 GM_cookie 读出来的真实 cookie 拼一个。
+                 *
+                 * 这里不能 await（xhr 是同步建请求的老接口），所以只在「已经缓存过」时补；
+                 * 首次请求由调用方先调 API.getCookieHeader() 预热（doPromos/周任务开头都会预热）。 */
+                const url = String((options && options.url) || "");
+                const hdr = Object.assign({}, (options && options.headers) || {});
+                const needCookie = /(^|\.)(bing\.com|live\.com|microsoft\.com|microsoftonline\.com)\//i.test(url);
+                const hasCookie = Object.keys(hdr).some(k => k.toLowerCase() === "cookie");
+                if (needCookie && !hasCookie && this._ckReady) {
+                    const ck = this._ckReady();
+                    if (ck) hdr["cookie"] = ck;
+                }
                 GM_xmlhttpRequest({
-                    anonymous: false,
                     ...options,
+                    headers: hdr,
                     // 允许调用方自带超时（出口探测要短超时），没传就还是 15 秒
                     timeout: Number(options && options.timeout) || 15000,
                     onload: (res) => {
@@ -791,6 +836,32 @@ const __scBgKeepAlive = (function() {
             return encodeURIComponent(JSON.stringify(tree));
         },
         getRandomUUID() { return crypto.randomUUID().replace(/-/g, "").toUpperCase(); },
+
+        /* ===== 桌面奖励应用「每周专属任务」的 quest 路由状态树 =====
+         * 2026-11-03 抓包对照：普通卡交卷时 next-router-state-tree 用 routerStateTree("earn")，
+         * 但 punchcard 子任务（/earn/quest/<id> 页面上的卡片）**必须**带上 quest 这一段，
+         * 否则服务端虽然回 200 且 `1:true`，却根本不记账 —— 这正是「桌面任务提交了但没完成」的原因。
+         * 真实应用发出的树形是：
+         *   ["",{children:["(nav)",{children:["earn",{children:["quest",{children:[
+         *       ["questId","<父任务ID>","d",null], {children:["__PAGE__",{},null,null,0]}, null,null,0
+         *   ]},null,null,0]},null,null,0]},null,null,0]},null,null,0]},null,"refetch",16]
+         * 注意内层的 refetch 标记是 0，外层是 16 —— 与普通页面正好相反，照抄才不会 500。 */
+        questRouterStateTree(parentOfferId) {
+            const tree = ["", {
+                children: ["(nav)", {
+                    children: ["earn", {
+                        children: ["quest", {
+                            children: [
+                                ["questId", String(parentOfferId), "d", null],
+                                { children: ["__PAGE__", {}, null, null, 0] },
+                                null, null, 0
+                            ]
+                        }, null, null, 0]
+                    }, null, null, 0]
+                }, null, null, 0]
+            }, null, "refetch", 16];
+            return encodeURIComponent(JSON.stringify(tree));
+        },
 
         /* 首次运行时的 GM_cookie 权限探测。
          *
@@ -872,9 +943,78 @@ const __scBgKeepAlive = (function() {
             return { hasMuid, hasSession, names: [...found].slice(0, 20) };
         },
 
+        /** 读出真实 cookie 并拼成 Cookie 头 —— 用来解决「后台请求不带登录态」。
+         *
+         * 2026-11-04 实测：同一个 Edge（页面里 `document.cookie` 有 MUID、页面内 fetch 能拿到
+         * earn 页全文），但 `GM_xmlhttpRequest` 直连 rewards.bing.com 拿回来的是 **35k 的登录页**
+         * —— 说明后台上下文里请求**没带上登录 cookie**。
+         *
+         * 这解释了之前所有怪现象：服务端把请求当匿名用户处理，于是 server action 一律 500、
+         * quest 页解析不到子卡（`fetchQuestCards` 返回 0 张）。
+         * 而 CDP 之所以能成，正是因为它跑在页面上下文里，cookie 天然齐全。
+         *
+         * 所以这里主动用 GM_cookie 把 cookie 拼出来，交给 GM_xmlhttpRequest 显式带上。
+         * 拿到就缓存 5 分钟，避免每次请求都读一遍。
+         */
+        async getCookieHeader(force = false) {
+            const now = Date.now();
+            if (!force && this._ckCache && now - this._ckAt < 5 * 60 * 1000) return this._ckCache;
+            if (typeof GM_cookie === "undefined" || !GM_cookie) return "";
+            const read = (filter) => new Promise(resolve => {
+                let settled = false;
+                const done = v => { if (!settled) { settled = true; resolve(v); } };
+                setTimeout(() => done(null), 3000);
+                try {
+                    if (typeof GM_cookie.list === "function") {
+                        GM_cookie.list(filter, cookies => done(Array.isArray(cookies) ? cookies : []));
+                    } else done(null);
+                } catch (_) { done(null); }
+            });
+            /* 读全量再本地筛选，不用 domain 过滤：
+             * 实测必须拿到 HttpOnly 的 `MSPAuth` 才算真正登录（document.cookie 里没有它），
+             * 而 `domain:"bing.com"` 这类过滤在不同管理器里语义不一致，容易漏掉
+             * `.rewards.bing.com` 下的条目 —— 漏了就等于没登录。 */
+            const groups = await Promise.all([
+                read({}),
+                read({ domain: "bing.com" }),
+                read({ url: "https://rewards.bing.com/" })
+            ]);
+            const seen = new Map();
+            for (const g of groups) {
+                for (const c of (g || [])) {
+                    const n = String((c && c.name) || "");
+                    const dom = String((c && c.domain) || "");
+                    if (!n || seen.has(n)) continue;
+                    if (!c.value) continue;
+                    // 只收微软系域，避免把无关站点的同名 cookie 混进来
+                    if (!/bing\.com|live\.com|microsoft\.com/i.test(dom)) continue;
+                    seen.set(n, String(c.value));
+                }
+            }
+            const header = [...seen.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+            this._ckCache = header;
+            this._ckAt = now;
+            // 给同步的 Utils.xhr 用的取值器：预热之后所有微软域请求自动带上
+            Utils._ckReady = () => header;
+            /* 判定「这份 cookie 够不够登录」：光有 MUID 只能说明被识别成浏览器，
+             * 真正代表登录的是 HttpOnly 的会话 cookie。实测只有 MSPAuth 之类在场时，
+             * 后台请求才会拿回完整 earn 页（35k 登录页 → 380k 真实页）。 */
+            const hasSession = ["MSPAuth", "MSPProf", "WLSSC", "NAP"].some(n => seen.has(n));
+            if (header) {
+                Utils.log(hasSession ? "🔑" : "🟡",
+                    `已读取 ${seen.size} 个 cookie${hasSession ? "（含登录会话）" : "（缺少会话 cookie，可能未登录）"}`
+                    + `，将用于给后台请求补登录态`);
+            } else {
+                Utils.log("🟡", "读不到任何 cookie：后台请求将没有登录态（GM_cookie 是否已授权？）");
+            }
+            return header;
+        },
+
         isJSON(s) {
-            try { const j = JSON.parse(s); return Array.isArray(j) || (typeof j === "object" && j !== null); }
-            catch { return false; }
+            try {
+                const j = JSON.parse(s);
+                return Array.isArray(j) || (typeof j === "object" && j !== null);
+            } catch (_) { return false; }
         },
 
         /* 解析 JSON 字符串，非 JSON / null / 标量一律 null。
@@ -1091,7 +1231,6 @@ const __scBgKeepAlive = (function() {
                 src: "tencent",
                 url: () => "https://disp-qryapi.3g.qq.com/v1/dispatch",
                 headers: { referer: "https://3g.qq.com/" },
-                anonymous: false,
                 parse: txt => {
                     const d = JSON.parse(txt);
                     if (!d || d.code != 0) throw new Error("dispatch 返回异常");
@@ -1466,7 +1605,6 @@ const __scBgKeepAlive = (function() {
                     GM_xmlhttpRequest({
                         method: "GET",
                         url: this.authUrl,
-                        anonymous: false,
                         headers: typeof navigator !== "undefined" ? { "User-Agent": navigator.userAgent } : {},
                         timeout: 20000,
                         onload: r => resolve(r),
@@ -1731,12 +1869,17 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        // 找到（或新开）一个 rewards earn 页
+        /* 找一个可执行 fetch 的 rewards 页面。
+         *
+         * 默认**不新开标签页**：用户明确不希望脚本弹标签。
+         * 没有已开的 rewards 页面时返回 null，调用方安静降级到后台直发。
+         * 想临时允许新开时，把 Config.cdpAllowNewTab 置为 true（默认 false）。 */
         async earnPage() {
             const list = await this.targets();
             if (!list) return null;
             const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
             if (hit) return hit;
+            if (!GM_getValue("Config.cdpAllowNewTab", false)) return null;
             try {
                 const res = await new Promise((resolve, reject) => {
                     GM_xmlhttpRequest({
@@ -1809,6 +1952,86 @@ const __scBgKeepAlive = (function() {
         async evaluate(expression) {
             const r = await this.send("Runtime.evaluate", { expression: expression, returnByValue: true, userGesture: true });
             return r && r.result ? r.result.value : undefined;
+        },
+
+        /* 在真实 Edge 页面里用原生 fetch 交卷（桌面应用每周专属任务）。
+         *
+         * 为什么必须走 CDP：server action 的 `Origin` 由浏览器强制注入 ——
+         *   · 扩展后台发 GM_xmlhttpRequest → 恒为 `chrome-extension://<id>` → 必应 WAF 直接 500；
+         *   · 页面里 fetch → 浏览器自动写 `https://rewards.bing.com` → 200 记账。
+         * 这个头脚本改不了，所以只能换发送方。CDP 让我们能在**页面上下文**里执行代码，
+         * 等于直接借用页面的 fetch —— 与本机调试时完全一致的通道。
+         *
+         * 前提：Edge 以 --remote-debugging-port 启动（桌面「Rewards Edge」快捷方式已配好 9224）。
+         * 返回 { accepted, status, text }。 */
+        /* 在页面上下文里 GET 一个 rewards 页面并返回正文。
+         *
+         * 为什么要它：后台 `GM_xmlhttpRequest` 在这个环境里**不带登录态**
+         * （拿回 35k 的登录页而不是 380k 的真实页），而页面里的 fetch 天然带齐 cookie。
+         * 页面上下文因此是「读到真实数据」唯一可靠的来源。
+         * CDP 不可用时返回 null，调用方回退到后台请求。 */
+        async fetchPageText(url) {
+            const expr = `(async function(){
+                try {
+                    var r = await fetch(${JSON.stringify(url)}, { credentials: "include", redirect: "follow" });
+                    var t = await r.text();
+                    return JSON.stringify({ ok: r.ok, status: r.status, text: t.slice(0, 900000) });
+                } catch (e) {
+                    return JSON.stringify({ ok: false, status: 0, text: String(e && e.message || e) });
+                }
+            })()`;
+            let raw;
+            try {
+                const r = await this.send("Runtime.evaluate", {
+                    expression: expr, awaitPromise: true, returnByValue: true, userGesture: true
+                });
+                raw = r && r.result ? r.result.value : "";
+            } catch (e) {
+                return null;
+            }
+            try {
+                const j = JSON.parse(raw || "{}");
+                if (!j.ok || !j.text) return null;
+                return String(j.text);
+            } catch (_) { return null; }
+        },
+
+        async claimInPage(pageUrl, headers, body) {
+            const expr = `(async function(){
+                try {
+                    var r = await fetch(${JSON.stringify(pageUrl)}, {
+                        method: "POST",
+                        credentials: "include",
+                        headers: ${JSON.stringify(headers)},
+                        body: ${JSON.stringify(body)}
+                    });
+                    var t = await r.text();
+                    return JSON.stringify({ ok: true, status: r.status, text: t.slice(0, 2000) });
+                } catch (e) {
+                    return JSON.stringify({ ok: false, status: 0, text: String(e && e.message || e) });
+                }
+            })()`;
+            /* 必须 awaitPromise：表达式是 async IIFE，返回的是 Promise 对象。
+             * 不设这个标志时 CDP 只能把它序列化成 "[object Object]"，
+             * JSON.parse 随即失败，日志就会显示「页面无返回」—— 一个假阴性。 */
+            let raw;
+            try {
+                const r = await this.send("Runtime.evaluate", {
+                    expression: expr,
+                    awaitPromise: true,
+                    returnByValue: true,
+                    userGesture: true
+                });
+                raw = r && r.result ? r.result.value : "";
+            } catch (e) {
+                return { accepted: false, status: 0, text: `CDP 求值失败：${e.message}` };
+            }
+            try {
+                const j = JSON.parse(raw || "{}");
+                return { accepted: j.ok && j.status >= 200 && j.status < 300, status: j.status || 0, text: String(j.text || "") };
+            } catch (_) {
+                return { accepted: false, status: 0, text: String(raw || "页面无返回") };
+            }
         },
 
         /* 列出 earn 页上未完成的「应用内搜索」型卡（必须是 bing 搜索链接） */
@@ -2274,7 +2497,6 @@ const __scBgKeepAlive = (function() {
                 const html = await Utils.xhr({
                     url: pageUrl,
                     headers: { "user-agent": RewardsAuto.ua.pc, "referer": "https://rewards.bing.com/" },
-                    anonymous: false
                 });
                 const tokenMatch = html.match(/name=["']__RequestVerificationToken["'][^>]*value=["']([^"']+)["']/i)
                     || html.match(/RequestVerificationToken.*?value=["']([^"']+)["']/i)
@@ -2302,7 +2524,7 @@ const __scBgKeepAlive = (function() {
             return await Utils.xhr({
                 method: "POST",
                 url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
-                headers, data: params.toString(), anonymous: false
+                headers, data: params.toString()
             });
         },
 
@@ -2509,7 +2731,8 @@ const __scBgKeepAlive = (function() {
                     headers: {
                         "content-type": "text/plain;charset=UTF-8",
                         "next-action": nextAction,
-                        "origin": "https://rewards.bing.com",
+                        // 不设 origin：扩展里会被覆盖成 chrome-extension://，必应 WAF 直接 500
+                        // （完整实测见 submitQuestCard 的注释）
                         "referer": earnUrl,
                         "user-agent": RewardsAuto.ua.pc,
                     },
@@ -2752,7 +2975,6 @@ const __scBgKeepAlive = (function() {
                         "referer": "https://rewards.bing.com/",
                         "x-requested-with": "XMLHttpRequest"
                     },
-                    anonymous: false
                 });
                 if (!Utils.isJSON(res)) return false;
                 const data = JSON.parse(res);
@@ -2996,7 +3218,6 @@ const __scBgKeepAlive = (function() {
                     const userInfo = await Utils.xhr({
                         url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
                         headers: { "user-agent": RewardsAuto.ua.pc, "referer": "https://rewards.bing.com/", "x-requested-with": "XMLHttpRequest" },
-                        anonymous: false
                     });
                     if (Utils.isJSON(userInfo)) {
                         const data = JSON.parse(userInfo);
@@ -3093,47 +3314,10 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔴", `卡片解析失败: ${e.message}`);
             }
 
-            // --- [桌面奖励应用专属任务检测与解析] ---
-            // 注意：此块必须留在 try 内，一旦引用 try 外的 html 会抛 ReferenceError 并被 catch 静默吞掉。
-            try {
-                if (!earnHtml) return cards;
-                const questMatch = earnHtml.match(/href="(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i)
-                    || earnHtml.match(/"(\/earn\/quest\/(WW_pcparent_RewardsApp_weekly_Exclusive[^"]+))"/i);
-                if (questMatch) {
-                    const questPath = questMatch[1];
-                    const questUrl = "https://rewards.bing.com" + questPath;
-                    const questHtml = await Utils.xhr({
-                        url: questUrl,
-                        headers: RewardsAuto.desktopAppHeaders
-                    });
-                    if (questHtml) {
-                        for (const qItem of this._flightItems(this._flightText(questHtml), "WW_pcchild\\d+[^\"]+")) {
-                            // 这段请求走的就是 Rewards 应用 UA（desktopAppHeaders），所以 isLocked 在这里
-                            // 已经是「应用视角」的结论：只有真锁（明天才开 / isDisabled）才跳过。
-                            const qLock = CardLock.probe(qItem);
-                            if (qLock.locked) {
-                                if (qItem.offerId && qItem.hash) {
-                                    lockStat.count++;
-                                    Utils.log("🔒", `桌面任务仍在锁定期：${qItem.title || qItem.offerId} [${qLock.reason}]`);
-                                }
-                            } else if (qItem.offerId && qItem.hash && qItem.isCompleted !== true) {
-                                Utils.log("🖥️", `发现已解锁桌面奖励任务: ${qItem.title || qItem.offerId}`);
-                                pushCard({
-                                    title: `[桌面专享] ${qItem.title || qItem.name || qItem.offerId}`,
-                                    points: 10,
-                                    offerId: qItem.offerId,
-                                    hash: qItem.hash,
-                                    kind: "desktop_app",
-                                    destination: qItem.destination || qItem.href || "",
-                                    url: "https://rewards.bing.com/earn"
-                                });
-                            }
-                        }
-                    }
-                }
-            } catch (eQuest) {
-                Utils.log("🟡", `桌面应用专属任务解析跳过: ${eQuest.message}`);
-            }
+            /* 桌面奖励应用「每周专属任务」不在这里下发卡片。
+             * 它的问题不是「锁没锁」，而是「交卷必须打到 quest 页面 + 带 quest 路由状态树」，
+             * 混进卡片队列只会被通用通道反复提交却永远不记账（旧版正是这样）。
+             * 现在由 API.runDesktopWeeklyQuests 用专用通道整批处理 —— 见 doPromos。 */
 
             if (lockStat.count > 0 || lockStat.app > 0) {
                 RewardsAuto.state.lockedCount = Math.max(RewardsAuto.state.lockedCount, lockStat.count);
@@ -3198,6 +3382,67 @@ const __scBgKeepAlive = (function() {
             const isBingSearch = /bing\.com\/search/i.test(dest);
             const hasSign = /(^|&)(form=ML2W4J|form=ML2Y2H|PUBL=RewardsDO)/i.test(q);
             return isBingSearch && hasSign;
+        },
+
+        /** 按子卡 href 做「应用内搜索」签名上报 —— 桌面周任务子卡的真实完成前奏。
+         *
+         * 参考「商城签到改进加强版」的实测结论：这类子卡的 href 是
+         * `bing.com/search?q=...&form=ML2Y2H&PUBL=RewardsDO`，**只交卷时服务端看不到那次搜索**，
+         * 于是即使返回 `1:true` 也不会记账（日志表现为「已受理但未记账」）。
+         * 正确顺序是：先走一遍 SERP → 再打 ncheader → 再打 reportActivity，最后才交卷。
+         *
+         * 三次请求都是 bing.com 域下的普通接口，不受 server action 的 Origin 限制。
+         * 返回 true 表示三步都发出去了（不代表一定记账，记账仍由交卷+复核决定）。
+         */
+        async reportAppSearchForCard(href) {
+            const raw = String(href || "").trim();
+            if (!/bing\.com\/search/i.test(raw)) return false;
+            const { origin, pathname, search } = (() => {
+                try { const u = new URL(raw); return { origin: u.origin, pathname: u.pathname, search: u.search }; }
+                catch (_) { return {}; }
+            })();
+            if (!origin) return false;
+            const query = origin + pathname + search;
+            const params = search.replace(/^\?/, "");
+            const today = new Date();
+            const p2 = n => String(n).padStart(2, "0");
+            // _Rwho 是 Bing 的「本次搜索来自哪个设备/哪一天」标记，缺了容易被当成复用会话
+            const baseHeaders = {
+                "user-agent": RewardsAuto.desktopAppHeaders["user-agent"],
+                "cookie": `_Rwho=u=d&ts=${today.getFullYear()}-${p2(today.getMonth() + 1)}-${p2(today.getDate())}`,
+            };
+
+            // 1) 先真的请求 SERP，从响应里取服务端分配的 IG（交互 ID）
+            let ig = "";
+            try {
+                const serp = await Utils.xhr({ url: query, headers: baseHeaders });
+                const flat = String(serp || "").replace(/\s/g, "");
+                const m = flat.match(/,IG:"([^"]+)"/);
+                if (m) ig = m[1];
+            } catch (_) {}
+            if (!ig) ig = Utils.getRandomUUID();
+            const reportHeaders = { ...baseHeaders, "referer": query };
+
+            // 2) ncheader：告诉服务端「这次搜索的上下文」
+            try {
+                await Utils.xhr({
+                    method: "POST",
+                    url: `${origin}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
+                    headers: { ...reportHeaders, "content-type": "application/x-www-form-urlencoded" },
+                    data: "wb=1%3bi%3d1%3bv%3d1"
+                });
+            } catch (_) {}
+
+            // 3) reportActivity：真正记账的那一下，参数要原样带上子卡 href 的签名
+            try {
+                await Utils.xhr({
+                    method: "POST",
+                    url: `${origin}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
+                    headers: { ...reportHeaders, "content-type": "application/x-www-form-urlencoded" },
+                    data: `url=${encodeURIComponent(query)}&V=web`
+                });
+            } catch (_) {}
+            return true;
         },
 
         /** 领取单张卡片（统一入口：先网页通道 → 网页完成不了再换 DAPI → 一律用服务端状态复核是否真的加分）。
@@ -3386,6 +3631,221 @@ const __scBgKeepAlive = (function() {
         /* 网页通道（Edge 与 Chrome/Firefox 差异所在）：返回 true 仅表示请求被接受，真实加分由 claimCard() 用 DAPI 复核。
          * appChannel=true：用 Rewards 桌面应用 UA 交卷。带锁徽标的 App 专属卡在普通浏览器 UA 下
          * 恒为 isLocked:true，但同一个 hash 在应用 UA 下就是解锁态 —— 换 UA 是这类卡唯一的完成方式。 */
+        /* ===== 页面通道：让 rewards 页面用自己的 fetch 代发交卷请求 =====
+         *
+         * 为什么需要它（2026-11-04 实测，两个账号都复现）：
+         *   server action 的 `Origin` 由**浏览器强制注入**，脚本改不了。后台（service_worker）
+         *   发 GM_xmlhttpRequest 时它恒为 `chrome-extension://<扩展ID>`，必应 WAF 直接回 500
+         *   （0.1~0.2 秒、响应体是风控页）。而在 rewards.bing.com 页面里 fetch，Origin 天然是
+         *   `https://rewards.bing.com`，同样请求 200 且记账。
+         * 既然改不了头，就换发送方：后台把请求写进 GM 存储，页面读出来用自己的 fetch 发，
+         * 再把响应写回去。
+         *
+         * 存活判定靠页面心跳：没有页面在线就直接跳过，不去等 15 秒超时。 */
+        PAGE_BOX: {
+            req: "Config.pageReq",
+            res: "Config.pageRes",
+            alive: "Config.pageAlive"
+        },
+
+        /* 页面侧：取一条待发请求并执行（带抢占标记，避免多标签页重复发）。 */
+        async pageServeOnce() {
+            const req = GM_getValue(this.PAGE_BOX.req, null);
+            if (!req || !req.id || req.done) return false;
+            GM_setValue(this.PAGE_BOX.req, { id: req.id, url: req.url, headers: req.headers, body: req.body, at: req.at, done: true });
+            const out = { id: req.id, at: Date.now(), status: 0, text: "", error: "" };
+            try {
+                const r = await fetch(req.url, {
+                    method: "POST",
+                    headers: req.headers || {},
+                    body: req.body,
+                    credentials: "include",
+                    redirect: "follow"
+                });
+                out.status = r.status;
+                out.text = String(await r.text()).slice(0, 4000);
+            } catch (e) {
+                out.error = String((e && e.message) || e);
+            }
+            GM_setValue(this.PAGE_BOX.res, out);
+            return true;
+        },
+
+        /* 页面侧常驻：每 1.5 秒写一次心跳并尝试服务一条请求。
+         * 注意：这里不挂「永不结束」的定时器链 —— 每轮只在内存里挂一次 next，
+         * 并且可通过 __MP_TEST_TAB_WAIT__ 之外的开关（Config.pageServerOff）停掉，
+         * 免得 Node 单测因为一个常驻定时器而无法退出。 */
+        startPageServer() {
+            if (typeof GM_getValue !== "function") return;
+            if (this._pageServerStarted) return;
+            if (GM_getValue("Config.pageServerOff", false)) return;
+            this._pageServerStarted = true;
+            const tick = async () => {
+                try {
+                    if (GM_getValue("Config.pageServerOff", false)) { this._pageServerStarted = false; return; }
+                    GM_setValue(this.PAGE_BOX.alive, Date.now());
+                    await this.pageServeOnce();
+                } catch (_) {}
+                this._pageServerTimer = setTimeout(tick, 1500);
+                // Node 单测里不要让这个定时器把进程钉住
+                if (this._pageServerTimer && typeof this._pageServerTimer.unref === "function") {
+                    this._pageServerTimer.unref();
+                }
+            };
+            this._pageServerTimer = setTimeout(tick, 600);
+            if (this._pageServerTimer && typeof this._pageServerTimer.unref === "function") {
+                this._pageServerTimer.unref();
+            }
+        },
+
+        /* 是否有 rewards 页面在线（心跳 40 秒内有效）。 */
+        _pageChannelAlive() {
+            const at = Number(GM_getValue(this.PAGE_BOX.alive, 0)) || 0;
+            return at > 0 && (Date.now() - at) < 40 * 1000;
+        },
+
+        /* 没有页面在线时，临时开一个 rewards 页面把通道架起来。
+         *
+         * 为什么必须这么做：扩展后台发 server action 时 Origin 恒为 chrome-extension://<id>，
+         * 必应 WAF 直接 500，而这个头脚本改不了。唯一干净的路是让某个 rewards 页面用
+         * 自己的 fetch 代发 —— 后台没有页面就开一个。
+         *
+         * 页面加载完、脚本注入、页面服务起来需要几秒，这里轮询等心跳。
+         * 用完不立即关：同一轮后续卡片还会继续用它（见 _claimPageTab）。 */
+        async _ensurePageChannel() {
+            /* 默认绝不自动开标签页（用户明确要求）。
+             * 现在这条通道整条默认关闭（见 submitQuestCard 策略 B），这里再加一道保险：
+             * 即使有人单独调用它，也必须有 Config.allowOpenTab 才会真的开。 */
+            if (!GM_getValue("Config.allowOpenTab", false)) return null;
+            /* 标签页只能开一次。
+             *
+             * 之前每张卡、每次重试都会进来开一个新标签（用户反馈「打开了很多标签」）：
+             * `_openingPage` 只防并发，跑完就清掉，下一次调用照样再开一个。
+             * 现在用持久化的 `Config.pageOpenedAt` 记住「这一轮已经开过了」——
+             * 跨上下文、跨重试都有效，因为 MV3 的 service_worker 随时可能被挂起，内存变量不可靠。
+             * 只要开过且还在 10 分钟窗口内，就绝不再开第二个。 */
+            const openedAt = Number(GM_getValue("Config.pageOpenedAt", 0)) || 0;
+            const reallyAlive = this._pageChannelAlive();
+            if (!reallyAlive && openedAt && (Date.now() - openedAt) < 10 * 60 * 1000) {
+                // 刚开过但心跳没起来：再等一小会儿（页面可能还在加载），绝不再开新的
+                for (let i = 0; i < 12; i++) {
+                    await Utils.delay(500);
+                    if (this._pageChannelAlive()) return null;
+                }
+                return null;
+            }
+            if (this._openingPage) {
+                for (let i = 0; i < 40; i++) {
+                    await Utils.delay(500);
+                    if (this._pageChannelAlive()) return null;
+                }
+                return null;
+            }
+            this._openingPage = true;
+            GM_setValue("Config.pageOpenedAt", Date.now());
+            try {
+                Utils.log("🖥️", "需要借 rewards 页面代发请求，正在打开一个临时页面…");
+                /* 打开方式要容错：日志里出现过
+                 *   `Tabs cannot be edited right now (user may be dragging a tab)`
+                 * （ScriptCat 的 offscreen messageServer 报的）—— 用户正在拖标签页、
+                 * 或浏览器窗口处于特殊状态时，insert/setParent 这类「编辑标签页」的动作会失败。
+                 * 所以先试完整参数，失败就退化成最简调用；两次都失败才算真开不了。 */
+                let opened = false;
+                const url = "https://rewards.bing.com/earn?mpq=" + Date.now();
+                for (const opts of [
+                    { active: false, insert: true, setParent: true },
+                    { active: false },
+                    undefined
+                ]) {
+                    try {
+                        if (opts) GM_openInTab(url, opts);
+                        else GM_openInTab(url);
+                        opened = true;
+                        break;
+                    } catch (e) {
+                        // 换下一组更保守的参数
+                    }
+                }
+                if (!opened) {
+                    Utils.log("🔴", "打开代发页面失败（浏览器拒绝编辑标签页），只能退回后台直发");
+                    return null;
+                }
+                // 等页面加载 + 脚本注入 + 页面服务起心跳。
+                // 45 秒：@run-at document-start 下要等整个 earn 页（含 Next.js 水合）跑完，
+                // 慢网络/低配机器上 20 秒经常不够 —— 之前那句「20 秒内没有就绪」就是这么来的。
+                for (let i = 0; i < 90; i++) {
+                    await Utils.delay(500);
+                    if (this._pageChannelAlive()) {
+                        Utils.log("✅", "代发页面已就绪");
+                        return null;
+                    }
+                    if (i === 19) Utils.log("🖥️", "代发页面还在加载（已等 10 秒）…");
+                    if (i === 49) Utils.log("🖥️", "代发页面还在加载（已等 25 秒）…");
+                }
+                Utils.log("🟡", "代发页面 45 秒内没有就绪。可能原因："
+                    + "① 脚本未注入该页（@background 会让页面永不注入，需用 @crontab）；"
+                    + "② 打开的标签页被浏览器冻结/未获得执行机会。本轮改用后台直发。");
+                return null;
+            } finally {
+                this._openingPage = false;
+            }
+        },
+
+        /* 后台侧：把请求交给页面执行并等结果。超时返回 null。
+         *
+         * 双通道等待（参考「商城签到」脚本的做法）：
+         *   · 首选 GM_addValueChangeListener —— 页面写回结果时**立刻**收到通知，延迟≈0；
+         *   · 兜底轮询 —— 某些 ScriptCat 版本里跨上下文的 GM_getValue 读不到对方写入，
+         *     或者监听器拿不到，这时靠轮询（600ms）保证最终能读到。
+         * 两者并存，谁先到用谁。 */
+        async viaPageChannel(url, headers, body, timeoutMs = 15000) {
+            const id = Date.now() + "-" + Math.floor(Math.random() * 1e6);
+            GM_setValue(this.PAGE_BOX.res, null);
+            GM_setValue(this.PAGE_BOX.req, { id, url, headers, body, at: Date.now() });
+
+            const pack = (res) => ({
+                ok: res.status >= 200 && res.status < 300,
+                status: res.status,
+                text: res.text || "",
+                error: res.error || ""
+            });
+
+            let listenerId = null;
+            let settled = false;
+            let result = null;
+
+            if (typeof GM_addValueChangeListener !== "undefined") {
+                try {
+                    listenerId = GM_addValueChangeListener(this.PAGE_BOX.res, (name, oldV, newV) => {
+                        if (settled || !newV || typeof newV !== "object") return;
+                        if (newV.id !== id) return;
+                        settled = true;
+                        result = pack(newV);
+                    });
+                } catch (_) { listenerId = null; }
+            }
+
+            const deadline = Date.now() + timeoutMs;
+            try {
+                while (!settled && Date.now() < deadline) {
+                    await Utils.delay(600);
+                    const res = GM_getValue(this.PAGE_BOX.res, null);
+                    if (res && res.id === id) {
+                        settled = true;
+                        result = pack(res);
+                        break;
+                    }
+                }
+            } finally {
+                if (listenerId != null && typeof GM_removeValueChangeListener === "function") {
+                    try { GM_removeValueChangeListener(listenerId); } catch (_) {}
+                }
+            }
+
+            GM_setValue(this.PAGE_BOX.req, null);
+            return settled ? result : null;
+        },
+
         /* 判断 Server Action 的响应是否「受理了这次交卷」。
          * 旧判断是 res.includes("true") || res.includes('"a":')，太松：
          * 任何带 true 的页面（甚至某些错误帧）都会被当成成功，于是日志里出现
@@ -3399,10 +3859,605 @@ const __scBgKeepAlive = (function() {
             if (/(?:^|\n)[0-9a-f]+:E\{/i.test(text) || /"digest"\s*:/.test(text)) return false;
             // 未登录时会被重定向到登录页 / 返回 HTML 文档，这种 2xx 也不是受理
             if (/^\s*<!doctype\s+html/i.test(text) || /<html[\s>]/i.test(text)) return false;
-            return text.includes('"ok":true')
-                || text.includes('"i":false')
-                || text.includes('"a":')
-                || text.includes("true");
+
+            /* 关键：Next.js flight 里服务端的**判定结果**是单独一行 `1:true` / `1:false`。
+             *
+             * 以前这里用 `text.includes("true")` 兜底，看似宽松实则致命：
+             * 失败帧 `0:{"a":"$@1","q":"","i":false} 1:false` 里既没有 "true"，
+             * 却命中了 `"i":false` 和 `"a":` 两个条件 —— **明确失败被当成了成功**。
+             * 后果就是日志显示「已受理」，脚本跳过重试，而卡片根本没进账；
+             * 更糟的是没解锁的卡提交后也被记成「成功」，掩盖了真正该做的那张。
+             *
+             * 现在只认 `<帧号>:true|false` 这种结果帧，并且：
+             *   · 结果帧之间可能用**换行**也可能用**空格**分隔（真实响应两种都出现过，
+             *     只认换行会导致成功被判失败 —— 这正是收紧判定后 5 个用例挂掉的根因）；
+             *   · 取**最后一个**匹配：flight 流里结果帧总在末尾，前面的记录帧不会误判；
+             *   · 排除 `1:E{...}` 错误帧（上面已先拦掉）与 `"i":false` 这类 JSON 字段
+             *     （它们的冒号前不是数字，天然不匹配 `\d+:`）。 */
+            const verdicts = [...text.matchAll(/\d+:(true|false)(?![\w{])/g)];
+            if (verdicts.length > 0) {
+                return verdicts[verdicts.length - 1][1] === "true";
+            }
+            // 极少数响应没有结果帧（老版本接口）：只有明确出现 ok:true 才算受理，
+            // 不能再靠 "a": 或 "i":false 这种结构性字段去猜。
+            return text.includes('"ok":true');
+        },
+
+        /* ===== 桌面奖励应用「每周专属任务」(punchcard) =====
+         *
+         * 任务形态（2026-11-03 实测，父任务 WW_pcparent_RewardsApp_weekly_Exclusive_Novw1_2026_punchcard）：
+         *   · 一个 punchcard 父任务，下面挂 8 个子卡（Sunday…Saturday + 「已安装应用」那张）。
+         *   · 每张子卡只在**自己对应的星期几**解锁，其余时间 isLocked:true。
+         *   · 子卡 href 都是 bing.com/search（form=ML2Y2H&PUBL=RewardsDO），属于「应用内搜索」型。
+         *   · 子卡与父卡的 hash / offerId 在网页端也能原样读到（只是网页版**不显示**这个入口）。
+         *
+         * 完成通道（纯 HTTP，不需要 CDP）：
+         *   Next.js Server Action POST 到 **quest 页面**，body 是
+         *     [hash, 11, {offerid, isPromotional:"$undefined", timezoneOffset:"-480"}]
+         *   关键差异是 next-router-state-tree 必须带 quest 段（见 Utils.questRouterStateTree）。
+         *   实测：同一份 body 换掉这个头之前「200 但不记账」，换之后子卡从列表消失并计入
+         *   「状态: X/8 个任务」——锁着的卡也能被这个请求记成完成，所以是真正能一次做完一周的通道。
+         *
+         * 判定「是否记账」：响应的 `1:true` 只代表**受理**（锁着的卡同样返回 true），
+         * 真正的判据是重新拉 quest 页面看这张卡还在不在。 */
+
+        QUESTS: {
+            // 桌面应用每周专属任务的父任务前缀（父任务 ID 会带上具体周次，如 _Novw1_2026_punchcard）
+            weeklyPrefix: /WW_pcparent_RewardsApp_weekly_Exclusive/i
+        },
+
+        /* 从 earn 页 HTML 里找出所有 quest 链接（不只桌面那一个）：monthly / Duolingo 等
+         * punchcard 走的是同一套完成通道，顺手一起收。 */
+        _questLinksFromEarn(earnHtml) {
+            /* 三重兜底，对齐参考脚本（商城签到改进版）的做法。
+             *
+             * 旧实现只走 _flightText（把 self.__next_f.push 的片段拼起来）。
+             * 但 flight 片段解析对转义层级很敏感：字符串里再套一层 `\"` 或
+             * `\u0026` 时就 parse 失败，拼出来是空串 → 一个入口都找不到
+             * → 日志只说「本轮没有桌面专属任务」，而页面上明明有解锁的卡。
+             *
+             * 参考脚本不依赖 flight 解析，它直接在整个 HTML 上跑三条正则：
+             *   1) "offerId":"...punchcard..."  ← flight 负载里的父任务字段
+             *   2) "href":"/earn/quest/..."     ← flight 负载里的链接字段
+             *   3) href="/earn/quest/..."       ← 渲染后 HTML 里的链接属性
+             * 任一条命中即可。这样即使 flight 解析失效也照样能找到。 */
+            const raw = String(earnHtml || "");
+            const cleanEarn = raw.replace(/\\"/g, '"');   // 反转义后正文，参考脚本同款
+            const found = new Map();
+            const add = (id) => {
+                let q = String(id || "").split("?")[0].split("#")[0];
+                try { q = decodeURIComponent(q); } catch (_) {}
+                if (q && /punchcard/i.test(q) && !found.has(q)) found.set(q, q);
+            };
+
+            // 兜底 0：flight 片段（保留原路径，正常时最准）
+            const text = this._flightText(raw);
+            const reFlight = /\/earn\/quest\/([A-Za-z0-9_%.\-]+punchcard[A-Za-z0-9_%.\-]*)/g;
+            let m;
+            while ((m = reFlight.exec(text)) !== null) add(m[1]);
+
+            // 兜底 1：整体 HTML 里的 offerId 字段
+            const reOffer = /"offerId"\s*:\s*"([^"]*punchcard[^"]*)"/g;
+            while ((m = reOffer.exec(cleanEarn)) !== null) add(m[1]);
+
+            // 兜底 2：整体 HTML 里的 href 字段（flight 负载）
+            const reHref = /"href"\s*:\s*"(\/earn\/quest\/[^"]+)"/g;
+            while ((m = reHref.exec(cleanEarn)) !== null) add(m[1].split("/").pop());
+
+            // 兜底 3：渲染后 HTML 的链接属性
+            const reHrefHtml = /href="(\/earn\/quest\/[^"]+)"/g;
+            while ((m = reHrefHtml.exec(cleanEarn)) !== null) add(m[1].split("/").pop());
+
+            // 兜底 4：转义形态（\"href\":\"/earn/quest/...），raw 上再扫一遍
+            const reEscaped = /\\"href\\":\\"(\/earn\/quest\/[^\\"]+)/g;
+            while ((m = reEscaped.exec(raw)) !== null) add(m[1].split("/").pop());
+
+            return [...found.keys()];
+        },
+
+        /* 拉一个 quest 页面，解析出它下面所有子卡（offerId / hash / 锁态 / 完成态）。 */
+        async fetchQuestCards(parentId) {
+            const url = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
+            const html = await Utils.xhr({
+                url,
+                headers: RewardsAuto.desktopAppHeaders
+            });
+            if (!html) return { parentId, url, html: "", cards: [] };
+            const text = this._flightText(html);
+            const cards = [];
+            // 子卡 ID 的前缀并不统一：桌面周任务是 WW_pcchild…，月度/品牌任务可能是
+            // ENWW_pcchild… / CNWW_pcchild… 等。旧版写死 "WW_pcchild" 只能收桌面那一套，
+            // 换成「任意前缀 + pcchild」后，同一套通道能覆盖所有 punchcard。
+            for (const item of this._flightItems(text, "[A-Za-z0-9]*_pcchild[^\"]+")) {
+                if (!item.offerId || !item.hash) continue;
+                cards.push({
+                    offerId: item.offerId,
+                    hash: item.hash,
+                    title: String(item.ariaLabel || item.linkText || item.offerId).replace(/^\s*\d+\s*[分点]?\s*,?\s*/, "").trim() || item.offerId,
+                    isCompleted: item.isCompleted === true,
+                    isLocked: item.isLocked === true,
+                    href: item.href || item.destination || ""
+                });
+            }
+            return { parentId, url, html, text, cards };
+        },
+
+        /* 一次 Server Action 交卷（quest 页面）。返回 { accepted, raw }。 */
+        /* 原始请求：**无论状态码都把 body 带回来**。
+         * Utils.xhr 遇到非 2xx 只抛 `HTTP 500，用时…`，响应体全丢了 ——
+         * 而 500 到底是「必应 WAF 拦截页」还是「Next.js 错误帧」还是「登录跳转」，
+         * 只有 body 能分辨。排障必须看到它。 */
+        async _rawXhr(options) {
+            const start = Date.now();
+            return await new Promise((resolve) => {
+                try {
+                    GM_xmlhttpRequest({
+                        /* 这里**不传 anonymous**。参考脚本（微软积分商城签到）的 xhr 也不传，
+                         * 实测那个脚本在同样的 service_worker 里能正常发出 server action。
+                         * 而本文以前统一写 `anonymous: false`，日志出现
+                         * `status=0 / 0.02 秒 / Unknown Error` —— 请求根本没出去，
+                         * 与「禁改头」是两种不同的失败，不能混为一谈。
+                         * 显式传 false 在部分 ScriptCat 版本里会让请求走匿名通道，
+                         * 反而丢掉会话 Cookie。 */
+                        ...options,
+                        timeout: Number(options && options.timeout) || 15000,
+                        onload: (res) => resolve({
+                            status: res.status,
+                            text: String(res.responseText || ""),
+                            headers: res.responseHeaders || "",
+                            cost: (Date.now() - start) / 1000
+                        }),
+                        onerror: (err) => resolve({
+                            status: 0,
+                            text: String((err && err.error) || "网络错误"),
+                            headers: "",
+                            cost: (Date.now() - start) / 1000
+                        }),
+                        ontimeout: () => resolve({
+                            status: -1,
+                            text: "请求超时",
+                            headers: "",
+                            cost: (Date.now() - start) / 1000
+                        })
+                    });
+                } catch (e) {
+                    resolve({ status: 0, text: String(e.message), headers: "", cost: 0 });
+                }
+            });
+        },
+
+        /* Server Action 交卷的「请求形态」候选表。
+         *
+         * 为什么需要多形态：同一个请求在不同账号/不同扩展上下文里结果不一样 ——
+         * 2026-11-04 已实测到，A 账号不带 origin 就能记账，B 账号照样 500。
+         * 与其继续猜哪一个头有问题，不如按代价从低到高逐个试，把**能过的那个记住**。
+         *
+         * 候选表（2026-11-04 第三版，对齐两个成熟参考脚本）：
+         *   1) earn页 + earn树 + 同源origin —— 参考脚本 `taskRewardsAppCards` 正是这么发的，
+         *      它们在 service_worker 里能正常交卷，所以作为首选；
+         *   2) quest页 + quest树 + 同源origin —— 本机实测同样 200 记账，作为备选；
+         *   3) earn页 + 普通UA（去掉 MSRewards 应用身份）。
+         *
+         * 注意：`origin` 这里是**可以设**的。上一版误以为设了必炸，其实是另一回事：
+         * 本机直连四种组合（有无 origin × earn/quest 页）全部 200 —— origin 本身不是问题，
+         * 真正让请求发不出去的是 `anonymous: false` 那类发送层参数（见 _rawXhr 注释）。
+         *
+         * 真正的禁改头（sec-fetch-* 等）依然不能出现：设了会直接 `status=0 / Unknown Error`。 */
+        _questSubmitVariants() {
+            const SRC = "https://rewards.bing.com";
+            return [
+                { name: "earn页+origin", toEarn: true, headers: { origin: SRC } },
+                { name: "quest页+origin", toEarn: false, headers: { origin: SRC } },
+                { name: "earn页+普通UA", toEarn: true, headers: { origin: SRC }, plainIdentity: true }
+            ];
+        },
+
+        /* 试出当前账号可用的交卷形态，并把结论存下来给后续卡片直接用。
+         * 返回 { variant, result } —— variant 为 null 表示全部失败。 */
+        async _probeQuestVariant(pageUrl, parentId, card) {
+            const saved = GM_getValue("Config.questVariant", "");
+            const all = this._questSubmitVariants();
+            // 已记住的形态优先，省掉每次重试的 3 次白跑
+            const ordered = saved
+                ? [...all.filter(v => v.name === saved), ...all.filter(v => v.name !== saved)]
+                : all;
+            const tried = [];
+            let last = null;
+            for (const v of ordered) {
+                const r = await this._submitQuestOnce(pageUrl, parentId, card, v);
+                last = r;
+                tried.push(`${v.name}=${r.status}`);
+                if (r.accepted) {
+                    if (saved !== v.name) {
+                        GM_setValue("Config.questVariant", v.name);
+                        if (saved) Utils.log("🖥️", `桌面任务交卷形态已切换：${saved} → ${v.name}`);
+                    }
+                    return { variant: v, result: r, tried };
+                }
+                // 401/403 说明是登录态问题，换形态也没用，直接停
+                if (r.status === 401 || r.status === 403) break;
+            }
+            // 全部失败：把最后一次结果带回去打日志，不再补发请求（补发只会白挨一次 WAF）
+            return { variant: null, result: last, tried };
+        },
+
+        /* 按某一种形态发一次交卷请求。
+         *
+         * 2026-11-04 第三版：改回参考脚本验证过的组合 —— **打到 earn 页 + earn 树 + 显式同源 origin**。
+         *
+         * 之前一直用 quest 页 + quest 树，是因为在本机 Node 里观察到 quest 树能记账。
+         * 但对照两个成熟脚本（微软积分全能任务版 / 商城签到改进版）后发现，它们完成同类
+         * 「Rewards App 专属卡」时走的都是：
+         *     POST https://rewards.bing.com/earn
+         *     next-action: <reportActivity id>
+         *     next-router-state-tree: getRouterStateTree("earn")
+         *     origin: https://rewards.bing.com
+         * 而且本机四种组合实测（同一张子卡）全部 `status=200 + 1:true`，
+         * 说明「quest 页 vs earn 页」不是成败关键，真正卡住的是**发送层**（见 _rawXhr 的注释）。
+         * 既然参考脚本在 service_worker 里能跑通，就按它们的形态发，少一个变量。 */
+        async _submitQuestOnce(pageUrl, parentId, card, variant) {
+            const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+            const dpl = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
+            const payload = JSON.stringify([card.hash, 11, {
+                offerid: card.offerId,
+                isPromotional: "$undefined",
+                timezoneOffset: "-480"
+            }]);
+            // 打到 earn 页（不是 quest 页），并配 earn 段的状态树
+            const target = variant.toEarn ? "https://rewards.bing.com/earn" : pageUrl;
+            const headers = {
+                "content-type": "text/plain;charset=UTF-8",
+                "next-action": nextAction,
+                "next-router-state-tree": variant.toEarn
+                    ? Utils.routerStateTree("earn")
+                    : Utils.questRouterStateTree(parentId),
+                "referer": target,
+                "accept": "text/x-component",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                ...(dpl ? { "x-deployment-id": dpl } : {})
+            };
+            if (!variant.plainIdentity) Object.assign(headers, RewardsAuto.desktopAppHeaders);
+            else headers["user-agent"] = RewardsAuto.ua.pc;
+            Object.assign(headers, variant.headers);
+
+            const res = await this._rawXhr({ method: "POST", url: target, headers, data: payload });
+            return {
+                status: res.status,
+                accepted: res.status >= 200 && res.status < 300 && this._actionLooksAccepted(res.text),
+                text: res.text,
+                cost: res.cost,
+                variant: variant.name
+            };
+        },
+
+        /* 交卷失败时把「服务器到底说了什么」写进日志 —— 这是唯一能继续排障的依据。
+         * 500 的 body 有三种可能，处理方式完全不同：
+         *   · 必应风控页（<title>Bing</title> + .sc_error）→ 被 WAF 拦，换形态/等一会儿；
+         *   · Next.js 错误帧（…:E{"digest":…}）→ action ID 或请求头不对；
+         *   · 登录页（login.live.com / oauth20）→ 登录态失效。 */
+        _questDiag(res) {
+            const t = String((res && res.text) || "");
+            const st = res ? res.status : 0;
+            // 状态 0 = 请求根本没发出去。以前这里显示「未知」，其实是最容易定位的一类：
+            // XHR 层拒绝了某个禁改头（Origin / sec-fetch-* 等），或扩展没权限访问该域名。
+            if (st === 0) {
+                return `请求未发出（${t.slice(0, 80) || "无响应"}）—— 多半是 XHR 层拒绝了禁改头或缺 @connect 权限`;
+            }
+            if (st === -1) return "请求超时";
+            let kind = "未知";
+            if (/login\.live\.com|oauth20_authorize|<title>登录<\/title>|Sign in to/i.test(t)) kind = "登录页";
+            else if (/<title>Bing<\/title>|sc_error|class="panda"/i.test(t)) kind = "必应风控页";
+            else if (/[0-9a-f]+:E\{|"digest"\s*:/.test(t)) kind = "Next.js错误帧";
+            else if (/<html/i.test(t)) kind = "HTML页面";
+            const body = t.replace(/\s+/g, " ").slice(0, 160);
+            return `HTTP ${st}（${kind}，${res ? res.cost.toFixed(2) : "?"}秒）${body ? " body=" + body : ""}`;
+        },
+
+        async submitQuestCard(parentId, card) {
+            const pageUrl = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
+            const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+            const dpl = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
+            const payload = JSON.stringify([card.hash, 11, {
+                offerid: card.offerId,
+                isPromotional: "$undefined",
+                timezoneOffset: "-480"
+            }]);
+            const baseHeaders = {
+                "content-type": "text/plain;charset=UTF-8",
+                "next-action": nextAction,
+                "next-router-state-tree": Utils.questRouterStateTree(parentId),
+                "referer": pageUrl,
+                "accept": "text/x-component",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                ...(dpl ? { "x-deployment-id": dpl } : {}),
+                ...RewardsAuto.desktopAppHeaders
+            };
+
+            /* 策略 A：CDP 页面通道（首选，实测唯一稳定可用）
+             *
+             * server action 的 Origin 由浏览器强制注入：
+             *   · 扩展后台 GM_xmlhttpRequest → `chrome-extension://<id>` → 必应 WAF 直接 500；
+             *   · 页面里 fetch → `https://rewards.bing.com` → 200 记账。
+             * 这个头脚本改不了，所以必须换发送方。CDP 能在**页面上下文**里执行代码，
+             * 等于借页面自己的 fetch —— 与本机调试时完全一致，实测确认可行。
+             *
+             * 前提：Edge 用桌面「Rewards Edge」快捷方式启动（已配 9224 调试端口）。
+             * CDP 不可用时安静降级，不打断其它任务。 */
+            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+                try {
+                    if (await CDP.available()) {
+                        // 确保有一个 rewards 页可执行；earnPage 会复用已开的页面
+                        const page = await CDP.earnPage();
+                        if (page && page.webSocketDebuggerUrl) {
+                            if (!CDP._ws || CDP._ws.readyState !== 1) {
+                                await CDP.connect(page.webSocketDebuggerUrl);
+                            }
+                            const r = await CDP.claimInPage(pageUrl, baseHeaders, payload);
+                            if (r.accepted && this._actionLooksAccepted(r.text)) {
+                                Utils.log("🖥️", "  经由 CDP 页面通道交卷成功");
+                                return { accepted: true, raw: r.text, status: r.status, variant: "CDP页面通道" };
+                            }
+                            Utils.log("🟡", `CDP 页面通道未受理（HTTP ${r.status}）：${String(r.text).replace(/\s+/g, " ").slice(0, 90)}`);
+                        }
+                    }
+                } catch (eCdp) {
+                    Utils.log("🟡", `CDP 页面通道异常：${eCdp.message}`);
+                } finally {
+                    try { CDP.close(); } catch (_) {}
+                }
+            }
+
+            /* 策略 B：页面代发（默认关闭）
+             *
+             * 这条通道的设想是：把请求写进 GM 存储，让 rewards 页面用自己的 fetch 代发。
+             * 但实测它在本脚本的部署方式下**从来没成功过**，原因很明确：
+             * 脚本用 `@background` 只跑在 service_worker 里，**页面永远不注入脚本**，
+             * 所以「代发服务」起不来，`_ensurePageChannel` 打开的那个标签页也白开
+             * （日志里那句「代发页面 45 秒内没有就绪」就是这么来的）。
+             *
+             * 而它想解决的问题（Origin 被浏览器强制成 chrome-extension://）已经由
+             * **策略 A 的 CDP 页面通道**彻底覆盖，且实测 200 记账。
+             * 所以这里默认关闭，避免无意义地弹标签页；确实需要时把
+             * `Config.usePageChannel` 置为 true 仍可启用。 */
+            if (GM_getValue("Config.usePageChannel", false)) {
+                let tabId = null;
+                if (!this._pageChannelAlive()) {
+                    tabId = await this._ensurePageChannel();
+                }
+                if (this._pageChannelAlive()) {
+                    const viaPage = await this.viaPageChannel(pageUrl, baseHeaders, payload);
+                    if (viaPage && !viaPage.error) {
+                        const accepted = viaPage.ok && this._actionLooksAccepted(viaPage.text);
+                        if (accepted) {
+                            this._claimPageTab = true;   // 有页面在手，本轮后面的卡继续复用
+                            return { accepted: true, raw: viaPage.text, status: viaPage.status, variant: "页面通道" };
+                        }
+                        Utils.log("🖥️", `页面通道未受理（HTTP ${viaPage.status}），改试后台直发`);
+                    } else {
+                        Utils.log("🟡", "页面通道没有返回结果（页面可能未加载完），改试后台直发");
+                    }
+                }
+            }
+
+            const probed = await this._probeQuestVariant(pageUrl, parentId, card);
+            if (probed.variant) {
+                return {
+                    accepted: true,
+                    raw: probed.result.text,
+                    status: probed.result.status,
+                    variant: probed.variant.name
+                };
+            }
+            // 全形态都失败：用最后一次的结果打日志（不再补发请求）
+            const last = probed.result;
+            return {
+                accepted: false,
+                raw: last ? last.text : "",
+                status: last ? last.status : 0,
+                variant: last ? last.variant : "",
+                tried: probed.tried,
+                diag: last ? this._questDiag(last) : "无响应"
+            };
+        },
+
+        /* 桌面应用每周专属任务：发现 → 交卷 → 复核。
+         *
+         * 与普通卡片最大的不同是「周节奏」：一周 8 张子卡按星期几依次解锁。
+         * 用户要求「发现后可以自动完成」，所以这里不做「今天是周几」的硬过滤，
+         * 而是把页面上**所有未完成**的子卡都交给服务端 —— 实测锁着的卡同样能被这个
+         * 请求记成完成，服务端是否给分由它自己决定，脚本不替它保守。
+         * 返回 { found, done, pending }。 */
+        async runDesktopWeeklyQuests() {
+            Utils.log("🖥️", "扫描桌面奖励应用专属任务…");
+            /* 先预热 cookie：这个环境里后台请求默认不带登录态（见 API.getCookieHeader），
+             * 不预热的话下面拉回来的 earn 页会是登录页，子卡一张也解析不到。 */
+            try { await this.getCookieHeader(); } catch (_) {}
+            let encEarn;
+            try {
+                /* 纯后台读取（不依赖 CDP）。
+                 * 之前一版用 CDP 在页面上下文读，因为误判「后台不带登录态」；
+                 * 但参考脚本（商城签到改进版）同样是裸 GM_xmlhttpRequest，在同样环境下能跑通，
+                 * 说明后台请求本身是会带 cookie 的 —— 问题不在「读不到」，而在「请求头」。
+                 * 所以回到后台读取，并把请求头降到最简（见下）。 */
+                encEarn = await Utils.xhr({
+                    url: "https://rewards.bing.com/earn",
+                    /* 只用应用 UA + 来源标记，不带任何多余头。
+                     * 参考脚本读 earn 页时也就带一个 User-Agent。 */
+                    headers: {
+                        ...RewardsAuto.desktopAppHeaders
+                    }
+                });
+            } catch (eEarn) {
+                Utils.log("🔴", `桌面专属任务：拉取 earn 页失败（${eEarn.message}），本轮跳过`);
+                return { found: 0, done: 0, pending: 0 };
+            }
+            if (!encEarn) {
+                Utils.log("🔴", "桌面专属任务：earn 页返回空，本轮跳过");
+                return { found: 0, done: 0, pending: 0 };
+            }
+
+            /* 诊断：earn 页拿回来的是「真实页面」还是「登录页」？
+             * 之前只打一句「本轮没有桌面专属任务」，让人无法判断到底是
+             *   (a) 本周真的没有/已做完，还是
+             *   (b) 后台请求没带登录态，只拿到登录页（于是当然解析不到任何 quest）。
+             * 这两种情况的处置完全不同，必须在日志里能分开。 */
+            const earnLen = String(encEarn).length;
+            const looksLogin = /<title>登录<\/title>|Sign in to your account|oauth20_authorize/i.test(String(encEarn));
+            if (looksLogin || earnLen < 60000) {
+                Utils.log("🟡", `桌面专属任务：earn 页疑似未登录（长度 ${earnLen}，`
+                    + `${looksLogin ? "是登录页" : "比正常页小很多"}）——`
+                    + `请检查 GM_cookie 是否授权、账号是否已登录`);
+            }
+
+            const questIds = this._questLinksFromEarn(encEarn)
+                .filter(id => this.QUESTS.weeklyPrefix.test(id));
+            if (questIds.length === 0) {
+                // 把所有 quest 入口都列出来，便于判断「是入口没了」还是「只是周任务入口没了」
+                const allQuests = this._questLinksFromEarn(encEarn);
+                Utils.log("🖥️", "本轮没有桌面奖励应用每周专属任务"
+                    + `（earn 页 ${earnLen} 字节，识别到 ${allQuests.length} 个 quest 入口`
+                    + (allQuests.length ? `：${allQuests.join("、")}` : "")
+                    + "）");
+                return { found: 0, done: 0, pending: 0 };
+            }
+            Utils.log("🖥️", `发现 ${questIds.length} 个桌面专属任务入口：`
+                + questIds.map(id => id.replace(/^WW_pcparent_RewardsApp_weekly_Exclusive_?/i, "")).join("、"));
+
+            let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
+            for (const parentId of questIds) {
+                let snap;
+                try {
+                    snap = await this.fetchQuestCards(parentId);
+                } catch (eSnap) {
+                    // 一张页面拉不到不能影响其它周任务，也不能让整批静默中止
+                    Utils.log("🔴", `桌面专属任务：读取 ${parentId} 失败（${eSnap.message}），跳过这一个`);
+                    totalFailed++;
+                    continue;
+                }
+                if (snap.cards.length === 0) {
+                    // 子卡全部消失 = 这一周的任务已经全部做完，是最常见的正常状态
+                    Utils.log("✅", `桌面专属任务本周已全部完成：${parentId}`);
+                    continue;
+                }
+                totalFound += snap.cards.length;
+                const open = snap.cards.filter(c => !c.isCompleted);
+                if (open.length === 0) {
+                    Utils.log("✅", `桌面专属任务本周已全部完成：${parentId}`);
+                    continue;
+                }
+                /* **只处理已解锁的卡**（用户明确要求）。
+                 *
+                 * 以前会把锁着的卡也一起提交，结果：先耗掉重试预算在注定失败的请求上，
+                 * 日志里还刷出一堆「锁定/未完成」的噪音，让人分不清「今天该做的没做成」
+                 * 还是「今天本来就没开」。现在：
+                 *   · 锁定卡完全不显示、不提交（它们到了对应那天自然会变成解锁态）；
+                 *   · 只把已解锁且未完成的卡打印出来并执行。 */
+                const unlocked = open.filter(c => !c.isLocked);
+                if (unlocked.length === 0) {
+                    Utils.log("🖥️", `桌面专属任务：${open.length} 张待办全部未解锁（未到对应星期），本轮不处理`);
+                } else {
+                    Utils.log("🖥️", `桌面奖励应用专属任务：${unlocked.length} 张已解锁待办`
+                        + `（另有 ${open.length - unlocked.length} 张未解锁，不处理）（${parentId}）`);
+                    for (const c of unlocked) Utils.log("🖥️", `  · [已解锁] ${c.title}`);
+                }
+
+                let doneHere = 0, failedHere = 0;
+                for (const card of unlocked) {
+                    /* 子卡的真实完成顺序是「先按 href 做应用搜索签名上报，再交卷」。
+                     * 只交卷时服务端看不到那次搜索，会返回 1:true 但不记账
+                     * —— 日志里那句「已受理但未记账」就是这个原因。 */
+                    if (card.href && /^https?:/i.test(card.href)) {
+                        try {
+                            const reported = await this.reportAppSearchForCard(card.href);
+                            if (reported) Utils.log("🖥️", `  已上报应用搜索：${card.title}`);
+                        } catch (_) {}
+                        await Utils.randomDelay(1500, 2500);
+                    }
+                    /* 单张卡最多试 2 轮：submitQuestCard 内部已经把几种请求形态都试过一遍，
+                     * 这里再给一次机会（中间隔几秒），因为 WAF 拦截常是瞬时的。
+                     * 循环现在只含已解锁的卡，所以固定 2 次。 */
+                    const maxAttempts = 2;
+                    let r = null;
+                    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+                        try {
+                            r = await this.submitQuestCard(parentId, card);
+                        } catch (eSubmit) {
+                            r = { accepted: false, raw: String(eSubmit.message), status: 0 };
+                        }
+                        if (r.accepted) break;
+                        if (attempt < maxAttempts) {
+                            Utils.log("🟡", `桌面任务交卷未受理（第 ${attempt} 次）：${card.title}`
+                                + ` [已试形态 ${(r.tried || []).join(",") || r.variant || "-"}]，稍后重试`);
+                            await Utils.randomDelay(5000, 9000);
+                        }
+                    }
+                    if (!r || !r.accepted) {
+                        failedHere++;
+                        Utils.log("🟠", `桌面任务交卷失败：${card.title}`
+                            + ` → ${r && r.diag ? r.diag : this._questReason(r && r.raw)}`);
+                        if (r && r.tried) {
+                            Utils.log("🖥️", `  形态尝试结果：${r.tried.join(" / ")}`);
+                        }
+                        continue;
+                    }
+                    if (r.variant && r.variant !== "无origin") {
+                        Utils.log("🖥️", `  本次用「${r.variant}」形态交卷成功`);
+                    }
+                    await Utils.randomDelay(2000, 4000);
+                    // 受理 ≠ 记账：重新拉一次 quest 页，看这张卡是否已经从待办列表里消失
+                    let after;
+                    try {
+                        after = await this.fetchQuestCards(parentId);
+                    } catch (eAfter) {
+                        Utils.log("🟡", `桌面任务已受理但复核失败（${eAfter.message}）：${card.title}，按待定处理`);
+                        totalPending++;
+                        continue;
+                    }
+                    const stillThere = after.cards.some(c => c.offerId === card.offerId && !c.isCompleted);
+                    if (stillThere) {
+                        totalPending++;
+                        Utils.log("🟡", `桌面任务已受理但未记账（服务端没加分）：${card.title}`);
+                    } else {
+                        doneHere++;
+                        Utils.log("🟢", `桌面专属任务完成：${card.title}`);
+                    }
+                }
+                totalDone += doneHere;
+                let verify = null;
+                try {
+                    verify = await this.fetchQuestCards(parentId);
+                } catch (_) {}
+                if (verify && verify.cards.every(c => c.isCompleted)) {
+                    Utils.log("🔵", `桌面应用每周专属任务全部完成（本次完成 ${doneHere} 张）`, true);
+                } else {
+                    /* 汇总也只看已解锁的卡：未解锁的不显示，
+                     * 否则日志里会冒出一串「(未解锁)」，与「今天该做的没做成」混淆。 */
+                    const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !c.isLocked) : [];
+                    const leftLocked = verify ? verify.cards.filter(c => !c.isCompleted && c.isLocked).length : 0;
+                    Utils.log("🟡", `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张`
+                        + (leftUnlocked.length > 0
+                            ? `，仍剩 ${leftUnlocked.length} 张已解锁未完成（${leftUnlocked.map(c => c.title).join("、")}）`
+                            : (leftLocked > 0 ? "，今日已解锁的都处理完了" : ""))
+                        + (leftLocked > 0 ? `（另有 ${leftLocked} 张未解锁，到对应那天自动处理）` : ""));
+                }
+            }
+            if (totalFailed > 0) {
+                Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`, true);
+            }
+            return { found: totalFound, done: totalDone, pending: totalPending };
+        },
+
+        /* 把交卷失败原因翻译成一句话：500 在必应上是 WAF 拦截（响应体是风控页而非错误帧），
+         * 401/403 是登录态问题，其余才按普通网络/服务端错误看。
+         * 排障时这三类的处置完全不同，所以日志里必须能一眼分开。 */
+        _questReason(raw) {
+            const t = String(raw || "");
+            if (!t) return "无响应";
+            if (/HTTP 500/.test(t)) return "HTTP 500（必应风控拦截，多半是 Origin/UA 特征）";
+            if (/\b(401|403)\b/.test(t)) return "未登录或无权限，请检查 Cookie / 登录态";
+            if (/HTTP (404|405)/.test(t)) return "接口/路由不存在（action ID 或 quest 页面可能已变更）";
+            if (/请求超时|timeout/i.test(t)) return "请求超时";
+            return t.replace(/\s+/g, " ").slice(0, 110);
         },
 
         async claimCardWeb(card, { appChannel = false } = {}) {
@@ -3428,10 +4483,12 @@ const __scBgKeepAlive = (function() {
                 "content-type": "text/plain;charset=UTF-8",
                 "next-action": nextAction,
                 "referer": referer,
-                // 显式覆盖 Origin：扩展/后台上下文发出的请求会自动带 Origin: chrome-extension://<id>，
-                // 风控账号的 server action 对非站点同源 Origin 直接抛 500（user.js 对照实验证实）。
-                // next-router-state-tree 同样不能缺，否则新版 action 端点会 500。
-                "origin": "https://rewards.bing.com",
+                /* 这里**不再显式设 origin**，理由与 submitQuestCard 完全一致（见那里的长注释）：
+                 * 浏览器会把这一个头覆盖成 chrome-extension://<扩展ID>，脚本写的同源值留不住。
+                 * 在扩展里「显式设同源 origin」= 主动制造一个非同源 Origin → 必应 WAF 直接 500。
+                 * 去掉后：不带 Origin 的请求实测 200 + 记账；而如果调用方上下文本来就会带同源
+                 * Origin（如页面里的 fetch），浏览器也会给出正确值，两种情况都正常。
+                 * next-router-state-tree 不能缺，否则新版 action 端点会 500。 */
                 "next-router-state-tree": Utils.routerStateTree(segment),
                 "accept": "text/x-component",
                 "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -4103,6 +5160,25 @@ const __scBgKeepAlive = (function() {
         }
     };
 
+    /* ===== rewards 页面「交卷代发」服务：在这里启动，不能放到脚本末尾 =====
+     *
+     * 脚本末尾有：
+     *     if (!Utils.hasDOM()) return new Promise(() => {});
+     * 后台分支到那里就 return 了，之后所有顶层代码不再执行。之前把启动代码放在末尾，
+     * 结果页面里也没起来（那之后还有大量 UI/菜单代码，任一环节抛错就轮不到它），
+     * 日志里因此是「代发页面 20 秒内没有就绪」——页面开着，服务却没跑。
+     *
+     * 这里紧跟 API 定义之后：此时 API.startPageServer 已存在，且位于任何 return 之前。 */
+    try {
+        if (Utils.hasDOM() && typeof location !== "undefined"
+            && /(^|\.)rewards\.bing\.com$/i.test(String(location.hostname || ""))) {
+            API.startPageServer();
+            // 这条日志是「页面是否注入脚本」的唯一外部证据：后台开标签页后在控制台/日志
+            // 看到它，就说明 @crontab 生效了（@background 下永远不会出现）。
+            Utils.log("🖥️", `代发服务已启动（页面上下文：${location.hostname}）`);
+        }
+    } catch (_) {}
+
     const TaskManager = {
         signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
@@ -4295,6 +5371,33 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
+        /* 桌面奖励应用「每周专属任务」：独立任务，**每一轮都检查**。
+         *
+         * 为什么必须独立出来（用户反馈「没有日志出来」的根因）：
+         * 以前它挂在 doPromos 里，而 doPromos 一开头就有
+         *     if (this.promosDate === RewardsAuto.state.dateNowNum) return true;
+         * —— 当天活动卡片判成完成之后，后面每一轮的 doPromos 都在那里直接返回，
+         * 周任务的扫描代码根本执行不到，于是整轮日志里一条都没有。
+         *
+         * 而周任务的节奏是**按星期逐日解锁**：今天没做的卡，明天才解锁，
+         * 所以它必须每轮都去看一眼，不能跟着其它任务的「今日已完成」短路。
+         *
+         * 完成判据也不看本地日期标记，只看服务端：quest 页上的子卡消失 = 真完成。
+         * 这样即使 unix 时间跨天、或用户在别的设备上做了某张卡，也不会漏判。 */
+        async doDesktopWeekly() {
+            if (!GM_getValue("Tasks.desktopWeekly", true)) return true;
+            try {
+                const weekly = await API.runDesktopWeeklyQuests();
+                RewardsAuto.state.weeklyQuestDone = weekly.done || 0;
+                RewardsAuto.state.weeklyQuestPending = weekly.pending || 0;
+                // 返回 false 会让 withRetry 再跑一遍（本任务内部已逐卡重试，不必叠加）
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `桌面专属任务异常：${e && e.message ? e.message : e}`);
+                return true;   // 不影响其它任务
+            }
+        },
+
         async doPromos(roundDeadline) {
             if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 2) return true;
             if (this.promosDate === RewardsAuto.state.dateNowNum) {
@@ -4302,6 +5405,8 @@ const __scBgKeepAlive = (function() {
                 return true;
             }
             Utils.log("🧩", "扫描活动卡片...");
+            // 预热 cookie：后台请求默认不带登录态，不补的话发现卡片时会拿回登录页
+            try { await API.getCookieHeader(); } catch (_) {}
             const cards = await API.discoverCards();
             /* 登录态核对：启动时的 probeCookiePermission 只跑一次（避免反复弹授权），
              * 这里每轮轻量确认一次，但**只在异常时出声** —— 正常登录不再刷屏。 */
@@ -4323,6 +5428,12 @@ const __scBgKeepAlive = (function() {
                 return true;
             }
             Utils.log("🧩", `发现 ${cards.length} 个卡片`);
+
+            /* 桌面应用每周专属任务**不在这里处理**（见 doDesktopWeekly）。
+             * 以前它跟在 doPromos 里，而 doPromos 开头有：
+             *     if (this.promosDate === dateNowNum) return true;
+             * 当天活动卡片判成完成后，后面每一轮都在这里直接返回，
+             * 周任务连扫描都轮不到 —— 这就是「没有日志出来」的原因。 */
 
             /* 先用 CDP 真实点击把「应用内搜索」型卡做掉 —— 这类卡只有浏览器级输入
              * 才能产生 rdrig（详见 CDP 模块注释）。CDP 不可用时会给出醒目提示，
@@ -4912,6 +6023,13 @@ const __scBgKeepAlive = (function() {
                     await withRetry(() => this.doRead(roundDeadline), "阅读");
                     await Utils.randomDelay();
                 }
+                /* 周任务每轮都跑，而且**放在最前面**（在活动卡片之前）：
+                 *  · 它按星期逐日解锁，今天不做明天不一定补得回来，优先级最高；
+                 *  · 放在 doPromos 之后时，一旦活动卡片耗掉整轮预算，它就被轮空，
+                 *    表现就是「这一轮没有任何周任务日志」。
+                 * 内部有自己的逐卡重试，不需要外层 withRetry 叠加。 */
+                await this.doDesktopWeekly();
+                await Utils.randomDelay();
                 await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
                 await Utils.randomDelay();
                 await withRetry(() => this.doSearch(roundDeadline), "搜索");
@@ -5130,6 +6248,92 @@ const __scBgKeepAlive = (function() {
             .then(() => TaskManager.runAll())
             .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
             .finally(() => Sched.finish(true));   // 手动跑过的这一轮也算数，顺延到下一次计划
+    });
+
+    /* ===== 诊断：交卷请求到底被谁拦了 =====
+     *
+     * 排障背景：本机（CDP 页面上下文 / Python 裸 HTTP）同样的请求全部 200，
+     * 但在 ScriptCat 里三种形态全是 500。所以必须在一个**真实扩展上下文**里，
+     * 把各个变量逐个打开/关闭，看哪个组合能过 —— 靠猜已经浪费太多轮了。
+     *
+     * 全程用 _rawXhr（无论状态码都带回 body），并给每条结果分类：
+     *   风控页 / flight错误帧 / 登录页 / 未发出。
+     */
+    const diagClaimRequest = async () => {
+        const PARENT = "WW_pcparent_RewardsApp_weekly_Exclusive_Novw1_2026_punchcard";
+        const EARN = "https://rewards.bing.com/earn";
+        const QUEST = "https://rewards.bing.com/earn/quest/" + PARENT;
+        const APP_UA = RewardsAuto.desktopAppHeaders["user-agent"];
+        const ACTION = RewardsAuto._nextAction || GM_getValue("Config.nextAction", "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce");
+        const DPL = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
+
+        Utils.log("🧪", "=== 交卷诊断开始 ===");
+        Utils.log("🧪", `上下文=${Utils.hasDOM() ? "页面(" + location.hostname + ")" : "后台/service_worker"}`
+            + ` action=${String(ACTION).slice(0, 12)}… dpl=${DPL || "无"}`);
+
+        // 取一张真子卡的 hash
+        let card = null;
+        try {
+            const snap = await API.fetchQuestCards(PARENT);
+            card = (snap.cards && snap.cards[0]) || null;
+            Utils.log("🧪", card ? `取到子卡：${card.title}（${snap.cards.length} 张待办）` : "该周已无待办子卡，用占位 hash 测通道");
+        } catch (e) {
+            Utils.log("🧪", `拉 quest 页失败：${e.message}`);
+        }
+        const hash = card ? card.hash : "0".repeat(64);
+        const offerId = card ? card.offerId : "WW_pcchild4_urlreward_Tuesday_RewardsApp_weekly_Exclusive_Novw1_2026_punchcard";
+        const body = JSON.stringify([hash, 11, { offerid: offerId, isPromotional: "$undefined", timezoneOffset: "-480" }]);
+
+        const earnTree = Utils.routerStateTree("earn");
+        const questTree = Utils.questRouterStateTree(PARENT);
+
+        // 逐个变量隔离：每条只改动一个因素
+        const cases = [
+            { n: "① earn+origin+appUA（参考脚本写法）", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA, "x-rewards-source": "msrewards-desktop", "next-router-state-tree": earnTree } },
+            { n: "② earn+origin 但无 x-rewards-source", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA, "next-router-state-tree": earnTree } },
+            { n: "③ earn 无origin+appUA", url: EARN, h: { "user-agent": APP_UA, "x-rewards-source": "msrewards-desktop", "next-router-state-tree": earnTree } },
+            { n: "④ earn+origin 用普通浏览器UA", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": RewardsAuto.ua.pc, "next-router-state-tree": earnTree } },
+            { n: "⑤ quest+origin+appUA", url: QUEST, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA, "x-rewards-source": "msrewards-desktop", "next-router-state-tree": questTree } },
+            { n: "⑥ 不带 next-router-state-tree", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA } },
+        ];
+
+        const lines = [];
+        for (const c of cases) {
+            const headers = {
+                "content-type": "text/plain;charset=UTF-8",
+                "next-action": ACTION,
+                "referer": c.url,
+                "accept": "text/x-component",
+                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                ...(DPL ? { "x-deployment-id": DPL } : {}),
+                ...c.h
+            };
+            let r;
+            try {
+                r = await API._rawXhr({ method: "POST", url: c.url, headers, data: body });
+            } catch (e) {
+                r = { status: 0, text: String(e.message), cost: 0 };
+            }
+            const t = String(r.text || "");
+            let kind;
+            if (r.status === 0) kind = "未发出";
+            else if (/login\.live\.com|oauth20_authorize/i.test(t)) kind = "登录页";
+            else if (/<title>Bing<\/title>|sc_error/i.test(t)) kind = "风控页";
+            else if (/[0-9a-f]+:E\{|"digest"\s*:/.test(t)) kind = "flight错误帧";
+            else if (t.includes("1:true")) kind = "受理";
+            else kind = "其他";
+            lines.push(`  ${c.n} → ${r.status} ${kind} ${String(r.cost).slice(0, 5)}s`);
+            // 非 200 且拿得到 body 时，附上前 100 字，这是唯一能继续排障的线索
+            if (r.status !== 200 && t) lines.push(`      body=${t.replace(/\s+/g, " ").slice(0, 100)}`);
+            await Utils.delay(1200);
+        }
+        Utils.log("🧪", "=== 诊断结果 ===\n" + lines.join("\n"));
+        Utils.log("🧪", "判定：哪一行出现「受理」= 那种组合可用；全 500 且都是风控页 = 后台身份被拒，只能用页面通道。");
+    };
+    GM_registerMenuCommand("🧪 诊断：交卷请求", () => {
+        Promise.resolve()
+            .then(diagClaimRequest)
+            .catch(e => Utils.log("🔴", `交卷诊断异常：${e && e.message ? e.message : e}`));
     });
 
     // 原「🔓 强制释放运行锁」菜单已移除：不再注册菜单按钮，
@@ -5661,6 +6865,10 @@ const __scBgKeepAlive = (function() {
             releaseLock: diagReleaseLock
         };
     } catch (_) {}
+
+    /* 页面「交卷代发」服务的启动已移到 TaskManager 定义之前（见那里的说明）。
+     * 这里只留一行注释标记，不再重复调用 —— 重复启动会被 _pageServerStarted 挡住，
+     * 但更重要的是末尾这段在后台分支根本执行不到。 */
 
     /* 测试挂钩：Node 回归测试加载本文件时会先在作用域里注入 __MP_TEST_HOOK__（见 tests/harness.mjs），
      * 借此对内部纯函数（请求头拼装、出口判定、节拍器等）做单元断言。
