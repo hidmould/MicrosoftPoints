@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.2
+// @version      1.6.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅月度打卡
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -331,6 +331,10 @@ const __scBgKeepAlive = (function() {
             startTime: 0,
             lockedCount: 0,
             lockedPoints: 0,
+            lockedTitles: [],
+            weeklyQuestLeft: [],
+            weeklyQuestUnknown: 0,
+            weeklyQuestScanned: false,
             webNoAuth: false,
             webFailStreak: 0,
         }
@@ -528,6 +532,39 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.sendMSG = `${icon} ${msg}`;
                 this.sendWebhook();
             }
+        },
+
+        // 环境/配置类提示专用：CDP 未连接、通道不可用、Origin 说明这一类「装好就没有」的固定信息，
+        // 只写日志，永不推送。推送通道只留给「任务结果」和「需要你立刻处理的事」。
+        logQuiet(icon, msg) {
+            this.log(icon, msg, false);
+        },
+
+        // 同一类提示在冷却期内只推一次（浏览器通知 + Webhook 一起压住）。
+        // 常驻调度是 20 分钟一轮，同一个失败不压的话一天能推几十条。
+        notifyKeyed(key, icon, msg, cooldownMs = 6 * 3600 * 1000) {
+            const now = Date.now();
+            let seen = {};
+            try {
+                const raw = GM_getValue("Config.noticeSeen", null);
+                seen = (raw && typeof raw === "object") ? raw : {};
+            } catch (_) { seen = {}; }
+            for (const k of Object.keys(seen)) {
+                const at = Number((seen[k] || {}).at || 0);
+                if (!at || now - at > 7 * 24 * 3600 * 1000) delete seen[k];
+            }
+            const rec = seen[key];
+            if (rec && now - (rec.at || 0) < cooldownMs) {
+                const ago = Math.max(1, Math.round((now - rec.at) / 60000));
+                const left = Math.max(1, Math.round((cooldownMs - (now - rec.at)) / 60000));
+                GM_setValue("Config.noticeSeen", seen);
+                this.log(icon, `${msg}（同类提示 ${ago} 分钟前已推过，${left} 分钟内不再重复通知）`);
+                return false;
+            }
+            seen[key] = { at: now, msg: String(msg).slice(0, 160) };
+            GM_setValue("Config.noticeSeen", seen);
+            this.log(icon, msg, true);
+            return true;
         },
 
         async sendWebhook() {
@@ -1561,7 +1598,7 @@ const __scBgKeepAlive = (function() {
             const now = Date.now();
             const first = !this._warnedAt || now - this._warnedAt > this.WARN_GAP;
             if (!first) {
-                Utils.log("🟡", "CDP 仍未连接：" + reason + "（30 分钟内不再重复提示）");
+                Utils.logQuiet("🟡", "CDP 仍未连接：" + reason + "（30 分钟内不再重复提示）");
                 return;
             }
             this._warnedAt = now;
@@ -1575,7 +1612,7 @@ const __scBgKeepAlive = (function() {
                 "",
                 "它会在一个独立小窗口打开（不影响你平时的 Edge）。首次需要在该窗口登录 rewards.bing.com。"
             ].join(String.fromCharCode(10));
-            Utils.log("🔴", msg);
+            Utils.logQuiet("🔴", msg);
         },
 
         async available() {
@@ -1659,10 +1696,12 @@ const __scBgKeepAlive = (function() {
             return r && r.result ? r.result.value : undefined;
         },
 
-        async fetchPageText(url) {
+        async fetchPageText(url, { noCache = false } = {}) {
+            // noCache：待领池状态必须读最新的，命中浏览器 HTTP 缓存会把「已经领完」读成「还有分」。
+            const opts = `{ credentials: "include", redirect: "follow"${noCache ? ', cache: "reload"' : ""} }`;
             const expr = `(async function(){
                 try {
-                    var r = await fetch(${JSON.stringify(url)}, { credentials: "include", redirect: "follow" });
+                    var r = await fetch(${JSON.stringify(url)}, ${opts});
                     var t = await r.text();
                     return JSON.stringify({ ok: r.ok, status: r.status, text: t.slice(0, 900000) });
                 } catch (e) {
@@ -2033,19 +2072,25 @@ const __scBgKeepAlive = (function() {
 
         parse(html) {
             const raw = String(html || "");
-            if (!raw) return { known: false, has: false, amount: 0 };
+            if (!raw) return { known: false, has: false, amount: 0, source: "empty-html" };
             const clean = raw.replace(/\\"/g, '"');
             const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/i);
             if (m) {
-                const has = m[1] !== "null";
-                return { known: true, has, amount: has ? this._amount(clean) : 0, source: "pointClaim" };
+                // null / [] / {} 都是「池子空」的明确写法，不能当成「有分可领」
+                if (m[1] === "null") return { known: true, has: false, amount: 0, source: "pointClaim" };
+                const rest = clean.slice(m.index + m[0].length);
+                if (m[1] === "[" && /^\s*\]/.test(rest)) return { known: true, has: false, amount: 0, source: "pointClaim" };
+                if (m[1] === "{" && /^\s*\}/.test(rest)) return { known: true, has: false, amount: 0, source: "pointClaim" };
+                // 非 null ≠ 有分：只认「真正读到的数字」。读不到数字就是未知，宁可这轮不动手，也不误报失败。
+                const amount = this._amount(clean);
+                if (amount !== null) return { known: true, has: amount > 0, amount, source: "pointClaim" };
+                const badge = this._badgeAmount(clean);
+                if (badge !== null) return { known: true, has: badge > 0, amount: badge, source: "badge" };
+                return { known: false, has: false, amount: 0, source: "pointClaim" };
             }
-            const alt = clean.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
-            if (alt) {
-                const amount = parseInt(String(alt[1]).replace(/,/g, ""), 10) || 0;
-                return { known: true, has: amount > 0, amount, source: "badge" };
-            }
-            return { known: false, has: false, amount: 0 };
+            const badge = this._badgeAmount(clean);
+            if (badge !== null) return { known: true, has: badge > 0, amount: badge, source: "badge" };
+            return { known: false, has: false, amount: 0, source: "none" };
         },
 
         _balance(html) {
@@ -2054,11 +2099,21 @@ const __scBgKeepAlive = (function() {
             return m ? (parseInt(m[1], 10) || 0) : 0;
         },
 
+        // 返回 null 表示「这个字段没读到」，0 才表示「确实读到 0 分」。两者必须区分，否则空池会被当成有分。
         _amount(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
-            const win = clean.slice(Math.max(0, clean.search(/"pointClaim"/i)), clean.search(/"pointClaim"/i) + 1200);
-            const m = win.match(/"(?:points|amount|availablePoints|totalPoints)"\s*:\s*(\d+)/i);
-            return m ? (parseInt(m[1], 10) || 0) : 0;
+            const at = clean.search(/"pointClaim"/i);
+            if (at < 0) return null;
+            const win = clean.slice(at, at + 1200);
+            const m = win.match(/"(?:points|amount|availablePoints|totalPoints)"\s*:\s*(-?\d+)/i);
+            if (!m) return null;
+            return Math.max(0, parseInt(m[1], 10) || 0);
+        },
+
+        _badgeAmount(html) {
+            const alt = String(html || "").match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
+            if (!alt) return null;
+            return parseInt(String(alt[1]).replace(/,/g, ""), 10) || 0;
         },
 
         _request(actionMap) {
@@ -2093,14 +2148,14 @@ const __scBgKeepAlive = (function() {
         },
 
         async run({ name = "领取积分" } = {}) {
-            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "" };
+            const out = { claimed: 0, before: 0, after: 0, empty: false, unknown: false, settled: false, variant: "", reason: "" };
             let dashHtml = "";
             try {
                 if (await CDP.available()) {
                     const page = await this._cdpPage();
                     if (page) {
                         if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
-                        dashHtml = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
+                        dashHtml = await CDP.fetchPageText("https://rewards.bing.com/dashboard", { noCache: true }) || "";
                     }
                 }
             } catch (_) { dashHtml = ""; }
@@ -2111,6 +2166,7 @@ const __scBgKeepAlive = (function() {
             const pool = this.parse(dashHtml);
             out.before = this._balance(dashHtml);
             if (!pool.known) {
+                out.unknown = true;
                 out.reason = "读不到待领池标记（页面可能是登录页或结构已变）";
                 return out;
             }
@@ -2142,7 +2198,7 @@ const __scBgKeepAlive = (function() {
             try {
                 if (accepted.variant === "page") {
                     const page = await this._cdpPage();
-                    if (page) afterHtml = await CDP.fetchPageText("https://rewards.bing.com/earn") || "";
+                    if (page) afterHtml = await CDP.fetchPageText("https://rewards.bing.com/earn", { noCache: true }) || "";
                 }
                 if (!afterHtml) afterHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
             } catch (_) { afterHtml = ""; }
@@ -2155,7 +2211,7 @@ const __scBgKeepAlive = (function() {
                     let again = "";
                     if (accepted.variant === "page") {
                         const page = await this._cdpPage();
-                        if (page) again = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
+                        if (page) again = await CDP.fetchPageText("https://rewards.bing.com/dashboard", { noCache: true }) || "";
                     }
                     if (!again) again = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
                     const later = this._balance(again);
@@ -2165,12 +2221,13 @@ const __scBgKeepAlive = (function() {
                     }
                     const poolAgain = this.parse(again);
                     if (out.claimed <= 0 && poolAgain.known && !poolAgain.has) {
-                        out.reason = "已受理，池子已清空（该账号余额差读不到，按已领取处理）";
-                        out.claimed = pool.amount;
+                        out.settled = true;
+                        out.reason = "已受理，池子已清空（余额差读不到，按已领取处理）";
+                        out.claimed = Math.max(0, pool.amount || 0);
                     }
                 } catch (_) {}
             }
-            if (out.claimed <= 0) {
+            if (out.claimed <= 0 && !out.settled) {
                 out.reason = `已受理但余额未变（页面可领取 ${pool.amount}）`;
             }
             return out;
@@ -2851,6 +2908,10 @@ const __scBgKeepAlive = (function() {
                 if (lock.locked) {
                     lockedCount++;
                     lockedPoints += item.max || 0;
+                    RewardsAuto.state.lockedTitles = [...new Set([
+                        ...(RewardsAuto.state.lockedTitles || []),
+                        String(item.title || item.offerId)
+                    ])];
                     Utils.log("🔒", `锁卡跳过（需在必应 App 完成）：${item.title || item.offerId} +${item.max || 0}p [${lock.reason}]`);
                     continue;
                 }
@@ -3068,13 +3129,14 @@ const __scBgKeepAlive = (function() {
             const cards = [];
             const seenCardKeys = new Set();
             let earnHtml = "";
-            const lockStat = { count: 0, points: 0, app: 0 };
+            const lockStat = { count: 0, points: 0, app: 0, titles: [] };
 
             const classify = (item, points = 0) => {
                 const lock = CardLock.probe(item);
                 if (lock.locked) {
                     lockStat.count++;
                     lockStat.points += Number(points) || 0;
+                    lockStat.titles.push(String(item.title || item.name || item.offerId || "活动卡片"));
                     Utils.log("🔒", `跳过锁卡：${item.title || item.name || item.offerId || "活动卡片"} +${points}p [${lock.reason}]`);
                     return { skip: true, appOnly: false, levelGated: false };
                 }
@@ -3229,6 +3291,11 @@ const __scBgKeepAlive = (function() {
             if (lockStat.count > 0 || lockStat.app > 0) {
                 RewardsAuto.state.lockedCount = Math.max(RewardsAuto.state.lockedCount, lockStat.count);
                 RewardsAuto.state.lockedPoints = Math.max(RewardsAuto.state.lockedPoints, lockStat.points);
+                // 记住是哪几张（排障用；播报只报张数与分值，不列名字）
+                RewardsAuto.state.lockedTitles = [...new Set([
+                    ...(RewardsAuto.state.lockedTitles || []),
+                    ...lockStat.titles
+                ])];
                 if (lockStat.count > 0) {
                     Utils.log("🔒", `锁卡汇总：${lockStat.count} 张（${lockStat.points} 分）今天做不了，已跳过`);
                 }
@@ -4101,10 +4168,14 @@ const __scBgKeepAlive = (function() {
                 });
             } catch (eEarn) {
                 Utils.log("🔴", `桌面专属任务：拉取 earn 页失败（${eEarn.message}），本轮跳过`);
+                RewardsAuto.state.weeklyQuestLeft = [];
+                RewardsAuto.state.weeklyQuestUnknown = 1;   // 读不到 → 收尾播报里如实说「状态未知」
                 return { found: 0, done: 0, pending: 0 };
             }
             if (!encEarn) {
                 Utils.log("🔴", "桌面专属任务：earn 页返回空，本轮跳过");
+                RewardsAuto.state.weeklyQuestLeft = [];
+                RewardsAuto.state.weeklyQuestUnknown = 1;
                 return { found: 0, done: 0, pending: 0 };
             }
 
@@ -4124,6 +4195,9 @@ const __scBgKeepAlive = (function() {
                     + `（earn 页 ${earnLen} 字节，识别到 ${allQuestIds.length} 个 quest 入口`
                     + (allQuestIds.length ? `：${allQuestIds.join("、")}` : "")
                     + "）");
+                RewardsAuto.state.weeklyQuestLeft = [];
+                RewardsAuto.state.weeklyQuestUnknown = 0;   // 本周确实没有桌面任务 → 不算没完成
+                RewardsAuto.state.weeklyQuestScanned = true; // 「确认没有」也是有效结论
                 return { found: 0, done: 0, pending: 0 };
             }
             if (weeklyIds.length) {
@@ -4138,6 +4212,9 @@ const __scBgKeepAlive = (function() {
             }
 
             let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
+            // 收尾播报要「逐项点名」，所以这里把没做完的卡（含是否未解锁）收集起来
+            const leftAll = [];
+            let unknownParents = 0;
             for (const parentId of questIds) {
                 let state;
                 try {
@@ -4268,12 +4345,13 @@ const __scBgKeepAlive = (function() {
                 let verify = null;
                 try { verify = await this.fetchQuestState(parentId); } catch (_) {}
                 if (verify && verify.ok && verify.allDone) {
-                    Utils.log("🔵", `桌面应用每周专属任务全部完成：${verify.progress}`
-                        + `（本次完成 ${doneHere} 张，失败 ${failedHere} 张）`, true);
+                    Utils.logQuiet("🔵", `桌面应用每周专属任务全部完成：${verify.progress}`
+                        + `（本次完成 ${doneHere} 张，失败 ${failedHere} 张）`);
                 } else if (verify && verify.ok) {
                     const left = verify.rows.filter(r => !r.isCompleted);
                     const leftLocked = left.filter(r => r.isLocked).length;
                     const leftOpen = left.length - leftLocked;
+                    for (const r of left) leftAll.push({ title: r.title, locked: !!r.isLocked });
                     // 只有「确实还有待办」时才提示剩余；不要在同一次里既说失败又说“都处理完了”
                     Utils.log(doneHere > 0 ? "🟢" : (failedHere > 0 ? "🟠" : "🟡"),
                         `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张，`
@@ -4286,12 +4364,18 @@ const __scBgKeepAlive = (function() {
                             : "")
                         + (left.length === 0 ? "，已全部完成" : ""));
                 } else {
+                    unknownParents++;
                     Utils.log("🟡", `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张`
                         + "，但收尾复核读不到页面，本轮不做最终结论");
                 }
             }
+            RewardsAuto.state.weeklyQuestLeft = leftAll;
+            RewardsAuto.state.weeklyQuestUnknown = totalFailed + unknownParents;
+            RewardsAuto.state.weeklyQuestScanned = (totalFailed + unknownParents) === 0;
             if (totalFailed > 0) {
-                Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`, true);
+                // 读取失败会每轮复现，压成 6 小时一条，别每轮都推
+                Utils.notifyKeyed("desktop-read-fail", "🟠",
+                    `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`, 6 * 60 * 60 * 1000);
             }
             return { found: totalFound, done: totalDone, pending: totalPending, failed: totalFailed };
         },
@@ -4728,7 +4812,7 @@ const __scBgKeepAlive = (function() {
             GM_setValue("Config.lastSearchProgress", currentTotal);
             GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
             if (RewardsAuto.state.restrictedTimes >= 3) {
-                Utils.log("🔴", "搜索受限或账号异常，已中断今日搜索！", true);
+                Utils.notifyKeyed("search-restricted", "🔴", "搜索受限或账号异常，已中断今日搜索！", 12 * 60 * 60 * 1000);
                 return true;
             }
             return false;
@@ -4795,7 +4879,7 @@ const __scBgKeepAlive = (function() {
             if (st.notified) return;
             st.notified = true;
             this.save(st);
-            Utils.log("🌐", `Edge 浏览连签任务已完成！（今日 ${EDGE.TARGET_MINUTES} 分钟浏览已记账）`, true);
+            Utils.logQuiet("🌐", `Edge 浏览连签任务已完成！（今日 ${EDGE.TARGET_MINUTES} 分钟浏览已记账）`);
         },
 
         async step() {
@@ -5122,7 +5206,7 @@ const __scBgKeepAlive = (function() {
                 this.signDate = RewardsAuto.state.dateNowNum;
                 GM_setValue("Config.signPoint", totalPoint);
                 this.save();
-                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`, true);
+                Utils.logQuiet("🔵", `签入任务完成！总积分 +${totalPoint}`);
             } else {
                 this.signTimes++;
                 Utils.log("🟡", `签入失败，稍后重试`);
@@ -5226,7 +5310,7 @@ const __scBgKeepAlive = (function() {
             if (verify && verify.progress >= verify.max) {
                 this.readDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`, true);
+                Utils.logQuiet("🔵", `阅读任务完成！共 ${successCount} 篇`);
             } else {
                 this.readTimes++;
                 Utils.log("🟡", `阅读已执行但未完成（${verify ? `${verify.progress}/${verify.max}` : "进度未知"}），下次继续`);
@@ -5272,8 +5356,9 @@ const __scBgKeepAlive = (function() {
                 const ck = await Utils.loginCookies();
                 if (ck === null) {
                 } else if (!ck.hasSession) {
-                    Utils.log("🟡", "Cookie 里没有 Bing 登录标识（MUID=" + ck.hasMuid + "）："
-                        + (ck.names.slice(0, 6).join(",") || "空") + "；网页通道可能不记账", true);
+                    // Cookie 缺登录标识属于环境问题，每轮都会命中，只记日志不推送
+                    Utils.logQuiet("🟡", "Cookie 里没有 Bing 登录标识（MUID=" + ck.hasMuid + "）："
+                        + (ck.names.slice(0, 6).join(",") || "空") + "；网页通道可能不记账");
                 }
             } catch (_) {}
             if (cards.length === 0) {
@@ -5291,10 +5376,10 @@ const __scBgKeepAlive = (function() {
                 } else if (cdp.ok) {
                     Utils.log("🖱️", "CDP 已连接，但没有待处理的应用搜索卡（" + cdp.done + "/" + cdp.total + "）");
                 } else {
-                    Utils.log("🔴", "CDP 不可用（" + cdp.reason + "）：应用内搜索型卡本轮跳过，详见上方提示");
+                    Utils.logQuiet("🔴", "CDP 不可用（" + cdp.reason + "）：应用内搜索型卡本轮跳过，详见上方提示");
                 }
             } catch (e) {
-                Utils.log("🔴", "CDP 异常：" + e.message);
+                Utils.logQuiet("🔴", "CDP 异常：" + e.message);
             }
 
             const shouldSkip = (card) => card.kind === "quiz" && !GM_getValue("Tasks.quiz", true);
@@ -5651,29 +5736,77 @@ const __scBgKeepAlive = (function() {
                 Utils.log("✅", "自动领取待领积分已关闭（Config：Tasks.claimPoints）");
                 return;
             }
+            const skipUntil = Number(GM_getValue("Config.claimSkipUntil", 0)) || 0;
+            if (skipUntil > Date.now()) {
+                const mins = Math.max(1, Math.ceil((skipUntil - Date.now()) / 60000));
+                this.claimSummary = `⏳ 通道冷却 ${mins} 分钟`;
+                Utils.log("⏳", `领取通道上次连续不受理，冷却中（${mins} 分钟后自动再试，待领积分不会丢）`);
+                return;
+            }
             try {
                 try { await API.getCookieHeader(); } catch (_) {}
                 const res = await ClaimPoints.run();
                 if (res.empty) {
                     this.claimSummary = "✅ 无可领";
+                    GM_setValue("Config.claimFailStreak", 0);
+                    GM_setValue("Config.claimSkipUntil", 0);
                     Utils.log("✅", `无可领取积分（${res.reason}）`);
                     return;
                 }
                 if (res.claimed > 0) {
                     this.claimSummary = `✅ +${res.claimed}（余额 ${res.after}）`;
-                    Utils.log("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`, true);
+                    GM_setValue("Config.claimFailStreak", 0);
+                    GM_setValue("Config.claimSkipUntil", 0);
+                    Utils.logQuiet("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`);
+                } else if (res.settled) {
+                    this.claimSummary = "✅ 已领取（池已清空）";
+                    GM_setValue("Config.claimFailStreak", 0);
+                    GM_setValue("Config.claimSkipUntil", 0);
+                    Utils.log("🎁", `待领积分已入账（余额差读不到，但待领池已清空）`);
                 } else if (res.variant) {
                     this.claimSummary = "⏳ 已受理待复核";
                     Utils.log("🟡", `积分领取请求已受理，但余额没有变化（${res.reason}）；下一轮再复核`);
+                } else if (res.unknown) {
+                    // 读不到待领池：既不重试通道，也不推通知，只在日志里留一句，等下一轮再说
+                    this.claimSummary = "⏳ 待领状态未知";
+                    Utils.log("🟡", `待领积分状态读不出来，本轮跳过（${res.reason}）`);
                 } else {
-                    this.claimSummary = "⏳ 未成功";
-                    Utils.log("🟡", `待领积分自动领取未成功：${res.reason}`, true);
-                    this._explainClaimChannels();
+                    const streak = (Number(GM_getValue("Config.claimFailStreak", 0)) || 0) + 1;
+                    GM_setValue("Config.claimFailStreak", streak);
+                    this.claimSummary = `⏳ 未成功（连续 ${streak} 次）`;
+                    if (this._calmClaimFailure(res.reason)) {
+                        // 通道全都没连上（0✗）或全被风控（500✗）：这是「环境没配好」，不是任务结果，
+                        // 和 CDP 未连接属于同一类，只写日志不推送。
+                        Utils.logQuiet("🟡", `待领积分没领成：${res.reason}（通道不可用，本轮不推送通知）`);
+                        this._explainClaimChannels();
+                    } else {
+                        // 真·服务端拒绝（401/403/404 等）才值得打扰用户，且同类提示 6 小时内只推一次
+                        const pushed = Utils.notifyKeyed(
+                            "claim-fail", "🟡",
+                            `待领积分自动领取未成功：${res.reason}`,
+                            6 * 60 * 60 * 1000
+                        );
+                        if (pushed) this._explainClaimChannels();
+                    }
+                    if (streak >= 2) {
+                        const until = Date.now() + 90 * 60 * 1000;
+                        GM_setValue("Config.claimSkipUntil", until);
+                        Utils.log("⏳", `领取通道连续 ${streak} 次不受理，先冷却 90 分钟再试（别每轮都去撞风控）`);
+                    }
                 }
             } catch (e) {
                 this.claimSummary = "⏳ 异常";
                 Utils.log("🟡", `领取积分执行异常: ${e.message}`);
             }
+        },
+
+        // 通道失败原因属于「环境没配好」而不是「服务端拒绝」时返回 true。
+        // 判据：每条通道的结果都是 0（没连上）或 500（Origin 被风控）。
+        // 这种提示跟「CDP 未连接」是一回事，只写日志，不推通知也不发 Webhook。
+        _calmClaimFailure(reason) {
+            const parts = [...String(reason || "").matchAll(/([a-z]+)=(\d+)✗/g)];
+            if (!parts.length) return false;
+            return parts.every(m => m[2] === "0" || m[2] === "500");
         },
 
         _explainClaimChannels() {
@@ -5686,7 +5819,7 @@ const __scBgKeepAlive = (function() {
             lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），并留一个 rewards 页面开着；`);
             lines.push(`② 页面代发通道：在 rewards.bing.com 页面里跑过一次脚本后自动可用（Config.usePageChannel 打开）；`);
             lines.push(`③ 后台直发：Chrome / 旧版 Edge 上通常能过，新版 Edge 上常被拒。`);
-            Utils.log("🟡", lines.join("\n"));
+            Utils.logQuiet("🟡", lines.join("\n"));
         },
 
         async doStreak() {
@@ -5760,6 +5893,89 @@ const __scBgKeepAlive = (function() {
             }
         },
 
+        /* 统一收尾播报：一天里只在这一处决定要不要推送。
+           规则：
+           ① 核心任务（签到/阅读/PC搜索/活动卡片/每日活动/Edge 连签）全部完成，才播报；
+           ② 允许「桌面专属任务 / 带锁的日常任务 / 首页待领取」三类留空，播报里要逐项说明是哪一类、还剩多少
+              （带锁的日常任务只报张数与分值，不列卡片名）；
+           ③ 核心任务没做完 → 只写日志，不推送（避免一天几十条「还差 N 项」）。
+           去重：同一天 + 同样的结论（全部完成 / 同样的遗留项）只推一次；遗留项变了才再推。 */
+        _notifyDailyDigest({ coreOn, corePending, soft, extraDone, earned, totalTime, balance }) {
+            const today = RewardsAuto.state.dateNowNum;
+            if (!coreOn || coreOn.length === 0) return false;
+            if (corePending.length > 0) {
+                Utils.log("📊", `核心任务还有 ${corePending.length} 项没完成`
+                    + `（${corePending.map(i => i.label).join("、")}），本轮不推送`);
+                return false;
+            }
+            const sig = soft.length ? "SOFT:" + soft.map(i => i.text).join("|") : "ALL";
+            const key = `${today}|${sig}`;
+            if (String(GM_getValue("Config.digestKey", "")) === key) return false;
+
+            const sentDate = Number(GM_getValue("Config.digestDate", 0)) || 0;
+            const sentCount = sentDate === today ? (Number(GM_getValue("Config.digestCount", 0)) || 0) : 0;
+            if (sentCount >= 4) {
+                Utils.log("📊", "今天的收尾播报已发过 4 条，之后只写日志（避免反复打扰）");
+                return false;
+            }
+
+            const coreLine = "已完成：" + coreOn.map(i => i.label).join(" ✅ · ") + " ✅";
+            const lines = [];
+            if (soft.length === 0) {
+                lines.push("🎉 今日任务已全部完成");
+                lines.push("");
+                for (const i of coreOn) {
+                    lines.push(`${i.label} · ✅${i.detail ? " " + i.detail : ""}`);
+                }
+                for (const line of (extraDone || [])) lines.push(line);
+            } else {
+                lines.push(`✅ 其它任务已全部完成，还剩 ${soft.length} 项没做完`);
+                lines.push("");
+                for (const i of soft) lines.push(i.text);
+                lines.push("");
+                /* 这三类的共同点：都得靠「浏览器级」通道才能自动完成 ——
+                   锁卡要真实点击（isTrusted），待领取要走同源 server action，普通扩展后台做不到。
+                   紧跟在遗留项后面，避免长通知被系统截断后看不到这句；不带括号补充，省地方。 */
+                lines.push("💡 这几项要自动完成：用 Chrome 跑脚本，或配好 CDP 通道");
+                lines.push("");
+                lines.push(coreLine);
+            }
+            lines.push(`💰 今日 +${earned} · 总积分 ${balance}`);
+            lines.push(`⏱️ 本轮用时 ${totalTime} 秒`);
+
+            GM_setValue("Config.digestKey", key);
+            GM_setValue("Config.digestDate", today);
+            GM_setValue("Config.digestCount", sentCount + 1);
+            Utils.log(soft.length === 0 ? "🎉" : "✅", lines.join("\n"), true);
+            return true;
+        },
+
+        /* 收工判定：每轮结束调一次，决定今天还要不要继续检测。
+           ① 核心任务没做完 → 什么都不做，交给常驻调度跑下一轮；
+           ② 核心做完、三项也了结 → 关掉「持续检测」就收工，开着则继续（保持原语义）；
+           ③ 核心做完、三项还剩 → 再给 SOFT_SETTLE_ROUNDS 轮机会（三项本来就得靠 CDP/Chrome
+              才做得了，没配好就一直做不了），试满仍遗留就今天收工，明天自动恢复。
+           三项只看「本轮还剩几项」，不区分它究竟能不能做成。 */
+        _settleToday(softLeft) {
+            softRounds.setLast(softLeft);
+            if (!isDayComplete()) return;
+            /* 今天已经收工过就不再重复判定（浏览器重启后可能还会走到这里） */
+            if ((Number(GM_getValue("Config.doneDate", 0)) || 0) === RewardsAuto.state.dateNowNum) return;
+            const isKeep = GM_getValue("Config.keep", true);
+            if (softLeft === 0) {
+                softRounds.reset();
+                if (!isKeep) markDayComplete();
+                return;
+            }
+            const n = softRounds.bump();
+            if (n >= SOFT_SETTLE_ROUNDS) {
+                markDayComplete(`三项还剩 ${softLeft} 项没做完（已连试 ${n} 轮），今天先收工，明天自动恢复`, "soft");
+            } else {
+                Utils.log("⏳", `核心任务已完成，三项还剩 ${softLeft} 项 —— 再试 ${SOFT_SETTLE_ROUNDS - n} 轮`
+                    + `（已试 ${n}/${SOFT_SETTLE_ROUNDS}），仍不行今天收工`);
+            }
+        },
+
         async runAll() {
             if (this.running && Date.now() - (this.runningSince || 0) < RUN_STALE) {
                 Utils.log("🟡", "任务正在运行中，请勿重复触发");
@@ -5784,6 +6000,10 @@ const __scBgKeepAlive = (function() {
                 this.promosTimes = 0;
                 RewardsAuto.state.lockedCount = 0;
                 RewardsAuto.state.lockedPoints = 0;
+                RewardsAuto.state.lockedTitles = [];
+                RewardsAuto.state.weeklyQuestLeft = [];
+                RewardsAuto.state.weeklyQuestUnknown = 0;
+                RewardsAuto.state.weeklyQuestScanned = false;
                 RewardsAuto.state.webNoAuth = false;
                 RewardsAuto.state.webFailStreak = 0;
                 RewardsAuto.state.startTime = Utils.getTimestamp();
@@ -5796,7 +6016,7 @@ const __scBgKeepAlive = (function() {
                 const startBalance = await API.getBalance();
                 Utils.log("📊", `初始积分: ${startBalance}`);
                 let isTokenOK = await API.renewToken();
-                if (!isTokenOK) Utils.log("🟡", "Token失败，跳过签入/阅读", true);
+                if (!isTokenOK) Utils.notifyKeyed("token-fail", "🟡", "Token失败，跳过签入/阅读", 6 * 60 * 60 * 1000);
                 const retryDelay = 60000;
                 const maxRetries = 2;
                 const withRetry = async (taskFn, taskName, retries = 0) => {
@@ -5912,15 +6132,54 @@ const __scBgKeepAlive = (function() {
                     const on = key => GM_getValue(key, true);
                     const signOn = on("Tasks.sign"), readOn = on("Tasks.read");
                     const searchOn = on("Tasks.search"), promosOn = on("Tasks.promos");
-                    const goals = [];
-                    if (signOn) goals.push(signOk);
-                    if (readOn) goals.push(readOk);
-                    if (searchOn) goals.push(searchOk);
-                    if (promosOn) goals.push(promosOk);
-                    goals.push(dailyOk);
-                    if (edge) goals.push(edgeOk);
-                    const doneCount = goals.filter(Boolean).length;
-                    const allDone = goals.length > 0 && doneCount === goals.length;
+
+                    /* 核心任务：只有它们全部完成，才算「今天做完了」 */
+                    const core = [
+                        { key: "edge", label: "🌐 Edge 浏览连签", enabled: !!edge, done: edgeOk, detail: edge ? edge.text : "" },
+                        { key: "promos", label: "🧩 活动卡片", enabled: promosOn, done: promosOk, detail: "" },
+                        { key: "daily", label: "✨ 每日活动", enabled: true, done: dailyOk, detail: this.dailySetSummary || "" },
+                        { key: "sign", label: "📅 签到", enabled: signOn, done: signOk, detail: this.streakDays > 0 ? "连签 " + this.streakDays + " 天" : "" },
+                        { key: "read", label: "📋 阅读", enabled: readOn, done: readOk, detail: readProg + "/" + readMaxProg },
+                        { key: "search", label: "🔍 PC 搜索", enabled: searchOn, done: searchOk, detail: info.pc.progress + "/" + info.pc.max },
+                    ];
+                    const coreOn = core.filter(i => i.enabled);
+                    const corePending = coreOn.filter(i => !i.done);
+                    const doneCount = coreOn.length - corePending.length;
+                    const allDone = coreOn.length > 0 && corePending.length === 0;
+
+                    /* 允许留空的三类：桌面专属任务 / 带锁的日常任务 / 首页待领取。
+                       它们没做完不影响「其它都做完了」这个结论，但播报里必须逐项点名。 */
+                    const soft = [];
+                    if (on("Tasks.desktopWeekly")) {
+                        const leftQ = Array.isArray(RewardsAuto.state.weeklyQuestLeft) ? RewardsAuto.state.weeklyQuestLeft : [];
+                        const unknownQ = Number(RewardsAuto.state.weeklyQuestUnknown) || 0;
+                        if (leftQ.length > 0) {
+                            const names = leftQ.slice(0, 8).map(q => q.title + (q.locked ? "（未到解锁日）" : "")).join("、");
+                            soft.push({ key: "desktop",
+                                text: `🖥️ 桌面专属任务 · ⏳ 剩 ${leftQ.length} 张：${names}${leftQ.length > 8 ? " 等" : ""}（需在奖励应用内完成）` });
+                        } else if (unknownQ > 0) {
+                            soft.push({ key: "desktop", text: `🖥️ 桌面专属任务 · ⏳ ${unknownQ} 个入口读不到状态，未能确认是否完成` });
+                        }
+                    }
+                    const lockN = Number(RewardsAuto.state.lockedCount) || 0;
+                    if (lockN > 0) {
+                        /* 只报数量与分值：卡片名和处理方式不进播报（明细见日志），避免一行太长 */
+                        soft.push({ key: "locked",
+                            text: `🔒 带锁的日常任务 · ⏳ ${lockN} 张（${Number(RewardsAuto.state.lockedPoints) || 0} 分）` });
+                    }
+                    if (on("Tasks.claimPoints")) {
+                        const cs = String(this.claimSummary || "");
+                        if (!/^✅/.test(cs)) {
+                            /* 摘要里的「连续 N 次」「冷却 N 分钟」每轮都在变，
+                               直接拿来当播报文本会让去重失效（每轮都算新状态），所以统一归到固定说法。 */
+                            const why = /通道冷却/.test(cs) ? "通道冷却中，稍后自动重试"
+                                : /未成功/.test(cs) ? "通道未受理"
+                                : /已受理/.test(cs) ? "已受理，等待余额确认"
+                                : /状态未知/.test(cs) ? "待领状态读不出来"
+                                : (cs.replace(/^[⏳🟡]\s*/, "") || "本轮未执行");
+                            soft.push({ key: "claim", text: `🎁 首页待领取 · ⏳ ${why}` });
+                        }
+                    }
 
                     /* 关掉的项要写「已关闭」：显示 ⏳ 0/90 会让人误以为没做完 */
                     const rows = [];
@@ -5937,7 +6196,7 @@ const __scBgKeepAlive = (function() {
                     row("🔍 PC 搜索", searchOn, searchOk, info.pc.progress + "/" + info.pc.max);
                     if (mob.max > 0) rows.push("📱 手机搜索 · " + tick(mobOk) + " " + mob.progress + "/" + mob.max);
                     if (RewardsAuto.state.lockedCount > 0) {
-                        rows.push("🔒 锁卡 · " + RewardsAuto.state.lockedCount + " 张（" + RewardsAuto.state.lockedPoints + " 分，需在必应 App 完成）");
+                        rows.push("🔒 锁卡 · " + RewardsAuto.state.lockedCount + " 张（" + RewardsAuto.state.lockedPoints + " 分）");
                     }
                     if (this.claimSummary) rows.push("🎁 领取积分 · " + this.claimSummary);
                     rows.push("💰 今日获取 +" + earned + " · 总积分 " + (info.balance || endBalance));
@@ -5945,14 +6204,30 @@ const __scBgKeepAlive = (function() {
                     /* 标题不带图标：推送图标由 Utils.log 第一参数统一加，
                        否则会拼成「🎉 🎉 今日任务已全部完成！」 */
                     const head = allDone
-                        ? "今日任务已全部完成！"
-                        : "本轮结果 · 还差 " + (goals.length - doneCount) + " 项";
-                    const logMsg = head + "\n\n" + rows.join("\n") + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
-                    Utils.log(allDone ? "🎉" : "📊", logMsg, true);
+                        ? (soft.length ? "核心任务已全部完成，仍有 " + soft.length + " 项待处理" : "今日任务已全部完成！")
+                        : "本轮结果 · 还差 " + corePending.length + " 项";
+                    const logMsg = head + "\n\n" + rows.join("\n")
+                        + "\n\n✅ 达标 " + doneCount + "/" + coreOn.length + " · ⏱️ 用时 " + totalTime + " 秒";
+                    // 明细只进日志；要不要推送由 _notifyDailyDigest 统一裁决（一天最多一条结论）
+                    Utils.log(allDone && soft.length === 0 ? "🎉" : "📊", logMsg);
+                    /* 「全部完成」时要顺带交代桌面任务和待领取这两项，
+                       否则只看核心 6 项会以为脚本把别的漏掉了 */
+                    const extraDone = [];
+                    if (on("Tasks.desktopWeekly") && RewardsAuto.state.weeklyQuestScanned && !soft.some(i => i.key === "desktop")) {
+                        extraDone.push("🖥️ 桌面专属任务 · ✅");
+                    }
+                    if (on("Tasks.claimPoints") && !soft.some(i => i.key === "claim")) {
+                        extraDone.push("🎁 首页待领取 · " + (this.claimSummary || "✅"));
+                    }
+                    this._notifyDailyDigest({
+                        coreOn, corePending, soft, extraDone,
+                        earned, totalTime, balance: info.balance || endBalance
+                    });
+                    this._settleToday(soft.length);
                 } else {
-                    Utils.log("📊", ("本轮执行完成 · ⏱️ 用时 " + totalTime + " 秒（服务端状态读取失败，明细见日志）"), true);
+                    Utils.log("📊", ("本轮执行完成 · ⏱️ 用时 " + totalTime + " 秒（服务端状态读取失败，明细见日志）"));
+                    if (!GM_getValue("Config.keep", true) && isDayComplete() && softRounds.last() <= 0) markDayComplete();
                 }
-                if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
             } catch (e) {
                 if (e && e.regionBlocked) {
                     Utils.log("🛑", `本轮已中止：${e.message}`);
@@ -6025,13 +6300,19 @@ const __scBgKeepAlive = (function() {
         text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
         text += `领取标识：${ActionMap.get("reportClaimAllPoints").slice(0, 12)}…\n\n`;
         const pool = await ClaimPoints.run();
-        text += `待领状态：${pool.empty ? "空池" : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
+        text += `待领状态：${pool.empty ? "空池（无需领取）"
+            : pool.unknown ? "读不出来（页面结构/登录态问题，本轮不动作）"
+            : pool.variant ? `已受理（${pool.variant}）` : "确有可领，但通道未受理"}\n`;
         text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
-        if (!pool.variant && !pool.empty) {
+        if (!pool.variant && !pool.empty && !pool.unknown) {
             text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）并留一个 rewards 页面，`
                 + "这样领取会走页面同源请求；Chrome 上后台直发通常也能过。";
         }
-        if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
+        if (pool.claimed > 0) {
+            GM_setValue("Config.claimFailStreak", 0);
+            GM_setValue("Config.claimSkipUntil", 0);
+            Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
+        }
         return text;
     };
 
@@ -6329,15 +6610,20 @@ const __scBgKeepAlive = (function() {
                 const next = this.plan(now);
                 this.watchdog(now);
                 EdgePacer.maybeReport().catch(() => {});
-                const stopped = !GM_getValue("Config.keep", true)
-                    && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
+                /* 收工后不再触发：关掉「持续检测」时核心做完就收工；
+                   开着时只有「三项试满轮数先收工」（doneReason=soft）才停。 */
+                const softSettle = GM_getValue("Config.doneReason", "") === "soft";
+                const stopped = (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum()
+                    && (!GM_getValue("Config.keep", true) || softSettle);
                 if (!stopped && now >= next && !this.getClaim()) {
                     this.fire(now);
                 } else if (now - this.lastHbLog >= (stopped ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
                     this.lastHbLog = now;
                     GM_setValue("Config.heartbeatAt", now);
                     const tip = stopped
-                        ? "，今日任务已全部完成、检测已停止，明天自动恢复"
+                        ? (softSettle
+                            ? "，核心任务已完成、三项试满轮数先收工，明天自动恢复"
+                            : "，今日任务已全部完成、检测已停止，明天自动恢复")
                         : this.isBusy(now)
                             ? `，本轮正在执行中（已 ${Math.round((now - ((this.getState() || {}).at || now)) / 60000)} 分钟）`
                             : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
@@ -6412,19 +6698,65 @@ const __scBgKeepAlive = (function() {
             edgeDone;
     };
 
-    const markDayComplete = () => {
+    /* 核心任务做完后，三项（桌面专属 / 锁卡 / 待领取）再试几轮 ——
+       它们本来就得靠 CDP/Chrome 才做得了，没配好时一直轮询没有意义。
+       3 轮 ≈ 1 小时（常驻调度 20 分钟一轮）。 */
+    const SOFT_SETTLE_ROUNDS = 3;
+
+    /* 当天已经「带遗留项」试过的轮数 + 上一轮三项还剩几项。
+       都按日期存，跨天自动归零，浏览器重启也不丢。 */
+    const softRounds = {
+        count() {
+            const today = RewardsAuto.state.dateNowNum;
+            return (Number(GM_getValue("Config.softSettleDate", 0)) || 0) === today
+                ? (Number(GM_getValue("Config.softSettleRounds", 0)) || 0) : 0;
+        },
+        bump() {
+            const n = this.count() + 1;
+            GM_setValue("Config.softSettleDate", RewardsAuto.state.dateNowNum);
+            GM_setValue("Config.softSettleRounds", n);
+            return n;
+        },
+        reset() {
+            GM_setValue("Config.softSettleDate", RewardsAuto.state.dateNowNum);
+            GM_setValue("Config.softSettleRounds", 0);
+        },
+        /* 上一轮三项还剩几项；-1 表示今天还没跑过（状态未知） */
+        last() {
+            const today = RewardsAuto.state.dateNowNum;
+            return (Number(GM_getValue("Config.softLastDate", 0)) || 0) === today
+                ? (Number(GM_getValue("Config.softLast", -1))) : -1;
+        },
+        setLast(n) {
+            GM_setValue("Config.softLastDate", RewardsAuto.state.dateNowNum);
+            GM_setValue("Config.softLast", Number(n) || 0);
+        }
+    };
+
+    const markDayComplete = (reason, kind) => {
         const today = RewardsAuto.state.dateNowNum;
         const prev = Number(GM_getValue("Config.doneDate", 0)) || 0;
         GM_setValue("Config.doneDate", today);
-        if (prev !== today) Utils.log("💤", "今日任务已全部完成，已停止检测（明天自动恢复）", true);
+        /* kind="soft"：核心做完、三项试满轮数先收工 —— 这种「收工」在开着持续检测时也要停，
+           因为它不属于「全部完成」（全部完成才会按 Config.keep 继续）。 */
+        GM_setValue("Config.doneReason", kind || "");
+        if (prev !== today) {
+            Utils.logQuiet("💤", reason || "今日任务已全部完成，已停止检测（明天自动恢复）");
+        }
     };
 
     const init = () => {
         bootstrap();
 
         const isKeep = GM_getValue("Config.keep", true);
-        if (!isKeep && isDayComplete()) {
-            markDayComplete();
+        const doneToday = (Number(GM_getValue("Config.doneDate", 0)) || 0) === RewardsAuto.state.dateNowNum;
+        /* 关掉「持续检测」时，核心任务做完就能收工 —— 但三项还得再试几轮：
+           上一轮已确认三项都了结，或已经试满 SOFT_SETTLE_ROUNDS 轮，才允许直接停下。 */
+        const settled = softRounds.last() === 0 || softRounds.count() >= SOFT_SETTLE_ROUNDS;
+        const stopNow = (doneToday && (!isKeep || GM_getValue("Config.doneReason", "") === "soft"))
+            || (!isKeep && isDayComplete() && settled);
+        if (stopNow) {
+            if (!doneToday) markDayComplete();
             Sched.finish(false);
             return;
         }
