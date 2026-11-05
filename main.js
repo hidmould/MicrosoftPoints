@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.6.0
+// @version      1.6.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅月度打卡
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -1007,6 +1007,8 @@ const __scBgKeepAlive = (function() {
         _lastNotifyAt: 0,
         TTL_OK: 120 * 1000,
         TTL_BLOCK: 45 * 1000,
+        /* 关掉「锁定国区」时只做参考用的地区探测，缓存久一点，别为选市场每轮发五次请求 */
+        TTL_ADVISORY: 10 * 60 * 1000,
         PROBE_TIMEOUT: 8000,
         NOTIFY_GAP: 10 * 60 * 1000,
 
@@ -1149,6 +1151,9 @@ const __scBgKeepAlive = (function() {
                 ok: reasons.length === 0,
                 reasons,
                 signals,
+                /* 真实出口国家（取第一个拿到国家码的探测源）——
+                   关掉「锁定国区」时也要用它来选市场，不能一律按 cn 发 */
+                cc: (coded[0] && coded[0].cc) || "",
                 ip: (ipHolder && ipHolder.ip) || "",
                 ipInfo: cnText ? `🌏所在地区：${cnText}` : "",
                 coded: coded.length,
@@ -1159,12 +1164,19 @@ const __scBgKeepAlive = (function() {
         },
 
         async check({ fresh = false, quiet = false } = {}) {
-            if (!this.enabled()) {
-                return { ok: true, skipped: true, reasons: [], signals: [], ip: "", ipInfo: "", coded: 0, known: 0, probes: 0, failed: [] };
-            }
+            const enabled = this.enabled();
             const now = Date.now();
-            if (!fresh && this._cache && (now - this._cache.at) < (this._cache.ok ? this.TTL_OK : this.TTL_BLOCK)) {
-                return this._cache;
+            /* 关闭「锁定国区」时仍然探测一次，但只看地区、不拦截：
+               dapi 的 country / mkt 要靠它，否则一律按 cn 市场发，挂梯子时反而不记账。
+               为了少发请求，这种「参考用」探测缓存久一点。 */
+            const ttl = enabled
+                ? (this._cache && this._cache.ok ? this.TTL_OK : this.TTL_BLOCK)
+                : this.TTL_ADVISORY;
+            if (!fresh && this._cache && (now - this._cache.at) < ttl) {
+                /* 关掉锁国区时，缓存里可能还留着「上一次开启时判定的拦截结论」，
+                   这里必须改成放行，否则关掉开关还会被旧缓存拦住。 */
+                return enabled ? this._cache
+                    : Object.assign({}, this._cache, { ok: true, reasons: [], advisory: true });
             }
             if (this._inflight) return this._inflight;
 
@@ -1178,12 +1190,24 @@ const __scBgKeepAlive = (function() {
                     raw = raw.concat(await this._probeAll());
                     verdict = this._judge(raw);
                 }
-                if (verdict.known === 0) {
+                if (verdict.known === 0 && enabled) {
                     verdict.ok = false;
                     verdict.reasons.unshift("无法确认出口地区（所有探测都失败）");
                 }
+                if (!enabled) {
+                    /* 关掉锁定国区 = 不拦代理：结论一律放行，只留下地区信息 */
+                    verdict.ok = true;
+                    verdict.reasons = [];
+                    verdict.advisory = true;
+                }
                 verdict.at = Date.now();
                 this._cache = verdict;
+
+                if (!enabled) {
+                    if (verdict.cc) RewardsAuto.state.region = verdict.cc;
+                    if (verdict.ip) RewardsAuto.state.ip = verdict.ip;
+                    return verdict;
+                }
 
                 if (verdict.ok) {
                     RewardsAuto.state.region = "CN";
@@ -1217,13 +1241,15 @@ const __scBgKeepAlive = (function() {
 
         async guard(where = "任务") {
             const v = await this.check();
+            /* 开关在运行中被关掉、或缓存/并发里带着旧结论时，一律放行 */
+            if (!this.enabled()) return v;
             if (!v.ok) throw new RegionBlockedError(`出口异常（${where}）：${v.reasons[0] || "未知原因"}`);
             return v;
         },
 
         async allow() {
             const v = await this.check();
-            return v.ok;
+            return !this.enabled() || v.ok;
         }
     };
 
@@ -2635,7 +2661,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613",
-                    headers: Utils.appHeaders(token, { country: "cn" })
+                    headers: Utils.appHeaders(token, { country: RewardsAuto.region() })
                 }));
                 if (Utils.isJSON(res)) {
                     const promos = JSON.parse(res).response?.promotions || [];
@@ -2768,7 +2794,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: RewardsAuto.appConfig.dapiMeUrl,
-                    headers: Utils.appHeaders(token, { country: GM_getValue("Config.lock", true) ? "cn" : "us" })
+                    headers: Utils.appHeaders(token, { country: RewardsAuto.region() })
                 }));
                 if (Utils.isJSON(res)) {
                     const list = JSON.parse(res).response?.promotions || [];
@@ -3005,7 +3031,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=613",
-                    headers: Utils.appHeaders(token, { country: "cn" })
+                    headers: Utils.appHeaders(token, { country: RewardsAuto.region() })
                 }));
                 if (Utils.isJSON(res)) {
                     const data = JSON.parse(res);
@@ -3055,7 +3081,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=105",
-                    headers: Utils.appHeaders(token, { country: "cn" })
+                    headers: Utils.appHeaders(token, { country: RewardsAuto.region() })
                 }));
                 if (Utils.isJSON(res)) {
                     const data = JSON.parse(res);
@@ -4678,7 +4704,8 @@ const __scBgKeepAlive = (function() {
         },
 
         async getSearchPage(query, isMobile = false) {
-            const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
+            /* 市场跟着实际出口走：大陆出口用 zh-CN，海外出口交给 bing 默认，别硬塞 cn 市场 */
+            const mkt = RewardsAuto.region() === "cn" ? "&mkt=zh-CN" : "";
             const deviceType = isMobile ? "m" : "d";
             return Utils.xhr({
                 url: `https://${RewardsAuto.state.host}/search?q=${encodeURIComponent(query)}&form=QBLH${mkt}`,
@@ -4695,7 +4722,8 @@ const __scBgKeepAlive = (function() {
         async reportSearch(html, query, isMobile = false) {
             try {
                 const ig = this.extractIG(html) || Utils.getRandomUUID();
-                const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
+                /* 市场跟着实际出口走：大陆出口用 zh-CN，海外出口交给 bing 默认，别硬塞 cn 市场 */
+            const mkt = RewardsAuto.region() === "cn" ? "&mkt=zh-CN" : "";
                 const params = `q=${encodeURIComponent(query)}&form=QBLH${mkt}`;
                 const deviceType = isMobile ? "m" : "d";
                 const headers = {
@@ -4723,7 +4751,8 @@ const __scBgKeepAlive = (function() {
         },
 
         async checkRegion() {
-            if (!RegionGuard.enabled()) return true;
+            /* 关掉「锁定国区」时也要跑一次：结论一律放行，但顺手把真实出口地区记进
+               RewardsAuto.state.region，后面的 country / mkt 才不会一律按 cn 发。 */
             const v = await RegionGuard.check({ fresh: true });
             if (v.ok) return true;
             if (!v.ipInfo) await this.getIPInfo();
@@ -6458,9 +6487,12 @@ const __scBgKeepAlive = (function() {
 
     const diagRegion = async () => {
         const v = await RegionGuard.check({ fresh: true });
+        const enabled = RegionGuard.enabled();
         let text = "🌍 网络出口检测\n\n";
-        if (v.skipped) {
-            text += "「锁定国区」已关闭：不做出口限制，也不拦代理。\n\n";
+        if (!enabled) {
+            text += "「锁定国区」已关闭：不做出口限制，也不拦代理。\n";
+            text += `当前出口地区：${(v.cc || RewardsAuto.region("?")).toUpperCase()}`
+                + `（市场按它走，dapi 用 country=${RewardsAuto.region("us")}）\n\n`;
         } else {
             text += `结论：${v.ok ? "✅ 出口在大陆，可以继续" : "⛔ 已拦截，任务不会上报"}\n`;
             if (v.reasons.length) text += `原因：${v.reasons.join("；")}\n`;
