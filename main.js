@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.10.1
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务（纯 HTTP，一周一次做满 8/8）、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅等级门槛卡（已解锁）优先走应用内搜索上报、失败再走 CDP 真实点击（全程后台运行）、✅同源通道自适应（新版 Edge 可跑）
+// @version      1.2.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -1545,11 +1545,18 @@ const __scBgKeepAlive = (function() {
         },
 
         warn(reason) {
+            /* 只写后台日志，不推送（通知/webhook）：CDP 没连上是常态，不该占用推送通道。
+               仍然保留 30 分钟节流，避免每一轮都往控制台刷一屏启用方法。 */
             const now = Date.now();
             const first = !this._warnedAt || now - this._warnedAt > this.WARN_GAP;
+            if (!first) {
+                Utils.log("🟡", "CDP 仍未连接：" + reason + "（30 分钟内不再重复提示）");
+                return;
+            }
+            this._warnedAt = now;
             const msg = [
                 "CDP 未连接：" + reason,
-                "应用内搜索型卡片（如「穿上你的舞鞋」「发光真菌」）需要浏览器级真实点击才能记账。",
+                "应用内搜索型卡片（带锁标识）需要浏览器级真实点击才能记账。",
                 "页面内 JS 模拟点击无效 —— isTrusted=false 时浏览器直接拒绝导航，这是安全边界。",
                 "",
                 "【启用方法】用桌面上的「Rewards Edge」快捷方式启动（或粘下面这条命令）：",
@@ -1557,12 +1564,7 @@ const __scBgKeepAlive = (function() {
                 "",
                 "它会在一个独立小窗口打开（不影响你平时的 Edge）。首次需要在该窗口登录 rewards.bing.com。"
             ].join(String.fromCharCode(10));
-            if (first) {
-                this._warnedAt = now;
-                Utils.log("🔴", msg, true);
-            } else {
-                Utils.log("🟡", "CDP 仍未连接：" + reason + "（30 分钟内不再重复提示）");
-            }
+            Utils.log("🔴", msg);
         },
 
         async available() {
@@ -4836,6 +4838,7 @@ const __scBgKeepAlive = (function() {
     const TaskManager = {
         signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
+        claimSummary: "",
         running: false, runningSince: 0,
 
         init() {
@@ -4848,6 +4851,7 @@ const __scBgKeepAlive = (function() {
             this.searchDate = tasks.search || 0;
             this.streakDays = tasks.streakDays || 0;
             this.signPoint = GM_getValue("Config.signPoint", -1);
+            this.claimSummary = "";
         },
 
         save() {
@@ -5415,6 +5419,7 @@ const __scBgKeepAlive = (function() {
         async doClaimPoints() {
             await RegionGuard.guard("领取积分");
             if (!GM_getValue("Tasks.claimPoints", true)) {
+                this.claimSummary = "⏭️ 已关闭";
                 Utils.log("✅", "自动领取待领积分已关闭（Config：Tasks.claimPoints）");
                 return;
             }
@@ -5422,18 +5427,23 @@ const __scBgKeepAlive = (function() {
                 try { await API.getCookieHeader(); } catch (_) {}
                 const res = await ClaimPoints.run();
                 if (res.empty) {
+                    this.claimSummary = "✅ 无可领";
                     Utils.log("✅", `无可领取积分（${res.reason}）`);
                     return;
                 }
                 if (res.claimed > 0) {
+                    this.claimSummary = `✅ +${res.claimed}（余额 ${res.after}）`;
                     Utils.log("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`, true);
                 } else if (res.variant) {
+                    this.claimSummary = "⏳ 已受理待复核";
                     Utils.log("🟡", `积分领取请求已受理，但余额没有变化（${res.reason}）；下一轮再复核`);
                 } else {
+                    this.claimSummary = "⏳ 未成功";
                     Utils.log("🟡", `待领积分自动领取未成功：${res.reason}`, true);
                     this._explainClaimChannels();
                 }
             } catch (e) {
+                this.claimSummary = "⏳ 异常";
                 Utils.log("🟡", `领取积分执行异常: ${e.message}`);
             }
         },
@@ -5651,30 +5661,68 @@ const __scBgKeepAlive = (function() {
                 const earned = (startBalance > 0 && endBalance > 0) ? (endBalance - startBalance) : 0;
                 const info = await API.getRewardsInfo();
                 if (info) {
-                    const signOk = this.signDate === RewardsAuto.state.dateNowNum;
-                    const readOk = this.readDate === RewardsAuto.state.dateNowNum;
-                    const searchOk = info.pc.progress >= info.pc.max;
-                    const promosOk = this.promosDate === RewardsAuto.state.dateNowNum;
-                    let logMsg = `签到\t\t${signOk ? '✅' : '❌'}\n`;
+                    /* 汇总的图标约定：一枚图标只表达一件事
+                       🌐 Edge 浏览连签  🧩 活动卡片  ✨ 每日活动  📅 签到  📋 阅读
+                       🔍 PC 搜索  📱 手机搜索  🔒 锁卡  🎁 领取积分  💰 积分总账
+                       ✅ 达标  ⏳ 未达标/进行中  ⏭️ 今日已跳过 */
+                    const today = RewardsAuto.state.dateNowNum;
                     const readProg = info.readProgress ?? RewardsAuto.state.readProgress ?? 0;
                     const readMaxProg = info.readMax ?? RewardsAuto.state.readMax ?? 30;
-                    logMsg += `阅读\t\t${readOk ? '✅' : '❌'} ${readProg}/${readMaxProg}\n`;
-                    const pacer = SEARCH_PACER.summary();
-                    logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}${searchOk ? '' : `（每轮从 ${pacer.min}s 起步${pacer.last ? `，上轮 ${pacer.last.attempts} 搜/${pacer.last.credits} 记` : ''}）`}\n`;
-                    logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
-                    logMsg += `每日活动\t${dailySetRes ? '✅' : '❌'} ${this.dailySetSummary || ''}\n`;
-                    if (RewardsAuto.state.lockedCount > 0) {
-                        logMsg += `锁卡\t\t🔒 ${RewardsAuto.state.lockedCount} 张（${RewardsAuto.state.lockedPoints} 分，需在必应 App 完成）\n`;
-                    }
-                    logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
+                    const signOk = this.signDate === today;
+                    /* 进度已满也算达标：标记位可能因刷新/跨实例丢失，服务端进度才是事实 */
+                    const readOk = this.readDate === today || (readMaxProg > 0 && readProg >= readMaxProg);
+                    const searchOk = info.pc.progress >= info.pc.max;
+                    const promosOk = this.promosDate === today;
+                    const dailyOk = !!dailySetRes;
                     const edge = EdgeStreak.summary();
-                    if (edge) logMsg += `Edge连签\t${edge.done ? '✅' : edge.skipped ? '⏭️' : '⏳'} ${edge.text}\n`;
-                    logMsg += `今日获取\t+${earned}\n`;
-                    logMsg += `总积分\t\t${info.balance || endBalance}`;
-                    RewardsAuto.state.sendMSG = logMsg;
-                    Utils.log("📊", logMsg, true);
+                    const edgeOk = !edge || edge.done || edge.skipped;
+                    const mob = info.mobile || {};
+                    const mobOk = !mob.max || mob.progress >= mob.max;
+                    const tick = ok => (ok ? '✅' : '⏳');
+
+                    /* 只把「开启的任务」计入达标分母，关掉的项不该被算成差一项 */
+                    const on = key => GM_getValue(key, true);
+                    const signOn = on("Tasks.sign"), readOn = on("Tasks.read");
+                    const searchOn = on("Tasks.search"), promosOn = on("Tasks.promos");
+                    const goals = [];
+                    if (signOn) goals.push(signOk);
+                    if (readOn) goals.push(readOk);
+                    if (searchOn) goals.push(searchOk);
+                    if (promosOn) goals.push(promosOk);
+                    goals.push(dailyOk);
+                    if (edge) goals.push(edgeOk);
+                    const doneCount = goals.filter(Boolean).length;
+                    const allDone = goals.length > 0 && doneCount === goals.length;
+
+                    /* 关掉的项要写「已关闭」：显示 ⏳ 0/90 会让人误以为没做完 */
+                    const rows = [];
+                    const row = (label, enabled, ok, detail) => rows.push(
+                        label + " · " + (!enabled ? "⏭️ 已关闭" : tick(ok) + (detail ? " " + detail : "")));
+
+                    rows.push("🌐 Edge 浏览连签 · " + (edge
+                        ? (edge.done ? "✅" : edge.skipped ? "⏭️" : "⏳") + " " + edge.text
+                        : "⏭️ 已关闭"));
+                    row("🧩 活动卡片", promosOn, promosOk, "");
+                    row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
+                    row("📅 签到", signOn, signOk, this.streakDays > 0 ? "连签 " + this.streakDays + " 天" : "");
+                    row("📋 阅读", readOn, readOk, readProg + "/" + readMaxProg);
+                    row("🔍 PC 搜索", searchOn, searchOk, info.pc.progress + "/" + info.pc.max);
+                    if (mob.max > 0) rows.push("📱 手机搜索 · " + tick(mobOk) + " " + mob.progress + "/" + mob.max);
+                    if (RewardsAuto.state.lockedCount > 0) {
+                        rows.push("🔒 锁卡 · " + RewardsAuto.state.lockedCount + " 张（" + RewardsAuto.state.lockedPoints + " 分，需在必应 App 完成）");
+                    }
+                    if (this.claimSummary) rows.push("🎁 领取积分 · " + this.claimSummary);
+                    rows.push("💰 今日获取 +" + earned + " · 总积分 " + (info.balance || endBalance));
+
+                    /* 标题不带图标：推送图标由 Utils.log 第一参数统一加，
+                       否则会拼成「🎉 🎉 今日任务已全部完成！」 */
+                    const head = allDone
+                        ? "今日任务已全部完成！"
+                        : "本轮结果 · 还差 " + (goals.length - doneCount) + " 项";
+                    const logMsg = head + "\n\n" + rows.join("\n") + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
+                    Utils.log(allDone ? "🎉" : "📊", logMsg, true);
                 } else {
-                    Utils.log("🎉", `任务执行完成！用时 ${totalTime} 秒`, true);
+                    Utils.log("📊", ("本轮执行完成 · ⏱️ 用时 " + totalTime + " 秒（服务端状态读取失败，明细见日志）"), true);
                 }
                 if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
             } catch (e) {
@@ -5819,80 +5867,6 @@ const __scBgKeepAlive = (function() {
             .then(() => TaskManager.runAll())
             .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
             .finally(() => Sched.finish(true));
-    });
-
-    const diagClaimRequest = async () => {
-        const PARENT = "WW_pcparent_RewardsApp_weekly_Exclusive_Novw1_2026_punchcard";
-        const EARN = "https://rewards.bing.com/earn";
-        const QUEST = "https://rewards.bing.com/earn/quest/" + PARENT;
-        const APP_UA = RewardsAuto.desktopAppHeaders["user-agent"];
-        const ACTION = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
-        const DPL = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
-
-        Utils.log("🧪", "=== 交卷诊断开始 ===");
-        Utils.log("🧪", `上下文=${Utils.hasDOM() ? "页面(" + location.hostname + ")" : "后台/service_worker"}`
-            + ` action=${String(ACTION).slice(0, 12)}… dpl=${DPL || "无"}`);
-
-        let card = null;
-        try {
-            const snap = await API.fetchQuestCards(PARENT);
-            card = (snap.cards && snap.cards[0]) || null;
-            Utils.log("🧪", card ? `取到子卡：${card.title}（${snap.cards.length} 张待办）` : "该周已无待办子卡，用占位 hash 测通道");
-        } catch (e) {
-            Utils.log("🧪", `拉 quest 页失败：${e.message}`);
-        }
-        const hash = card ? card.hash : "0".repeat(64);
-        const offerId = card ? card.offerId : "WW_pcchild4_urlreward_Tuesday_RewardsApp_weekly_Exclusive_Novw1_2026_punchcard";
-        const body = JSON.stringify([hash, 11, { offerid: offerId, isPromotional: "$undefined", timezoneOffset: "-480" }]);
-
-        const earnTree = Utils.routerStateTree("earn");
-        const questTree = Utils.questRouterStateTree(PARENT);
-
-        const cases = [
-            { n: "① earn+origin+appUA（参考脚本写法）", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA, "x-rewards-source": "msrewards-desktop", "next-router-state-tree": earnTree } },
-            { n: "② earn+origin 但无 x-rewards-source", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA, "next-router-state-tree": earnTree } },
-            { n: "③ earn 无origin+appUA", url: EARN, h: { "user-agent": APP_UA, "x-rewards-source": "msrewards-desktop", "next-router-state-tree": earnTree } },
-            { n: "④ earn+origin 用普通浏览器UA", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": RewardsAuto.ua.pc, "next-router-state-tree": earnTree } },
-            { n: "⑤ quest+origin+appUA", url: QUEST, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA, "x-rewards-source": "msrewards-desktop", "next-router-state-tree": questTree } },
-            { n: "⑥ 不带 next-router-state-tree", url: EARN, h: { origin: "https://rewards.bing.com", "user-agent": APP_UA } },
-        ];
-
-        const lines = [];
-        for (const c of cases) {
-            const headers = {
-                "content-type": "text/plain;charset=UTF-8",
-                "next-action": ACTION,
-                "referer": c.url,
-                "accept": "text/x-component",
-                "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
-                ...(DPL ? { "x-deployment-id": DPL } : {}),
-                ...c.h
-            };
-            let r;
-            try {
-                r = await API._rawXhr({ method: "POST", url: c.url, headers, data: body });
-            } catch (e) {
-                r = { status: 0, text: String(e.message), cost: 0 };
-            }
-            const t = String(r.text || "");
-            let kind;
-            if (r.status === 0) kind = "未发出";
-            else if (/login\.live\.com|oauth20_authorize/i.test(t)) kind = "登录页";
-            else if (/<title>Bing<\/title>|sc_error/i.test(t)) kind = "风控页";
-            else if (/[0-9a-f]+:E\{|"digest"\s*:/.test(t)) kind = "flight错误帧";
-            else if (t.includes("1:true")) kind = "受理";
-            else kind = "其他";
-            lines.push(`  ${c.n} → ${r.status} ${kind} ${String(r.cost).slice(0, 5)}s`);
-            if (r.status !== 200 && t) lines.push(`      body=${t.replace(/\s+/g, " ").slice(0, 100)}`);
-            await Utils.delay(1200);
-        }
-        Utils.log("🧪", "=== 诊断结果 ===\n" + lines.join("\n"));
-        Utils.log("🧪", "判定：哪一行出现「受理」= 那种组合可用；全 500 且都是风控页 = 后台身份被拒，只能用页面通道。");
-    };
-    GM_registerMenuCommand("🧪 诊断：交卷请求", () => {
-        Promise.resolve()
-            .then(diagClaimRequest)
-            .catch(e => Utils.log("🔴", `交卷诊断异常：${e && e.message ? e.message : e}`));
     });
 
     const diagReleaseLock = () => {
