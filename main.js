@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.1
+// @version      1.4.2
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅月度打卡
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -1602,26 +1602,9 @@ const __scBgKeepAlive = (function() {
             if (!list) return null;
             const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
             if (hit) return hit;
-            if (!GM_getValue("Config.cdpAllowNewTab", false)) return null;
-            try {
-                const res = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: "PUT",
-                        url: this.base() + "/json/new?" + encodeURIComponent("https://rewards.bing.com/earn"),
-                        onload: r => resolve(r.responseText),
-                        onerror: e => reject(new Error((e && e.error) || "new tab failed")),
-                        ontimeout: () => reject(new Error("timeout")),
-                        timeout: 8000
-                    });
-                });
-                const j = JSON.parse(res);
-                await Utils.delay(3000);
-                return j;
-            } catch (_) {
-                return null;
-            }
+            // 【已禁用自动开标签】只使用当前已开着的 rewards 页面，不再新开浏览器标签。
+            return null;
         },
-
         async connect(wsUrl) {
             if (this._ws) {
                 try { this._ws.close(); } catch (_) {}
@@ -3304,53 +3287,70 @@ const __scBgKeepAlive = (function() {
             return isBingSearch && hasSign;
         },
 
+        // 应用内搜索上报（首页待领取 / 等级门槛卡用）。
+        //
+        // 【不再打开标签、不再导航】旧实现为了在 bing 域内发 /rewardsapp/* 请求，
+        // 会把浏览器导航到搜索结果页再跳回来，每张卡来回两次，标签刷屏。
+        // 实测结论（_probe/test-tree-matrix.mjs + 实际跑批）：
+        //   · punchcard 子卡：直接交卷就能记账，根本不需要这条上报；
+        //   · 这条上报只对首页「等级门槛卡」有意义，而它在后台直发也常被拒，
+        //     所以这里退回「尽力而为」的后台直发，不再动用户的标签页。
+        // 返回 true 只代表请求发出去了，不代表记账成功 —— 记账仍由调用方复核。
         async reportAppSearchForCard(href) {
             const raw = String(href || "").trim();
             if (!/bing\.com\/search/i.test(raw)) return false;
-            const { origin, pathname, search } = (() => {
-                try { const u = new URL(raw); return { origin: u.origin, pathname: u.pathname, search: u.search }; }
-                catch (_) { return {}; }
-            })();
-            if (!origin) return false;
-            const query = origin + pathname + search;
-            const params = search.replace(/^\?/, "");
-            const today = new Date();
+            let u;
+            try { u = new URL(raw); } catch (_) { return false; }
+            if (!u || !u.origin) return false;
+
+            const query = u.origin + u.pathname + u.search;
+            const params = u.search.replace(/^\?/, "");
             const p2 = n => String(n).padStart(2, "0");
-            const baseHeaders = {
-                "user-agent": RewardsAuto.desktopAppHeaders["user-agent"],
-                "cookie": `_Rwho=u=d&ts=${today.getFullYear()}-${p2(today.getMonth() + 1)}-${p2(today.getDate())}`,
-            };
+            const today = new Date();
+            const rwho = `_Rwho=u=d&ts=${today.getFullYear()}-${p2(today.getMonth() + 1)}-${p2(today.getDate())}`;
+            const appUA = RewardsAuto.desktopAppHeaders["user-agent"];
 
             let ig = "";
             try {
-                const serp = await Utils.xhr({ url: query, headers: baseHeaders });
+                const serp = await Utils.xhr({ url: query, headers: { "user-agent": appUA, "cookie": rwho } });
                 const flat = String(serp || "").replace(/\s/g, "");
                 const m = flat.match(/,IG:"([^"]+)"/);
                 if (m) ig = m[1];
             } catch (_) {}
             if (!ig) ig = Utils.getRandomUUID();
-            const reportHeaders = { ...baseHeaders, "referer": query };
 
+            const hdr = {
+                "user-agent": appUA,
+                "cookie": rwho,
+                "referer": query,
+                "content-type": "application/x-www-form-urlencoded"
+            };
+            let sent = 0;
             try {
                 await Utils.xhr({
                     method: "POST",
-                    url: `${origin}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
-                    headers: { ...reportHeaders, "content-type": "application/x-www-form-urlencoded" },
+                    url: `${u.origin}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
+                    headers: hdr,
                     data: "wb=1%3bi%3d1%3bv%3d1"
                 });
+                sent++;
             } catch (_) {}
-
             try {
                 await Utils.xhr({
                     method: "POST",
-                    url: `${origin}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
-                    headers: { ...reportHeaders, "content-type": "application/x-www-form-urlencoded" },
+                    url: `${u.origin}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
+                    headers: hdr,
                     data: `url=${encodeURIComponent(query)}&V=web`
                 });
+                sent++;
             } catch (_) {}
+
+            if (!sent) return false;
+            if (GM_getValue("Config.debugDAPI", false)) {
+                Utils.log("🔬", `应用搜索上报（后台直发，不保证记账）：${query.slice(0, 80)}`);
+            }
             return true;
         },
-
         async _claimLevelGatedViaAppSearch(card, { diag = [], name = "" } = {}) {
             const label = name || card.title || card.offerId;
             const offerId = card.offerId;
@@ -3604,66 +3604,12 @@ const __scBgKeepAlive = (function() {
             return at > 0 && (Date.now() - at) < 40 * 1000;
         },
 
+        // 【已禁用自动开标签】页面代发通道改为「只借用已存在的 rewards 页面」。
+        // 原来这里会用 GM_openInTab 自动开一个临时 rewards 页来代发请求，
+        // 每轮都可能弹一个标签，很扰人。现在只认已经开着的页面：
+        // 没有就返回 null，调用方会自然退回 xhr 通道（脚本仍能正常跑）。
         async _ensurePageChannel() {
-
-            if (!GM_getValue("Config.allowOpenTab", false)) return null;
-
-            const openedAt = Number(GM_getValue("Config.pageOpenedAt", 0)) || 0;
-            const reallyAlive = this._pageChannelAlive();
-            if (!reallyAlive && openedAt && (Date.now() - openedAt) < 10 * 60 * 1000) {
-                for (let i = 0; i < 12; i++) {
-                    await Utils.delay(500);
-                    if (this._pageChannelAlive()) return null;
-                }
-                return null;
-            }
-            if (this._openingPage) {
-                for (let i = 0; i < 40; i++) {
-                    await Utils.delay(500);
-                    if (this._pageChannelAlive()) return null;
-                }
-                return null;
-            }
-            this._openingPage = true;
-            GM_setValue("Config.pageOpenedAt", Date.now());
-            try {
-                Utils.log("🖥️", "需要借 rewards 页面代发请求，正在打开一个临时页面…");
-
-                let opened = false;
-                const url = "https://rewards.bing.com/earn?mpq=" + Date.now();
-                for (const opts of [
-                    { active: false, insert: true, setParent: true },
-                    { active: false },
-                    undefined
-                ]) {
-                    try {
-                        if (opts) GM_openInTab(url, opts);
-                        else GM_openInTab(url);
-                        opened = true;
-                        break;
-                    } catch (e) {
-                    }
-                }
-                if (!opened) {
-                    Utils.log("🔴", "打开代发页面失败（浏览器拒绝编辑标签页），只能退回后台直发");
-                    return null;
-                }
-                for (let i = 0; i < 90; i++) {
-                    await Utils.delay(500);
-                    if (this._pageChannelAlive()) {
-                        Utils.log("✅", "代发页面已就绪");
-                        return null;
-                    }
-                    if (i === 19) Utils.log("🖥️", "代发页面还在加载（已等 10 秒）…");
-                    if (i === 49) Utils.log("🖥️", "代发页面还在加载（已等 25 秒）…");
-                }
-                Utils.log("🟡", "代发页面 45 秒内没有就绪。可能原因："
-                    + "① 脚本未注入该页（@background 会让页面永不注入，需用 @crontab）；"
-                    + "② 打开的标签页被浏览器冻结/未获得执行机会。本轮改用后台直发。");
-                return null;
-            } finally {
-                this._openingPage = false;
-            }
+            return null;
         },
 
         async viaPageChannel(url, headers, body, timeoutMs = 15000) {
@@ -3777,28 +3723,124 @@ const __scBgKeepAlive = (function() {
             return [...found.keys()];
         },
 
-        async fetchQuestCards(parentId) {
-            const url = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
-            const html = await Utils.xhr({
-                url,
-                headers: RewardsAuto.desktopAppHeaders
-            });
-            if (!html) return { parentId, url, html: "", cards: [] };
-            const text = this._flightText(html);
-            const cards = [];
-            for (const item of this._flightItems(text, "[A-Za-z0-9]*_pcchild[^\"]+")) {
-                if (!item.offerId || !item.hash) continue;
-                cards.push({
-                    offerId: item.offerId,
-                    hash: item.hash,
-                    title: String(item.ariaLabel || item.linkText || item.offerId).replace(/^\s*\d+\s*[分点]?\s*,?\s*/, "").trim() || item.offerId,
-                    isCompleted: item.isCompleted === true,
-                    isLocked: item.isLocked === true,
-                    href: item.href || item.destination || ""
+        // ============================================================
+        // quest 详情页真实状态解析（唯一可信来源）
+        //
+        // 实测结论（见 _probe/ 下的探针脚本）：
+        //   ① 服务端只把「未完成」的子卡放进 RSC payload（带 offerId/hash/PUBL）。
+        //      已完成的子卡会被整段省略（连 offerId 都没有）。
+        //      所以「解析到 0 张卡」绝不能当成「全部完成」——旧代码正是这样报假成功的。
+        //   ② 页面顶部有权威计数器「状态: N/M 个任务」，只有 N===M 才算真的做完。
+        //   ③ 每张卡的图标（实测）：
+        //        已完成  = 图标容器带 bg-statusSuccessRewardsBg（里面是对勾 path m1.147 2.919）
+        //        未解锁  = 行内显式 "isLocked":true，图标是空圈 border-ctrlChoiceBaseStrokeRest
+        //        可领取  = 空圈但**没有** isLocked，且带 offerId + hash
+        //   ④ 坑：CTA 按钮上的 "M6.25 4.5A1.75" 是「外链箭头」不是锁，
+        //      拿它判锁会把每张卡都当成锁定（1.4.0 备份里就是这么写的）。
+        // ============================================================
+        _questCheckIcon: /bg-statusSuccessRewardsBg/,
+        _questLockRing: /border-ctrlChoiceBaseStrokeRest/,
+
+        _parseQuestState(html) {
+            const raw = String(html || "");
+            const flat = this._flightText(raw);
+            const out = {
+                progress: "", done: 0, total: 0, allDone: false,
+                unavailable: false, signedOut: false, rows: [], htmlLen: raw.length
+            };
+
+            out.signedOut = /<title>登录<\/title>|Sign in to your account|oauth20_authorize/i.test(flat);
+            out.unavailable = /此优惠对你不可用/.test(flat);
+
+            const pm = flat.match(/状态:[\s\S]{0,240}?(\d+)\s*\/\s*(\d+)\s*个任务/);
+            if (pm) {
+                out.done = Number(pm[1]);
+                out.total = Number(pm[2]);
+                out.progress = out.done + "/" + out.total;
+            }
+
+            // 每张卡 = 一个 "flex flex-row gap-2" 行容器；用行起点切片，避免跨行串味。
+            const MARK = "\"className\":\"flex flex-row gap-2";
+            const starts = [];
+            let at = 0;
+            while ((at = flat.indexOf(MARK, at)) !== -1) {
+                starts.push(at);
+                at += MARK.length;
+            }
+            for (let i = 0; i < starts.length; i++) {
+                const seg = flat.slice(starts[i],
+                    i + 1 < starts.length ? starts[i + 1] : starts[i] + 20000);
+                const tm = seg.match(/"h3",null,\{"className":"[^"]*","children":"((?:[^"\\]|\\.)*)"/);
+                if (!tm) continue;
+                let title = tm[1];
+                try { title = JSON.parse("\"" + title + "\""); } catch (_) {}
+
+                const icon = seg.slice(0, 900);
+                const isCompleted = this._questCheckIcon.test(icon);
+                const explicitLock = /"isLocked":true/.test(seg);
+                const isLocked = !isCompleted && (explicitLock || !this._questLockRing.test(icon));
+
+                const offerId = (seg.match(/"offerId":"([^"]+)"/) || [])[1] || "";
+                const hash = (seg.match(/"hash":"([^"]+)"/) || [])[1] || "";
+                let href = (seg.match(/"href":"((?:[^"\\]|\\.)*)"/) || [])[1] || "";
+                try { href = JSON.parse("\"" + href + "\""); } catch (_) {}
+
+                out.rows.push({
+                    title: title, offerId: offerId, hash: hash, href: href,
+                    isCompleted: isCompleted, isLocked: isLocked,
+                    // 只要服务端下发了 offerId + hash，就具备交卷条件。
+                    // 页面上的「锁定」只是显示态，不构成交卷障碍（实测锁定的卡也能交卷，
+                    // 是否真记账由交卷后的进度复核决定），所以这里不再用 isLocked 卡住。
+                    claimable: !isCompleted && !!offerId && !!hash
                 });
             }
-            return { parentId, url, html, text, cards };
+
+            // 只有「计数器满」且「所有行都显示对勾」才算全部完成；
+            // 解析不到任何行时，只要计数器不满就绝不算完成。
+            out.allDone = out.total > 0 && out.done >= out.total
+                && out.rows.every(r => r.isCompleted);
+            return out;
         },
+
+
+        // 读一次 quest 页的权威状态。优先用 CDP 页面同源 fetch（带登录态、同 Origin），
+        // 失败再退回后台 GM_xmlhttpRequest。
+        async fetchQuestState(parentId) {
+            const url = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
+            let html = "", via = "";
+
+            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+                try {
+                    if (await CDP.available()) {
+                        const page = await CDP.earnPage();
+                        if (page && page.webSocketDebuggerUrl) {
+                            if (!CDP._ws || CDP._ws.readyState !== 1) {
+                                await CDP.connect(page.webSocketDebuggerUrl);
+                            }
+                            const got = await CDP.fetchPageText(url);
+                            if (got) { html = got; via = "cdp"; }
+                        }
+                    }
+                } catch (_) {}
+            }
+            if (!html) {
+                try {
+                    html = await Utils.xhr({ url, headers: RewardsAuto.desktopAppHeaders });
+                    via = "xhr";
+                } catch (_) {}
+            }
+            if (!html) {
+                return { parentId, url, via: via || "none", ok: false, html: "",
+                    progress: "", done: 0, total: 0, allDone: false,
+                    unavailable: false, signedOut: false, rows: [] };
+            }
+
+            const st = this._parseQuestState(html);
+            return Object.assign({ parentId, url, via, ok: true, html }, st);
+        },
+
+
+
 
         async _rawXhr(options) {
             const start = Date.now();
@@ -3926,14 +3968,19 @@ const __scBgKeepAlive = (function() {
             return `HTTP ${st}（${kind}，${res ? res.cost.toFixed(2) : "?"}秒）${body ? " body=" + body : ""}`;
         },
 
+        // ============================================================
+        // 交卷：只有「响应明确 true」+「页面计数器真的 +1」才算成功。
+        // 旧代码两层都太松：解析到 0 张卡当完成、只看 accepted 不看进度变化。
+        // ============================================================
         async submitQuestCard(parentId, card) {
             const pageUrl = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
             const nextAction = RewardsAuto._nextAction || GM_getValue("Config.nextAction", ActionMap.FALLBACK.reportActivity);
             const dpl = RewardsAuto._dpl || GM_getValue("Config.dpl", "");
+            const tz = String(new Date().getTimezoneOffset());
             const payload = JSON.stringify([card.hash, 11, {
                 offerid: card.offerId,
                 isPromotional: "$undefined",
-                timezoneOffset: "-480"
+                timezoneOffset: tz
             }]);
             const baseHeaders = {
                 "content-type": "text/plain;charset=UTF-8",
@@ -3946,68 +3993,97 @@ const __scBgKeepAlive = (function() {
                 ...RewardsAuto.desktopAppHeaders
             };
 
-            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+            // 交卷前先记下计数器，事后用它判断「服务端到底有没有记账」
+            let before = null;
+            try { before = await this.fetchQuestState(parentId); } catch (_) {}
+
+            const tries = [];
+            const attempt = async (label, runner) => {
+                let r;
                 try {
-                    if (await CDP.available()) {
-                        const page = await CDP.earnPage();
-                        if (page && page.webSocketDebuggerUrl) {
-                            if (!CDP._ws || CDP._ws.readyState !== 1) {
-                                await CDP.connect(page.webSocketDebuggerUrl);
-                            }
-                            const r = await CDP.claimInPage(pageUrl, baseHeaders, payload);
-                            if (r.accepted && this._actionLooksAccepted(r.text)) {
-                                Utils.log("🖥️", "  经由 CDP 页面通道交卷成功");
-                                return { accepted: true, raw: r.text, status: r.status, variant: "CDP页面通道" };
-                            }
-                            Utils.log("🟡", `CDP 页面通道未受理（HTTP ${r.status}）：${String(r.text).replace(/\s+/g, " ").slice(0, 90)}`);
-                        }
-                    }
-                } catch (eCdp) {
-                    Utils.log("🟡", `CDP 页面通道异常：${eCdp.message}`);
-                } finally {
-                    try { CDP.close(); } catch (_) {}
+                    r = await runner();
+                } catch (e) {
+                    r = { accepted: false, status: 0, text: String((e && e.message) || e) };
                 }
-            }
-
-            if (GM_getValue("Config.usePageChannel", false)) {
-                let tabId = null;
-                if (!this._pageChannelAlive()) {
-                    tabId = await this._ensurePageChannel();
-                }
-                if (this._pageChannelAlive()) {
-                    const viaPage = await this.viaPageChannel(pageUrl, baseHeaders, payload);
-                    if (viaPage && !viaPage.error) {
-                        const accepted = viaPage.ok && this._actionLooksAccepted(viaPage.text);
-                        if (accepted) {
-                            this._claimPageTab = true;
-                            return { accepted: true, raw: viaPage.text, status: viaPage.status, variant: "页面通道" };
-                        }
-                        Utils.log("🖥️", `页面通道未受理（HTTP ${viaPage.status}），改试后台直发`);
-                    } else {
-                        Utils.log("🟡", "页面通道没有返回结果（页面可能未加载完），改试后台直发");
-                    }
-                }
-            }
-
-            const probed = await this._probeQuestVariant(pageUrl, parentId, card);
-            if (probed.variant) {
-                return {
-                    accepted: true,
-                    raw: probed.result.text,
-                    status: probed.result.status,
-                    variant: probed.variant.name
-                };
-            }
-            const last = probed.result;
-            return {
-                accepted: false,
-                raw: last ? last.text : "",
-                status: last ? last.status : 0,
-                variant: last ? last.variant : "",
-                tried: probed.tried,
-                diag: last ? this._questDiag(last) : "无响应"
+                tries.push(`${label}=${r.status}${r.accepted ? "✓" : "✗"}`);
+                return r;
             };
+
+            let hit = null;
+
+            // ① CDP 页面通道（Origin 同源，最稳）
+            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+                const r = await attempt("cdp", async () => {
+                    if (!(await CDP.available())) return { accepted: false, status: 0, text: "CDP 不可用" };
+                    const page = await CDP.earnPage();
+                    if (!page || !page.webSocketDebuggerUrl) return { accepted: false, status: 0, text: "没有 rewards 页面" };
+                    if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
+                    const res = await CDP.claimInPage(pageUrl, baseHeaders, payload);
+                    return {
+                        accepted: res.status >= 200 && res.status < 300 && this._actionLooksAccepted(res.text),
+                        status: res.status, text: res.text
+                    };
+                });
+                if (r.accepted) hit = Object.assign({ variant: "CDP页面通道" }, r);
+                // 这里不能 CDP.close()：后面还要用它做「进度复核」，
+                // 关掉连接会让之后所有 fetchPageText 静默失败（旧版就踩过这个坑）。
+            }
+
+            // ② 页面代发服务
+            if (!hit && GM_getValue("Config.usePageChannel", false)) {
+                const r = await attempt("proxy", async () => {
+                    if (!this._pageChannelAlive()) return { accepted: false, status: 0, text: "页面代发不在线" };
+                    if (!this._claimPageTab) await this._ensurePageChannel();
+                    if (!this._pageChannelAlive()) return { accepted: false, status: 0, text: "页面代发不在线" };
+                    const res = await this.viaPageChannel(pageUrl, baseHeaders, payload);
+                    if (!res || res.error) return { accepted: false, status: 0, text: String((res && res.error) || "无返回") };
+                    return {
+                        accepted: res.status >= 200 && res.status < 300 && this._actionLooksAccepted(res.text),
+                        status: res.status, text: res.text
+                    };
+                });
+                if (r.accepted) hit = Object.assign({ variant: "页面通道" }, r);
+            }
+
+            // ③ 后台直发（Origin 是扩展源，常被 500，仅兜底）
+            if (!hit) {
+                const variants = this._questSubmitVariants();
+                for (const v of variants) {
+                    const r = await attempt(v.name, () => this._submitQuestOnce(pageUrl, parentId, card, v));
+                    if (r.accepted) { hit = Object.assign({ variant: v.name }, r); break; }
+                    if (r.status === 401 || r.status === 403) break;
+                }
+            }
+
+            if (!hit) {
+                const last = tries.length ? tries[tries.length - 1] : "-";
+                return { accepted: false, confirmed: false, raw: "", status: 0,
+                    tried: tries, diag: `交卷未受理（${last}）` };
+            }
+
+            // ★ 复核：必须看到页面计数器比交卷前 +1，才算真的记账
+            await Utils.randomDelay(2500, 4000);
+            let after = null;
+            try { after = await this.fetchQuestState(parentId); } catch (_) {}
+            if (!after || !after.ok) {
+                return Object.assign({}, hit, {
+                    confirmed: false,
+                    note: "已受理但复核失败（读不到页面），按待定处理"
+                });
+            }
+            const grew = (before && before.ok) ? after.done > before.done : false;
+            const rowNowDone = after.rows.some(r => r.title === card.title && r.isCompleted);
+            if (grew || rowNowDone) {
+                return Object.assign({}, hit, { confirmed: true, beforeProgress: before && before.progress, afterProgress: after.progress });
+            }
+            return Object.assign({}, hit, {
+                confirmed: false,
+                beforeProgress: before && before.progress,
+                afterProgress: after.progress,
+                note: `交卷返回受理，但账没记上（进度 ${before && before.progress || "?"} → ${after.progress || "?"}）`
+            });
         },
+
 
         async runDesktopWeeklyQuests() {
             Utils.log("🖥️", "扫描桌面奖励应用专属任务…");
@@ -4063,112 +4139,161 @@ const __scBgKeepAlive = (function() {
 
             let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
             for (const parentId of questIds) {
-                let snap;
+                let state;
                 try {
-                    snap = await this.fetchQuestCards(parentId);
-                } catch (eSnap) {
-                    Utils.log("🔴", `桌面专属任务：读取 ${parentId} 失败（${eSnap.message}），跳过这一个`);
+                    state = await this.fetchQuestState(parentId);
+                } catch (eSt) {
+                    Utils.log("🔴", `桌面专属任务：读取 ${parentId} 失败（${eSt.message}），跳过这一个`);
                     totalFailed++;
                     continue;
                 }
-                if (snap.cards.length === 0) {
-                    Utils.log("✅", `桌面专属任务本周已全部完成：${parentId}`);
+                if (!state || !state.ok) {
+                    Utils.log("🔴", `桌面专属任务：${parentId} 页面读不到内容，本轮跳过（不作任何“已完成”判断）`);
+                    totalFailed++;
                     continue;
                 }
-                totalFound += snap.cards.length;
-                const open = snap.cards.filter(c => !c.isCompleted);
-                if (open.length === 0) {
-                    Utils.log("✅", `桌面专属任务本周已全部完成：${parentId}`);
+                if (state.signedOut) {
+                    Utils.log("🔴", "桌面专属任务：quest 页是登录页，请重新登录后下一轮再试");
+                    totalFailed++;
+                    continue;
+                }
+                if (state.unavailable) {
+                    Utils.log("🟡", `桌面专属任务：${parentId} 对该账号不可用（页面提示「此优惠对你不可用」），跳过`);
                     continue;
                 }
 
-                const unlocked = open.filter(c => !c.isLocked);
-                if (unlocked.length === 0) {
-                    Utils.log("🖥️", `桌面专属任务：${open.length} 张待办全部未解锁（未到对应星期），本轮不处理`);
+                // 进度必须来自页面计数器；计数器读不到就不能下任何结论
+                if (!state.total) {
+                    if (state.unavailable || !state.rows.length) {
+                        // 页面里既没有卡片、也没有计数器：这个入口当前无活动可做
+                        // （实测 WW_pcparent_FY27_Duolingo3M_punchcard 就是这种空壳，直接落地首页）。
+                        // 这本身不说明“已完成”，所以绝不写完成日志。
+                        Utils.log("🖥️", `桌面专属任务：${parentId} 当前没有活动面板（`
+                            + `回包 ${state.html ? state.html.length : 0} 字节，通道 ${state.via}），跳过`);
+                        continue;
+                    }
+                    Utils.log("🟡", `桌面专属任务：${parentId} 读不到「N/M 个任务」计数器`
+                        + `（回包 ${state.html ? state.html.length : 0} 字节，通道 ${state.via}），`
+                        + `为避免误判，本轮跳过这个入口`);
+                    totalFailed++;
+                    continue;
+                }
+
+                totalFound += state.rows.length;
+                Utils.log("🖥️", `桌面专属任务 ${parentId}：进度 ${state.progress}`
+                    + `（页面解析 ${state.rows.length} 张，通道 ${state.via}）`);
+
+                if (state.allDone) {
+                    Utils.log("✅", `桌面专属任务已全部完成：${state.progress}（${parentId}）`);
+                    continue;
+                }
+
+                const open = state.rows.filter(r => !r.isCompleted);
+                // 【用户要的行为】不要死盯着星期/解锁与否。
+                // 服务端只要给了 offerId + hash，就说明这张卡此刻是「可交卷」的，
+                // 就去尝试完成它；是否真的记分由交卷后的进度复核来裁决。
+                // 这样既不会漏掉同时解锁的多张卡，也不会把「能做的」当「没到日子」跳过。
+                const actionable = open.filter(r => !!r.offerId && !!r.hash);
+                const lockedOpen = open.filter(r => r.isLocked);
+                if (actionable.length === 0) {
+                    if (open.length === 0) {
+                        Utils.log("✅", `桌面专属任务：当前进度 ${state.progress}，没有待办卡`);
+                    } else {
+                        Utils.log("🖥️", `桌面专属任务：${open.length} 张待办都没有下发 hash（`
+                            + `需在奖励应用内完成，脚本无法直接交卷），本轮不处理`
+                            + `：${open.map(r => r.title).join("、")}`);
+                    }
                 } else {
-                    Utils.log("🖥️", `桌面奖励应用专属任务：${unlocked.length} 张已解锁待办`
-                        + `（另有 ${open.length - unlocked.length} 张未解锁，不处理）（${parentId}）`);
-                    for (const c of unlocked) Utils.log("🖥️", `  · [已解锁] ${c.title}`);
+                    Utils.log("🖥️", `桌面奖励应用专属任务：${actionable.length} 张可交卷（进度 ${state.progress}`
+                        + (lockedOpen.length ? `，其中 ${lockedOpen.length} 张页面显示为锁定，照样尝试` : "")
+                        + `）（${parentId}）`);
+                    for (const c of actionable) {
+                        Utils.log("🖥️", `  · [${c.isLocked ? "显示锁定" : "已解锁"}] ${c.title}`);
+                    }
                 }
 
                 let doneHere = 0, failedHere = 0;
-                for (const card of unlocked) {
-
-                    if (card.href && /^https?:/i.test(card.href)) {
-                        try {
-                            const reported = await this.reportAppSearchForCard(card.href);
-                            if (reported) Utils.log("🖥️", `  已上报应用搜索：${card.title}`);
-                        } catch (_) {}
-                        await Utils.randomDelay(1500, 2500);
-                    }
-
-                    const maxAttempts = 2;
-                    let r = null;
-                    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-                        try {
-                            r = await this.submitQuestCard(parentId, card);
-                        } catch (eSubmit) {
-                            r = { accepted: false, raw: String(eSubmit.message), status: 0 };
-                        }
-                        if (r.accepted) break;
-                        if (attempt < maxAttempts) {
-                            Utils.log("🟡", `桌面任务交卷未受理（第 ${attempt} 次）：${card.title}`
-                                + ` [已试形态 ${(r.tried || []).join(",") || r.variant || "-"}]，稍后重试`);
-                            await Utils.randomDelay(5000, 9000);
-                        }
-                    }
-                    if (!r || !r.accepted) {
+                for (const card of actionable) {
+                    if (!card.claimable) {
                         failedHere++;
-                        Utils.log("🟠", `桌面任务交卷失败：${card.title}`
-                            + ` → ${r && r.diag ? r.diag : this._questReason(r && r.raw)}`);
-                        if (r && r.tried) {
-                            Utils.log("🖥️", `  形态尝试结果：${r.tried.join(" / ")}`);
+                        continue;
+                    }
+
+                    // 真做不了就不要硬交卷：先确认这张卡此刻仍然可领取
+                    let guard;
+                    try {
+                        guard = await this.fetchQuestState(parentId);
+                    } catch (_) {}
+                    const fresh = guard && guard.ok ? guard.rows.find(r => r.title === card.title) : null;
+                    if (fresh && fresh.isCompleted) {
+                        Utils.log("✅", `  该卡已完成，跳过：${card.title}`);
+                        continue;
+                    }
+                    // 【实测结论】这张卡不需要「先打开目标页 / 上报应用搜索」。
+                    // 对照实验（_probe/test-tree-matrix.mjs）：
+                    //   真正解锁的卡 → 直接交卷回 1:true，进度 0/5 → 1/5，真记账；
+                    //   页面显示锁定的卡 → 无论访问 / 上报 / 交卷，进度都不动。
+                    // 之前那套「导航到 bing 页再上报」只会让浏览器多开标签、来回跳页，
+                    // 对是否记账没有帮助，所以整段移除。
+                    // 记账与否仍然只看下面交卷后的进度复核，不做任何假设。
+
+                    Utils.log("🎯", `  交卷：${card.title}（${card.offerId}）`);
+                    let r = null;
+                    try {
+                        r = await this.submitQuestCard(parentId, card);
+                    } catch (eSubmit) {
+                        r = { accepted: false, confirmed: false, raw: String(eSubmit.message), status: 0 };
+                    }
+
+                    if (!r || !r.confirmed) {
+                        failedHere++;
+                        const why = r && r.note ? r.note
+                            : r && r.diag ? r.diag : this._questReason(r && r.raw);
+                        Utils.log("🟠", `桌面任务未确认成功：${card.title} → ${why}`);
+                        if (r && r.tried && r.tried.length) {
+                            Utils.log("🖥️", `  形态尝试：${r.tried.join(" / ")}`);
                         }
                         continue;
                     }
-                    if (r.variant && r.variant !== "无origin") {
-                        Utils.log("🖥️", `  本次用「${r.variant}」形态交卷成功`);
-                    }
-                    await Utils.randomDelay(2000, 4000);
-                    let after;
-                    try {
-                        after = await this.fetchQuestCards(parentId);
-                    } catch (eAfter) {
-                        Utils.log("🟡", `桌面任务已受理但复核失败（${eAfter.message}）：${card.title}，按待定处理`);
-                        totalPending++;
-                        continue;
-                    }
-                    const stillThere = after.cards.some(c => c.offerId === card.offerId && !c.isCompleted);
-                    if (stillThere) {
-                        totalPending++;
-                        Utils.log("🟡", `桌面任务已受理但未记账（服务端没加分）：${card.title}`);
-                    } else {
-                        doneHere++;
-                        Utils.log("🟢", `桌面专属任务完成：${card.title}`);
-                    }
+
+                    doneHere++;
+                    Utils.log("🟢", `桌面专属任务完成（服务端已记账）：${card.title}`
+                        + (r.beforeProgress ? `　进度 ${r.beforeProgress} → ${r.afterProgress}` : "")
+                        + (r.variant ? `　[${r.variant}]` : ""));
+                    await Utils.randomDelay(2000, 3500);
                 }
                 totalDone += doneHere;
-                let verify = null;
-                try {
-                    verify = await this.fetchQuestCards(parentId);
-                } catch (_) {}
-                if (verify && verify.cards.every(c => c.isCompleted)) {
-                    Utils.log("🔵", `桌面应用每周专属任务全部完成（本次完成 ${doneHere} 张）`, true);
-                } else {
 
-                    const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !c.isLocked) : [];
-                    const leftLocked = verify ? verify.cards.filter(c => !c.isCompleted && c.isLocked).length : 0;
+                // 收尾用「页面计数器」说话，不再用「解析到 0 张卡」当完成
+                let verify = null;
+                try { verify = await this.fetchQuestState(parentId); } catch (_) {}
+                if (verify && verify.ok && verify.allDone) {
+                    Utils.log("🔵", `桌面应用每周专属任务全部完成：${verify.progress}`
+                        + `（本次完成 ${doneHere} 张，失败 ${failedHere} 张）`, true);
+                } else if (verify && verify.ok) {
+                    const left = verify.rows.filter(r => !r.isCompleted);
+                    const leftLocked = left.filter(r => r.isLocked).length;
+                    const leftOpen = left.length - leftLocked;
+                    // 只有「确实还有待办」时才提示剩余；不要在同一次里既说失败又说“都处理完了”
+                    Utils.log(doneHere > 0 ? "🟢" : (failedHere > 0 ? "🟠" : "🟡"),
+                        `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张，`
+                        + `目前进度 ${verify.progress || "?"}`
+                        + (leftOpen > 0
+                            ? `，仍剩 ${leftOpen} 张未完成（${left.filter(r => !r.isLocked).map(r => r.title).join("、")}）`
+                            : "")
+                        + (leftLocked > 0
+                            ? `（另有 ${leftLocked} 张页面显示未解锁：${left.filter(r => r.isLocked).map(r => r.title).join("、")}）`
+                            : "")
+                        + (left.length === 0 ? "，已全部完成" : ""));
+                } else {
                     Utils.log("🟡", `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张`
-                        + (leftUnlocked.length > 0
-                            ? `，仍剩 ${leftUnlocked.length} 张已解锁未完成（${leftUnlocked.map(c => c.title).join("、")}）`
-                            : (leftLocked > 0 ? "，今日已解锁的都处理完了" : ""))
-                        + (leftLocked > 0 ? `（另有 ${leftLocked} 张未解锁，到对应那天自动处理）` : ""));
+                        + "，但收尾复核读不到页面，本轮不做最终结论");
                 }
             }
             if (totalFailed > 0) {
                 Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`, true);
             }
-            return { found: totalFound, done: totalDone, pending: totalPending };
+            return { found: totalFound, done: totalDone, pending: totalPending, failed: totalFailed };
         },
 
         _questReason(raw) {
