@@ -28,18 +28,60 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 
 > 授权码**只能用一次**。若提示"换取 Token 失败"，多半是码已过期或被用过，重新走一遍上面的步骤。状态可用菜单 **📊 Token状态** 查看。
 
-## ⚠️ 必须在谷歌浏览器（Chrome）才能完成的任务
+## Edge / Chrome 都能完成（1.3.1 起）
 
-脚本大部分任务用 Edge 也能跑，但下面**三类任务需在Chrome上完成**。
+**不存在「必须在 Chrome 才能完成的任务」**，也不需要降级 Edge 或装 MV2 扩展。
 
+### 真正的原因
 
-所以：**想拿满这三类分数，请用 Chrome 跑本脚本。**
+必应的交卷 / 领取接口只接受 `Origin: https://rewards.bing.com`：
 
-| 任务 | 在 Chrome | 在 Edge |
+| 发送方 | Origin | 结果 |
 | --- | --- | --- |
-| 带锁 🔒 卡片(已解锁) | ✅  | ✅ 需先配好 CDP (不建议配置CDP) |
-| 桌面端任务 | ✅ | ❌ |
-| 首页待领取 | ✅ | ❌ |
+| rewards 页面里的 `fetch` | `https://rewards.bing.com` | **200 记账** ✅ |
+| 扩展后台 / offscreen document | `chrome-extension://<id>` | 500 风控页 ❌ |
+
+实测：同一份 MV3 扩展在 **Chrome 里从后台发也一样 500**。所以问题从来不是浏览器品牌。
+
+### 解决办法：CDP 同源通道
+
+脚本保持 `@background`（**后台常驻，关掉所有页面也会按 20 分钟一轮自动跑**），
+同时通过调试端口在真实页面里发请求。
+
+**一次性配置**（详见 `Rewards-Edge-CDP.ps1`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Rewards-Edge-CDP.ps1
+```
+
+它会：
+1. 建一个独立配置目录 `%LOCALAPPDATA%\Microsoft\Edge\CDPUserData`（约 200KB，不影响日常 Edge）
+2. 从 `Profile 6` 复制登录态（Cookies + Local State + Preferences）
+3. 以 `--remote-debugging-port=9224` 启动 Edge 并打开 rewards 页
+
+之后**保持这个窗口开着**即可，无需重复登录。
+
+### 怎么确认生效
+
+脚本日志里应出现：
+
+```
+CDP 调试端口 9224：✅ 可连
+🖥️   经由 CDP 页面通道交卷成功
+```
+
+### 通道优先级
+
+```
+local（脚本被注入 rewards 页时）→ page（CDP）→ proxy → xhr（仅兜底）
+```
+
+| 任务 | 状态 |
+| --- | --- |
+| 带锁 🔒 卡片(已解锁) | ✅ |
+| 桌面端任务（每周专属） | ✅ |
+| 首页待领取 | ✅ |
+| 月度打卡 | ✅ 1.3.1 起 |
 
 ## 说明
 

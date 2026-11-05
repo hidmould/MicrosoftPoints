@@ -1,11 +1,22 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
+// @version      1.3.1
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅月度打卡
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
+// 保持后台常驻：关闭所有页面后依然会按 Sched 定时跑。
+//
+// 【关于必应 server action 的 500 风控页】
+// 交卷/领取这类 server action，服务端只认 Origin === https://rewards.bing.com。
+// 从扩展后台（service worker / offscreen）发出时 Origin 是 chrome-extension://<id>，恒回 500。
+// 可用的发送方只有两种，脚本已全部内置并按 local → page → proxy → xhr 依次尝试：
+//   local : 脚本被注入到 rewards 页面里时，用页面原生 fetch（Origin 同源）——最稳
+//   page  : 借 CDP 调试端口，在真实 rewards 页面里发（需 --remote-debugging-port 启动浏览器）
+//   proxy : 借同源页面里驻留的代发服务中转
+//   xhr   : 扩展后台直发，Origin 是扩展源，必应常回 500，仅作兜底
+// 想不配 CDP 也能做这三类任务，唯一途径是让脚本能注入 rewards 页（改普通脚本或配 CDP）。
 // @connect      bing.com
 // @connect      login.live.com
 // @connect      rewards.bing.com
@@ -1534,7 +1545,7 @@ const __scBgKeepAlive = (function() {
         launchCommand() {
             const port = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
             const profile = String(GM_getValue("Config.cdpProfileDir", "") || "%LOCALAPPDATA%\\Microsoft\\Edge\\CDPUserData");
-            const profDir = String(GM_getValue("Config.cdpProfileName", "") || "Profile 2");
+            const profDir = String(GM_getValue("Config.cdpProfileName", "") || "Profile 6");
             return "& \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\""
                 + " --remote-debugging-port=" + port
                 + " --remote-allow-origins=* --user-data-dir=\""
@@ -1888,7 +1899,19 @@ const __scBgKeepAlive = (function() {
         },
 
         channelOrder() {
-            return ["page", "proxy", "xhr"];
+            // local：脚本自己就在 rewards 页面里 → 页面原生 fetch（最稳，Origin 同源）
+            // page ：借 CDP 调试端口在真实页面里发（需 --remote-debugging-port）
+            // proxy：借同源页面驻留的代发服务中转（需页面注入）
+            // xhr  ：扩展后台直发，Origin 是 chrome-extension://<id>，必应常回 500，仅作兜底
+            const order = [];
+            try {
+                if (Utils.hasDOM() && typeof location !== "undefined"
+                    && new RegExp("(^|\\.)rewards\\.bing\\.com$", "i").test(String(location.hostname || ""))) {
+                    order.push("local");
+                }
+            } catch (_) {}
+            order.push("page", "proxy", "xhr");
+            return order;
         },
         summary() {
             const i = this.info();
@@ -3705,7 +3728,22 @@ const __scBgKeepAlive = (function() {
         },
 
         QUESTS: {
-            weeklyPrefix: /WW_pcparent_RewardsApp_weekly_Exclusive/i
+            // 桌面奖励应用「每周专属」（8 张子卡，按星期逐日解锁）
+            weeklyPrefix: /WW_pcparent_RewardsApp_weekly_Exclusive/i,
+            // 月度打卡（如 ENWW_pcparent_FY27_BingMonthlyPC_Nov_punchcard），前缀各月/各区不统一，
+            // 所以只按 punchcard 这个特征识别，再排除掉已由 weeklyPrefix 负责的那些。
+            monthlyHint: /punchcard/i,
+            monthlyExclude: /RewardsApp_weekly_Exclusive/i
+        },
+
+        // 把 earn 页上识别出的 quest 入口分成两类：weekly（周专属）与 monthly（其它 punchcard）
+        _classifyQuests(ids) {
+            const weekly = [], monthly = [];
+            for (const id of ids || []) {
+                if (this.QUESTS.weeklyPrefix.test(id)) weekly.push(id);
+                else if (this.QUESTS.monthlyHint.test(id) && !this.QUESTS.monthlyExclude.test(id)) monthly.push(id);
+            }
+            return { weekly, monthly };
         },
 
         _questLinksFromEarn(earnHtml) {
@@ -3764,6 +3802,16 @@ const __scBgKeepAlive = (function() {
 
         async _rawXhr(options) {
             const start = Date.now();
+            // 先试同源原生 fetch：脚本在 rewards 页面里时，浏览器会把 Origin 写成
+            // https://rewards.bing.com，server action 才会被受理（后台直发恒 500）。
+            if (this._sameOriginNow && this._sameOriginNow() && /^https:\/\/rewards\.bing\.com\//i.test(String(options && options.url || ""))) {
+                try {
+                    const r = await this._sameOriginFetch(options.url, options.headers, options.data);
+                    if (r.status > 0) {
+                        return { status: r.status, text: r.text, headers: "", cost: (Date.now() - start) / 1000, via: "local" };
+                    }
+                } catch (_) {}
+            }
             return await new Promise((resolve) => {
                 try {
                     GM_xmlhttpRequest({
@@ -3992,18 +4040,26 @@ const __scBgKeepAlive = (function() {
                     + `请检查 GM_cookie 是否授权、账号是否已登录`);
             }
 
-            const questIds = this._questLinksFromEarn(encEarn)
-                .filter(id => this.QUESTS.weeklyPrefix.test(id));
+            const allQuestIds = this._questLinksFromEarn(encEarn);
+            const { weekly: weeklyIds, monthly: monthlyIds } = this._classifyQuests(allQuestIds);
+            const questIds = [...weeklyIds, ...monthlyIds];
             if (questIds.length === 0) {
-                const allQuests = this._questLinksFromEarn(encEarn);
-                Utils.log("🖥️", "本轮没有桌面奖励应用每周专属任务"
-                    + `（earn 页 ${earnLen} 字节，识别到 ${allQuests.length} 个 quest 入口`
-                    + (allQuests.length ? `：${allQuests.join("、")}` : "")
+                Utils.log("🖥️", "本轮没有桌面奖励应用专属任务，也没有月度打卡"
+                    + `（earn 页 ${earnLen} 字节，识别到 ${allQuestIds.length} 个 quest 入口`
+                    + (allQuestIds.length ? `：${allQuestIds.join("、")}` : "")
                     + "）");
                 return { found: 0, done: 0, pending: 0 };
             }
-            Utils.log("🖥️", `发现 ${questIds.length} 个桌面专属任务入口：`
-                + questIds.map(id => id.replace(/^WW_pcparent_RewardsApp_weekly_Exclusive_?/i, "")).join("、"));
+            if (weeklyIds.length) {
+                Utils.log("🖥️", `发现 ${weeklyIds.length} 个桌面专属任务入口：`
+                    + weeklyIds.map(id => id.replace(/^WW_pcparent_RewardsApp_weekly_Exclusive_?/i, "")).join("、"));
+            } else {
+                Utils.log("🖥️", "本周没有桌面奖励应用专属任务（可能已完成或本周未投放）");
+            }
+            if (monthlyIds.length) {
+                Utils.log("📅", `发现 ${monthlyIds.length} 个月度打卡任务：`
+                    + monthlyIds.map(id => id.replace(/_(pcparent|punchcard).*$/i, "")).join("、"));
+            }
 
             let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
             for (const parentId of questIds) {
@@ -4127,9 +4183,13 @@ const __scBgKeepAlive = (function() {
 
         async postAction(req, { savedKey = "Config.actionVariant" } = {}) {
             const saved = String(GM_getValue(savedKey, "") || "");
-            const order = (saved && BrowserEnv.channelOrder().includes(saved))
-                ? [saved, ...BrowserEnv.channelOrder().filter(v => v !== saved)]
-                : BrowserEnv.channelOrder();
+            const allowed = BrowserEnv.channelOrder();
+            // 「记住的通道」只在它当前仍然可用时才排到最前。
+            // 关键：local（页面同源）是唯一稳定不 500 的通道，绝不能被历史记录的 xhr 挤到后面。
+            const savedUsable = saved && allowed.includes(saved) && saved !== "xhr";
+            const order = savedUsable
+                ? [saved, ...allowed.filter(v => v !== saved)]
+                : allowed;
             const tried = [];
             let accepted = null;
             let last = null;
@@ -4170,6 +4230,18 @@ const __scBgKeepAlive = (function() {
                     status: r.status, text: r.text, variant
                 };
             }
+            if (variant === "local") {
+                // 脚本自己就跑在 rewards.bing.com 页面里：直接用页面原生 fetch，
+                // Origin 由浏览器写成 https://rewards.bing.com —— 与 CDP 通道等价，但不需要调试端口。
+                if (!this._sameOriginNow()) {
+                    return { ok: false, status: 0, text: "当前不在 rewards 页面", variant };
+                }
+                const r = await this._sameOriginFetch(req.url, req.headers, req.data);
+                return {
+                    ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
+                    status: r.status, text: r.text, variant
+                };
+            }
             if (variant === "proxy") {
                 if (!this._pageChannelAlive()) return { ok: false, status: 0, text: "页面代发服务不在线", variant };
                 const r = await this.viaPageChannel(req.url, req.headers, req.data, 20000);
@@ -4184,6 +4256,35 @@ const __scBgKeepAlive = (function() {
                 ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
                 status: r.status, text: r.text, variant
             };
+        },
+
+        // 当前上下文是否就是 rewards.bing.com（脚本以普通脚本注入该页时为真）
+        _sameOriginNow() {
+            try {
+                return Utils.hasDOM()
+                    && typeof location !== "undefined"
+                    && /^https:/i.test(String(location.protocol))
+                    && /(^|\.)rewards\.bing\.com$/i.test(String(location.hostname || ""));
+            } catch (_) {
+                return false;
+            }
+        },
+
+        // 在页面上下文用原生 fetch 发同源请求。浏览器会自动补 Origin: https://rewards.bing.com
+        async _sameOriginFetch(url, headers, body) {
+            try {
+                const r = await fetch(url, {
+                    method: "POST",
+                    headers: headers || {},
+                    body: body,
+                    credentials: "include",
+                    redirect: "follow"
+                });
+                const text = String(await r.text()).slice(0, 4000);
+                return { status: r.status, text };
+            } catch (e) {
+                return { status: 0, text: String((e && e.message) || e) };
+            }
         },
 
         async _anyRewardsPage() {
@@ -4832,6 +4933,8 @@ const __scBgKeepAlive = (function() {
             && /(^|\.)rewards\.bing\.com$/i.test(String(location.hostname || ""))) {
             API.startPageServer();
             Utils.log("🖥️", `代发服务已启动（页面上下文：${location.hostname}）`);
+            Utils.log("🔑", `交卷通道：local（页面同源 fetch，Origin=https://rewards.bing.com）优先`
+                + ` → page(CDP) → proxy → xhr(扩展源，仅兜底)`);
         }
     } catch (_) {}
 
@@ -6253,6 +6356,17 @@ const __scBgKeepAlive = (function() {
             });
         }
         GM_log("⏭️ 当前为 Bing 搜索页，跳过脚本初始化（防止重复执行/打开多余页面）");
+        return;
+    }
+
+    // @background 下这里通常不会到达（后台上下文没有 DOM，末尾的 hasDOM 判断会先 return）。
+    // 但保留这段：若用户改用普通脚本 / 或脚本被注入到 rewards 页，页面分支会在这里接管。
+    const isRewardsPage = typeof location !== "undefined"
+        && /(^|\.)rewards\.bing\.com$/i.test(String(location.hostname || ""));
+
+    if (!isRewardsPage) {
+        bootstrap();
+        Utils.log("⏭️", `当前页面（${location.hostname}）不是 rewards.bing.com，不启动任务调度`);
         return;
     }
 
