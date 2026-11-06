@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.1
+// @version      1.2.6
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -320,6 +320,11 @@ const __scBgKeepAlive = (function() {
             startTime: 0,
             lockedCount: 0,
             lockedPoints: 0,
+            lockedTitles: [],
+            desktopPendingTitles: [],
+            weeklyQuestDone: 0,
+            weeklyQuestPending: 0,
+            weeklyQuestFailed: 0,
             webNoAuth: false,
             webFailStreak: 0,
         }
@@ -517,6 +522,52 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.sendMSG = `${icon} ${msg}`;
                 this.sendWebhook();
             }
+        },
+
+        /*
+         * 同类通知节流：同一 key + 同一文案在 ttl 内只推送一次。
+         * 用于「每轮都会复现」的失败提示（例如领取积分通道被拒），
+         * 避免同一件事每隔几十分钟就弹一次通知 / 推一条 webhook。
+         */
+        _noticeHash(str) {
+            const s = String(str || "");
+            let h = 5381;
+            for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+            return h;
+        },
+
+        /* hashText 可选：只用于判断「是不是同一件事」，让带数字变化的同类提示也能合并 */
+        logOnce(icon, msg, key, ttlMs = 12 * 60 * 60 * 1000, hashText) {
+            GM_log(`${icon} ${msg}`);
+            const storeKey = `Notice.once.${key}`;
+            const now = Date.now();
+            const hash = this._noticeHash(hashText == null ? msg : hashText);
+            let rec = null;
+            try { rec = GM_getValue(storeKey, null); } catch (_) {}
+            const lastAt = rec ? (Number(rec.at) || 0) : 0;
+            if (rec && rec.hash === hash && now - lastAt < ttlMs) {
+                const leftMin = Math.max(1, Math.ceil((ttlMs - (now - lastAt)) / 60000));
+                GM_log(`🔁 同类通知 ${leftMin} 分钟内已推送过，本次静默（只写日志）`);
+                return false;
+            }
+            try { GM_setValue(storeKey, { at: now, hash, msg: String(msg).slice(0, 200) }); } catch (_) {}
+            if (GM_getValue("Notice.bro", true)) {
+                try {
+                    GM_notification({
+                        title: GM_info.script.name + ` ${icon}`,
+                        text: msg,
+                        onclick: () => GM_openInTab("https://rewards.bing.com/dashboard", { active: true })
+                    });
+                } catch (_) {}
+            }
+            RewardsAuto.state.sendMSG = `${icon} ${msg}`;
+            this.sendWebhook();
+            return true;
+        },
+
+        /* 状态恢复正常时重置节流记录，保证下次真出问题时还能提醒一次 */
+        resetOnce(key) {
+            try { GM_setValue(`Notice.once.${key}`, null); } catch (_) {}
         },
 
         async sendWebhook() {
@@ -772,7 +823,7 @@ const __scBgKeepAlive = (function() {
                 return;
             }
 
-            Utils.log("🔑", "首次运行：请求 Cookie 读取权限（若弹出授权框请点「允许」）", true);
+            Utils.log("🔑", "首次运行：请求 Cookie 读取权限，若弹出授权框请点「允许」", true);
             const r = await this.loginCookies();
             GM_setValue("Config.cookieProbed", true);
 
@@ -2076,15 +2127,30 @@ const __scBgKeepAlive = (function() {
             const clean = raw.replace(/\\"/g, '"');
             const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/i);
             if (m) {
-                const has = m[1] !== "null";
-                return { known: true, has, amount: has ? this._amount(clean) : 0, source: "pointClaim" };
+                if (m[1] === "null") return { known: true, has: false, amount: 0, source: "pointClaim" };
+                /* pointClaim 是个非 null 的空壳对象（如 {"points":0}）时，原来会一直当成「有待领」
+                   去发领取请求，失败了每轮再通知一次。这里必须用金额二次判定。 */
+                const amount = this._amount(clean);
+                if (amount > 0) return { known: true, has: true, amount, source: "pointClaim" };
+                const badge = this._badge(clean);
+                if (badge > 0) return { known: true, has: true, amount: badge, source: "badge" };
+                return { known: true, has: false, amount: 0, source: "pointClaim-empty", uncertain: true };
             }
-            const alt = clean.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
-            if (alt) {
-                const amount = parseInt(String(alt[1]).replace(/,/g, ""), 10) || 0;
-                return { known: true, has: amount > 0, amount, source: "badge" };
-            }
+            const badge = this._badge(clean);
+            if (badge >= 0) return { known: true, has: badge > 0, amount: badge, source: "badge" };
             return { known: false, has: false, amount: 0 };
+        },
+
+        /* 页面徽标上的「可领取 N」数字，仅用于 pointClaim 金额读到 0 时的兜底确认。
+           先按元素紧邻匹配，再退化为纯文本匹配，避免把标签属性里的数字当成积分。
+           返回 -1 表示页面上根本找不到徽标。 */
+        _badge(html) {
+            const clean = String(html || "").replace(/\\"/g, '"');
+            const near = clean.match(/alt="可领取"[^>]*>\s*([\d,]+)/i);
+            if (near) return parseInt(String(near[1]).replace(/,/g, ""), 10) || 0;
+            const text = clean.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
+            const m = text.match(/待领取\s*[:：]?\s*([\d,]+)/);
+            return m ? (parseInt(String(m[1]).replace(/,/g, ""), 10) || 0) : -1;
         },
 
         _balance(html) {
@@ -2132,7 +2198,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async run({ name = "领取积分" } = {}) {
-            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "" };
+            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "", uncertain: false };
             let dashHtml = "";
             try {
                 if (await CDP.available()) {
@@ -2149,20 +2215,23 @@ const __scBgKeepAlive = (function() {
 
             const pool = this.parse(dashHtml);
             out.before = this._balance(dashHtml);
+            out.uncertain = !!pool.uncertain;
             if (!pool.known) {
                 out.reason = "读不到待领池标记（页面可能是登录页或结构已变）";
                 return out;
             }
             if (!pool.has) {
+                /* 空壳 pointClaim（金额 0）也走这里：直接判定无可领，不再发请求、不再推通知 */
+                const kind = pool.uncertain ? "待领池标记存在但金额为 0（按无可领处理）" : "待领池为空";
                 const last = Number(GM_getValue(this.KEY_EMPTY_AT, 0)) || 0;
                 if (Date.now() - last < this.EMPTY_TTL && !pool.amount) {
                     out.empty = true;
-                    out.reason = "待领池为空（15 分钟内已确认过）";
+                    out.reason = `${kind}（15 分钟内已确认过）`;
                     return out;
                 }
                 GM_setValue(this.KEY_EMPTY_AT, Date.now());
                 out.empty = true;
-                out.reason = "待领池为空";
+                out.reason = kind;
                 return out;
             }
             GM_setValue(this.KEY_EMPTY_AT, 0);
@@ -2890,6 +2959,10 @@ const __scBgKeepAlive = (function() {
                 if (lock.locked) {
                     lockedCount++;
                     lockedPoints += item.max || 0;
+                    try {
+                        const t = item.title || item.offerId;
+                        if (!RewardsAuto.state.lockedTitles.includes(t)) RewardsAuto.state.lockedTitles.push(t);
+                    } catch (_) {}
                     Utils.log("🔒", `锁卡跳过（需在必应 App 完成）：${item.title || item.offerId} +${item.max || 0}p [${lock.reason}]`);
                     continue;
                 }
@@ -4108,6 +4181,12 @@ const __scBgKeepAlive = (function() {
                     }
                     if (!r || !r.accepted) {
                         failedHere++;
+                        totalPending++;   /* 交卷没被受理 = 这张卡没记账，算进「未完成」里 */
+                        try {
+                            if (card.title && !RewardsAuto.state.desktopPendingTitles.includes(card.title)) {
+                                RewardsAuto.state.desktopPendingTitles.push(card.title);
+                            }
+                        } catch (_) {}
                         Utils.log("🟠", `桌面任务交卷失败：${card.title}`
                             + ` → ${r && r.diag ? r.diag : this._questReason(r && r.raw)}`);
                         if (r && r.tried) {
@@ -4142,11 +4221,21 @@ const __scBgKeepAlive = (function() {
                     verify = await this.fetchQuestCards(parentId);
                 } catch (_) {}
                 if (verify && verify.cards.every(c => c.isCompleted)) {
-                    Utils.log("🔵", `桌面应用每周专属任务全部完成（本次完成 ${doneHere} 张）`, true);
+                    Utils.log("🔵", `桌面应用每周专属任务全部完成（本次完成 ${doneHere} 张）`);
                 } else {
 
                     const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !c.isLocked) : [];
                     const leftLocked = verify ? verify.cards.filter(c => !c.isCompleted && c.isLocked).length : 0;
+                    if (leftUnlocked.length > 0) {
+                        /* 记下待记账的标题，供收尾通知点名 */
+                        try {
+                            for (const c of leftUnlocked) {
+                                if (c.title && !RewardsAuto.state.desktopPendingTitles.includes(c.title)) {
+                                    RewardsAuto.state.desktopPendingTitles.push(c.title);
+                                }
+                            }
+                        } catch (_) {}
+                    }
                     Utils.log("🟡", `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张`
                         + (leftUnlocked.length > 0
                             ? `，仍剩 ${leftUnlocked.length} 张已解锁未完成（${leftUnlocked.map(c => c.title).join("、")}）`
@@ -4155,9 +4244,10 @@ const __scBgKeepAlive = (function() {
                 }
             }
             if (totalFailed > 0) {
-                Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`, true);
+                /* 只写日志：这类失败下一轮会重试，收尾通知里也会点名 */
+                Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`);
             }
-            return { found: totalFound, done: totalDone, pending: totalPending };
+            return { found: totalFound, done: totalDone, pending: totalPending, failed: totalFailed };
         },
 
         _questReason(raw) {
@@ -4547,7 +4637,7 @@ const __scBgKeepAlive = (function() {
             GM_setValue("Config.lastSearchProgress", currentTotal);
             GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
             if (RewardsAuto.state.restrictedTimes >= 3) {
-                Utils.log("🔴", "搜索受限或账号异常，已中断今日搜索！", true);
+                Utils.logOnce("🔴", "搜索受限或账号异常，已中断今日搜索！", "searchRestricted", 6 * 60 * 60 * 1000);
                 return true;
             }
             return false;
@@ -4614,7 +4704,7 @@ const __scBgKeepAlive = (function() {
             if (st.notified) return;
             st.notified = true;
             this.save(st);
-            Utils.log("🌐", `Edge 浏览连签任务已完成！（今日 ${EDGE.TARGET_MINUTES} 分钟浏览已记账）`, true);
+            Utils.log("🌐", `Edge 浏览连签任务已完成！（今日 ${EDGE.TARGET_MINUTES} 分钟浏览已记账）`);
         },
 
         async step() {
@@ -4884,6 +4974,7 @@ const __scBgKeepAlive = (function() {
         signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
         claimSummary: "",
+        claimReason: "",
         running: false, runningSince: 0,
         abortRound: false, hbTimer: null, roundSeq: 0, roundId: 0, lastRunStarted: false,
 
@@ -4993,6 +5084,7 @@ const __scBgKeepAlive = (function() {
             this.streakDays = tasks.streakDays || 0;
             this.signPoint = GM_getValue("Config.signPoint", -1);
             this.claimSummary = "";
+            this.claimReason = "";
         },
 
         save() {
@@ -5035,7 +5127,7 @@ const __scBgKeepAlive = (function() {
                 this.signDate = RewardsAuto.state.dateNowNum;
                 GM_setValue("Config.signPoint", totalPoint);
                 this.save();
-                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`, true);
+                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
             } else {
                 this.signTimes++;
                 Utils.log("🟡", `签入失败，稍后重试`);
@@ -5140,7 +5232,7 @@ const __scBgKeepAlive = (function() {
             if (verify && verify.progress >= verify.max) {
                 this.readDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`, true);
+                Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`);
             } else {
                 this.readTimes++;
                 Utils.log("🟡", `阅读已执行但未完成（${verify ? `${verify.progress}/${verify.max}` : "进度未知"}），下次继续`);
@@ -5165,6 +5257,7 @@ const __scBgKeepAlive = (function() {
                 const weekly = await API.runDesktopWeeklyQuests();
                 RewardsAuto.state.weeklyQuestDone = weekly.done || 0;
                 RewardsAuto.state.weeklyQuestPending = weekly.pending || 0;
+                RewardsAuto.state.weeklyQuestFailed = weekly.failed || 0;
                 return true;
             } catch (e) {
                 Utils.log("🟡", `桌面专属任务异常：${e && e.message ? e.message : e}`);
@@ -5187,7 +5280,7 @@ const __scBgKeepAlive = (function() {
                 if (ck === null) {
                 } else if (!ck.hasSession) {
                     Utils.log("🟡", "Cookie 里没有 Bing 登录标识（MUID=" + ck.hasMuid + "）："
-                        + (ck.names.slice(0, 6).join(",") || "空") + "；网页通道可能不记账", true);
+                        + (ck.names.slice(0, 6).join(",") || "空") + "；网页通道可能不记账");
                 }
             } catch (_) {}
             if (cards.length === 0) {
@@ -5554,7 +5647,7 @@ const __scBgKeepAlive = (function() {
             }
             this.dailySetSummary = remain >= 0
                 ? `${doneIds.size} 张已完成${remain > 0 ? `，剩 ${remain} 张` : ""}`
-                : `${doneIds.size} 张已完成（服务端状态未知）`;
+                : `${doneIds.size} 张已完成 · 服务端状态未知`;
             if (remain < 0) return true;
             return remain === 0;
         },
@@ -5571,22 +5664,28 @@ const __scBgKeepAlive = (function() {
                 const res = await ClaimPoints.run();
                 if (res.empty) {
                     this.claimSummary = "✅ 无可领";
-                    Utils.log("✅", `无可领取积分（${res.reason}）`);
+                    /* uncertain = pointClaim 标记还在但金额读到 0，按无可领处理，只记日志不通知 */
+                    Utils.log(res.uncertain ? "🟡" : "✅", `无可领取积分（${res.reason}）`);
                     return;
                 }
                 if (res.claimed > 0) {
-                    this.claimSummary = `✅ +${res.claimed}（余额 ${res.after}）`;
-                    Utils.log("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`, true);
+                    this.claimSummary = `✅ +${res.claimed} · 余额 ${res.after}`;
+                    this.claimReason = "";
+                    Utils.log("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`);
                 } else if (res.variant) {
                     this.claimSummary = "⏳ 已受理待复核";
+                    this.claimReason = res.reason || "";
                     Utils.log("🟡", `积分领取请求已受理，但余额没有变化（${res.reason}）；下一轮再复核`);
                 } else {
                     this.claimSummary = "⏳ 未成功";
-                    Utils.log("🟡", `待领积分自动领取未成功：${res.reason}`, true);
+                    this.claimReason = res.reason || "";
+                    /* 不单独推送：收尾通知的「受限制未完成」里会点名 */
+                    Utils.log("🟡", `待领积分自动领取未成功：${res.reason}`);
                     this._explainClaimChannels();
                 }
             } catch (e) {
                 this.claimSummary = "⏳ 异常";
+                this.claimReason = e.message || "";
                 Utils.log("🟡", `领取积分执行异常: ${e.message}`);
             }
         },
@@ -5720,6 +5819,11 @@ const __scBgKeepAlive = (function() {
                 this.promosTimes = 0;
                 RewardsAuto.state.lockedCount = 0;
                 RewardsAuto.state.lockedPoints = 0;
+                RewardsAuto.state.lockedTitles = [];
+                RewardsAuto.state.desktopPendingTitles = [];
+                RewardsAuto.state.weeklyQuestDone = 0;
+                RewardsAuto.state.weeklyQuestPending = 0;
+                RewardsAuto.state.weeklyQuestFailed = 0;
                 RewardsAuto.state.webNoAuth = false;
                 RewardsAuto.state.webFailStreak = 0;
                 RewardsAuto.state.startTime = Utils.getTimestamp();
@@ -5732,7 +5836,12 @@ const __scBgKeepAlive = (function() {
                 const startBalance = await API.getBalance();
                 Utils.log("📊", `初始积分: ${startBalance}`);
                 let isTokenOK = await API.renewToken();
-                if (!isTokenOK) Utils.log("🟡", "Token失败，跳过签入/阅读", true);
+                if (!isTokenOK) {
+                    /* Token 失效会每轮都命中，6 小时内只提醒一次 */
+                    Utils.logOnce("🟡", "Token失败，跳过签入/阅读", "tokenFail", 6 * 60 * 60 * 1000);
+                } else {
+                    Utils.resetOnce("tokenFail");
+                }
                 const retryDelay = 60000;
                 const maxRetries = 2;
                 const withRetry = async (taskFn, taskName, retries = 0) => {
@@ -5854,6 +5963,7 @@ const __scBgKeepAlive = (function() {
                     const on = key => GM_getValue(key, true);
                     const signOn = on("Tasks.sign"), readOn = on("Tasks.read");
                     const searchOn = on("Tasks.search"), promosOn = on("Tasks.promos");
+                    const desktopOn = on("Tasks.desktopWeekly");
                     const goals = [];
                     if (signOn) goals.push(signOk);
                     if (readOn) goals.push(readOk);
@@ -5863,6 +5973,38 @@ const __scBgKeepAlive = (function() {
                     if (edge) goals.push(edgeOk);
                     const doneCount = goals.filter(Boolean).length;
                     const allDone = goals.length > 0 && doneCount === goals.length;
+
+                    /* 三类「受环境限制」的项目不参与达标判定：
+                       🖥️ 桌面专属任务（交卷了但服务端不一定记账）
+                       🔒 日常带锁卡（必须在必应 App 里点）
+                       🎁 首页待领取（通道被浏览器安全策略挡掉）
+                       它们没完成不影响「全部完成」的判定，但通知里要点名。 */
+                    const desktopPending = Number(RewardsAuto.state.weeklyQuestPending) || 0;
+                    const desktopFailed = Number(RewardsAuto.state.weeklyQuestFailed) || 0;
+                    /* 具体卡片名只在后台日志里保留（state 里仍记录），通知只报数量 */
+                    const claimPending = /未成功|异常|待复核/.test(this.claimSummary || "");
+                    const blocked = [];
+                    if (desktopOn && (desktopPending > 0 || desktopFailed > 0)) {
+                        const parts = [];
+                        if (desktopPending > 0) {
+                            parts.push(`${desktopPending} 张未记账`);
+                        }
+                        if (desktopFailed > 0) parts.push(`${desktopFailed} 个入口读取失败`);
+                        blocked.push("🖥️ 桌面专属任务 " + parts.join("，"));
+                    }
+                    if (RewardsAuto.state.lockedCount > 0) {
+                        blocked.push(`🔒 带锁卡片 ${RewardsAuto.state.lockedCount} 张 / ${RewardsAuto.state.lockedPoints} 分`);
+                    }
+                    if (claimPending) {
+                        /* 通道类失败的原话太技术，换成一句人话；其它原因照抄 */
+                        const rawReason = String(this.claimReason || "");
+                        const claimText = (/三种通道都没受理/.test(rawReason)
+                            ? "领取通道被浏览器拒绝"
+                            : (rawReason || String(this.claimSummary).replace("⏳ ", "")))
+                            .replace(/（[^）]*）/g, "").replace(/\([^)]*\)/g, "").trim();
+                        blocked.push("🎁 首页待领取" + String(this.claimSummary).replace("⏳ ", "")
+                            + (claimText ? `：${claimText}` : ""));
+                    }
 
                     /* 关掉的项要写「已关闭」：显示 ⏳ 0/90 会让人误以为没做完 */
                     const rows = [];
@@ -5874,12 +6016,15 @@ const __scBgKeepAlive = (function() {
                         : "⏭️ 已关闭"));
                     row("🧩 活动卡片", promosOn, promosOk, "");
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
+                    row("🖥️ 桌面专属任务", desktopOn, desktopPending === 0 && desktopFailed === 0,
+                        desktopPending > 0 ? `${desktopPending} 张未记账`
+                            : (desktopFailed > 0 ? `${desktopFailed} 个入口读取失败` : ""));
                     row("📅 签到", signOn, signOk, this.streakDays > 0 ? "连签 " + this.streakDays + " 天" : "");
                     row("📋 阅读", readOn, readOk, readProg + "/" + readMaxProg);
                     row("🔍 PC 搜索", searchOn, searchOk, info.pc.progress + "/" + info.pc.max);
                     if (mob.max > 0) rows.push("📱 手机搜索 · " + tick(mobOk) + " " + mob.progress + "/" + mob.max);
                     if (RewardsAuto.state.lockedCount > 0) {
-                        rows.push("🔒 锁卡 · " + RewardsAuto.state.lockedCount + " 张（" + RewardsAuto.state.lockedPoints + " 分，需在必应 App 完成）");
+                        rows.push("🔒 锁卡 · " + RewardsAuto.state.lockedCount + " 张 / " + RewardsAuto.state.lockedPoints + " 分");
                     }
                     if (this.claimSummary) rows.push("🎁 领取积分 · " + this.claimSummary);
                     rows.push("💰 今日获取 +" + earned + " · 总积分 " + (info.balance || endBalance));
@@ -5887,12 +6032,30 @@ const __scBgKeepAlive = (function() {
                     /* 标题不带图标：推送图标由 Utils.log 第一参数统一加，
                        否则会拼成「🎉 🎉 今日任务已全部完成！」 */
                     const head = allDone
-                        ? "今日任务已全部完成！"
+                        ? (blocked.length > 0
+                            ? "今日任务已完成"
+                            : "今日任务已全部完成！")
                         : "本轮结果 · 还差 " + (goals.length - doneCount) + " 项";
-                    const logMsg = head + "\n\n" + rows.join("\n") + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
-                    Utils.log(allDone ? "🎉" : "📊", logMsg, true);
+                    let logMsg = head + "\n\n" + rows.join("\n")
+                        + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
+                    if (blocked.length > 0) {
+                        logMsg += "\n\n⏳ 受限制未完成：\n"
+                            + blocked.map(s => "· " + s).join("\n")
+                            + "\n💡 上面三项要自动完成，需用 Chrome 浏览器运行脚本";
+                    }
+
+                    /* 通知策略：常规任务全达标才推一条汇总；中间轮次只写日志。
+                       同一天同一状态只推一次，避免每轮一条的骚扰；
+                       若后来受限制项清零，允许再推一次「全部完成」。 */
+                    if (allDone) {
+                        const dayKey = `roundDone:${today}`;
+                        Utils.logOnce("🎉", logMsg, dayKey, 20 * 60 * 60 * 1000,
+                            `${dayKey}:${blocked.length > 0 ? "partial" : "full"}`);
+                    } else {
+                        Utils.log("📊", logMsg);
+                    }
                 } else {
-                    Utils.log("📊", ("本轮执行完成 · ⏱️ 用时 " + totalTime + " 秒（服务端状态读取失败，明细见日志）"), true);
+                    Utils.log("📊", ("本轮执行完成 · ⏱️ 用时 " + totalTime + " 秒 · 服务端状态读取失败，明细见日志"));
                 }
                 if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
             } catch (e) {
@@ -5977,7 +6140,7 @@ const __scBgKeepAlive = (function() {
         text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
         text += `领取标识：${ActionMap.get("reportClaimAllPoints").slice(0, 12)}…\n\n`;
         const pool = await ClaimPoints.run();
-        text += `待领状态：${pool.empty ? "空池" : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
+        text += `待领状态：${pool.empty ? (pool.uncertain ? "空（标记存在但金额读为 0）" : "空池") : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
         text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
         if (!pool.variant && !pool.empty) {
             text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）并留一个 rewards 页面，`
@@ -6353,7 +6516,7 @@ const __scBgKeepAlive = (function() {
 
             const next = this.plan(this.startedAt);
             if (next > this.startedAt) this.saveNext(next);
-            Utils.log("🕒", `常驻调度已启动（${this.ctxName()}上下文）：每 ${CRON_PERIOD / 60000} 分钟一轮，下一轮 ${this.fmt(next)}`);
+            Utils.log("🕒", `常驻调度已启动（${this.ctxName()}上下文）：v${(GM_info.script && GM_info.script.version) || "?"}，每 ${CRON_PERIOD / 60000} 分钟一轮，下一轮 ${this.fmt(next)}`);
             this.arm(true);
         },
 
@@ -6499,7 +6662,7 @@ const __scBgKeepAlive = (function() {
         const today = RewardsAuto.state.dateNowNum;
         const prev = Number(GM_getValue("Config.doneDate", 0)) || 0;
         GM_setValue("Config.doneDate", today);
-        if (prev !== today) Utils.log("💤", "今日任务已全部完成，已停止检测（明天自动恢复）", true);
+        if (prev !== today) Utils.log("💤", "今日任务已全部完成，已停止检测（明天自动恢复）");
     };
 
     const init = () => {
