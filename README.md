@@ -2,7 +2,7 @@
 
 在后台自动完成 Microsoft Rewards 任务，完成后推送汇总。
 
-## 授权（首次必做）
+## 一、授权（首次必做）
 
 1. 自动授权:
    - 手动运行一次，等待一分钟
@@ -26,9 +26,7 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 ```
 
 
-> 授权码**只能用一次**。若提示"换取 Token 失败"，多半是码已过期或被用过，重新走一遍上面的步骤。状态可用菜单 **📊 Token状态** 查看。
-
-## ⚠️ 必须在谷歌浏览器（Chrome）才能完成的任务
+## ⚠️ 二、必须在Chrome浏览器才能完成的任务(须知)
 
 脚本大部分任务用 Edge 也能跑，但下面**三类任务需在Chrome上完成**。
 
@@ -40,6 +38,7 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 | 带锁 🔒 卡片(已解锁) | ✅  | ✅ 需先配好 CDP (不建议配置CDP) |
 | 桌面端任务 | ✅ | ❌ |
 | 首页待领取 | ✅ | ❌ |
+| 月度计划 | ✅ | ❌ |
 
 ## 说明
 

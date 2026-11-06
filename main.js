@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.6
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
+// @version      1.2.7
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -105,6 +105,10 @@ Tasks:
         default: true
     desktopWeekly:
         title: 桌面应用每周专属任务（每轮检测，按星期逐日解锁）
+        type: checkbox
+        default: true
+    monthly:
+        title: 月度计划（月度 punchcard，子项解锁后自动完成）
         type: checkbox
         default: true
     claimPoints:
@@ -325,6 +329,12 @@ const __scBgKeepAlive = (function() {
             weeklyQuestDone: 0,
             weeklyQuestPending: 0,
             weeklyQuestFailed: 0,
+            monthlyFound: 0,
+            monthlyDone: 0,
+            monthlyTotal: 0,
+            monthlyPending: 0,
+            monthlyComplete: false,
+            monthlyUnlocked: 0,
             webNoAuth: false,
             webFailStreak: 0,
         }
@@ -477,6 +487,18 @@ const __scBgKeepAlive = (function() {
         ACTIVATION_OFFER: "edge_flight_1_ww_treatment_eligible",
         TARGET_MINUTES: 30,
         MAX_EXTRA_ROUNDS: 3,
+    };
+
+    /* 月度计划（月度 punchcard）：
+       父任务形如 ENWW_pcparent_FY27_BingMonthlyPC_Nov_punchcard，页面上是「N/5 个任务」，
+       子项间隔解锁（子项 4/5 在子项 3 完成并且到点后才 isLocked=false），全部完成给一次 +50。
+       子项的进度只能靠回读详情页的「M/N 个任务」确认——交卷被受理不代表服务端记账。
+       cron 每 20 分钟一轮，这里按月维度节流：本月已判「不再推进」就不再去拉详情页。 */
+    const MONTHLY = {
+        RECHECK_MS: 90 * 60 * 1000,
+        DONE_RECHECK_MS: 22 * 60 * 60 * 1000,
+        MAX_ATTEMPTS_PER_DAY: 2,
+        PAGE_URL: "https://rewards.bing.com/earn/quest/",
     };
 
     const WEBHOOK_PLATFORMS = [
@@ -3880,6 +3902,439 @@ const __scBgKeepAlive = (function() {
             return { parentId, url, html, text, cards };
         },
 
+        /* ===== 月度计划（月度 punchcard）=====
+           与桌面专属任务同一个 quest 详情页结构，差别有三点：
+             1) 父任务 id 不含 RewardsApp，普通 PC UA 就能渲染出子项（不用应用 UA 也能拿到 hash/href）；
+             2) 子项个数更多（本月 5 个），按天解锁，一次只能推进一个；
+             3) 全部完成后父任务发一次 +50，进度只能回读「M/N 个任务」确认。
+           子项 href 指向 bing.com/search?form=ML2YBx&PUBL=RewardsDO 的，
+           必须先在奖励搜索页上报（reportAppSearchForCard）再交卷，否则服务端看不到那次搜索。 */
+
+        MONTH_KEY() {
+            const d = new Date();
+            return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}`;
+        },
+
+        monthlyState() {
+            const raw = GM_getValue("Config.monthlyState", null);
+            const st = (raw && typeof raw === "object") ? raw : {};
+            const month = this.MONTH_KEY();
+            if (String(st.month || "") !== month) {
+                return { month, paused: false, logDate: 0, quests: {} };
+            }
+            return {
+                month,
+                paused: !!st.paused,
+                pausedAt: Number(st.pausedAt) || 0,
+                logDate: Number(st.logDate) || 0,
+                quests: (st.quests && typeof st.quests === "object") ? st.quests : {},
+            };
+        },
+
+        saveMonthlyState(st) {
+            GM_setValue("Config.monthlyState", st);
+        },
+
+        /* 同一件事每天只写一条日志/推一条通知：cron 每 20 分钟一轮，不加节流会刷屏 */
+        monthlyLog(st, icon, msg, push = false) {
+            const today = Utils.getTodayNum();
+            if (Number(st.logDate) === today) {
+                Utils.log(icon, msg);
+                return false;
+            }
+            st.logDate = today;
+            this.saveMonthlyState(st);
+            Utils.log(icon, msg, push);
+            return true;
+        },
+
+        /* 月度子项的完成动作由 href 决定，和桌面任务那套一致：
+             · /redeem/ 开头 = 领取型，点开链接即完成（奖励多半走邮件）
+             · bing.com/search?form=ML2xx|PUBL=RewardsDO = 应用内搜索型，先上报搜索再交卷
+             · 其它 = 纯交卷型
+           返回 "redeem" | "search" | "plain" */
+        monthlyChildKind(href) {
+            const h = String(href || "");
+            if (/\/redeem/i.test(h)) return "redeem";
+            const q = h.includes("?") ? h.slice(h.indexOf("?") + 1) : "";
+            if (/bing\.com\/search/i.test(h) && /(^|&)(form=ML2Y2H|form=ML2YB\d|PUBL=RewardsDO)/i.test(q)) return "search";
+            return "plain";
+        },
+
+        /* 拉详情页并解析：进度 + 子项。进度只认「M/N 个任务」，
+           没有这个文案时退化为数子项的 isCompleted，避免把「已解锁但没进度文案」当成 0 进度。 */
+        /* 拉详情页并解析：进度 + 子项。
+           身份：统一用 Rewards 应用 UA —— 参考实现的实测结论是「同一个 quest 在应用 UA 下才渲染
+           真实进度与真实解锁态，普通 UA 会渲染成 0/N 且子项全 isLocked=true」，
+           因此不能拿普通 UA 的结果当依据。只有应用 UA 连子项都解析不出来时，
+           才退到普通 PC UA 兜底（页面结构变更时至少还能认出子项）。
+           进度只认「M/N 个任务」文案，没有时退化为数子项 isCompleted。
+           返回的 identity 字段用于日志定位「到底哪份渲染被采纳了」。 */
+        async fetchMonthlyQuest(parentId) {
+            const url = MONTHLY.PAGE_URL + encodeURIComponent(parentId);
+            const identities = [
+                { name: "应用 UA", headers: RewardsAuto.desktopAppHeaders },
+                { name: "普通 UA", headers: { "user-agent": RewardsAuto.ua.pc, "accept-language": "zh-CN,zh;q=0.9,en;q=0.8" } },
+            ];
+            let lastReason = "";
+            for (const idn of identities) {
+                let html = "";
+                try {
+                    html = await Utils.xhr({ url, headers: idn.headers });
+                } catch (e) {
+                    lastReason = `详情页请求失败：${e.message}`;
+                    continue;
+                }
+                if (!html) { lastReason = "详情页返回空"; continue; }
+
+                const text = this._flightText(html);
+                const cards = [];
+                const seen = new Set();
+                for (const item of this._flightItems(text, "[A-Za-z0-9]*_pcchild[^\"]+")) {
+                    if (!item.offerId || !item.hash || seen.has(item.offerId)) continue;
+                    seen.add(item.offerId);
+                    cards.push({
+                        offerId: String(item.offerId),
+                        hash: String(item.hash),
+                        title: String(item.ariaLabel || item.linkText || item.offerId)
+                            .replace(/^\s*\d+\s*[分点]?\s*,?\s*/, "").trim() || item.offerId,
+                        isCompleted: item.isCompleted === true,
+                        isLocked: item.isLocked === true,
+                        isDisabled: item.isDisabled === true,
+                        href: String(item.href || item.destination || ""),
+                    });
+                }
+                const m = text.match(/(\d+)\s*\/\s*(\d+)\s*个任务/);
+                const doneByText = m ? parseInt(m[1], 10) : 0;
+                const totalByText = m ? parseInt(m[2], 10) : 0;
+                const completedCards = cards.filter(c => c.isCompleted).length;
+                /* 子项和进度文案至少拿到一样才算「解析成功」，否则换下一个身份兜底 */
+                if (cards.length === 0 && totalByText === 0) {
+                    lastReason = "未解析到子项（页面结构可能已变更）";
+                    continue;
+                }
+                if (idn.name !== identities[0].name) {
+                    Utils.log("📆", `月度计划：${parentId} 应用 UA 没解析出内容，已用${idn.name}兜底`);
+                }
+                return {
+                    parentId, url, ok: true, identity: idn.name,
+                    html, text, cards,
+                    done: totalByText > 0 ? doneByText : completedCards,
+                    total: totalByText > 0 ? totalByText : cards.length,
+                    hasProgressText: !!m,
+                    unlockedOpen: cards.filter(c => !c.isCompleted && !c.isLocked && !c.isDisabled).length,
+                };
+            }
+            return { parentId, url, ok: false, reason: lastReason || "解析失败", cards: [] };
+        },
+
+        /* 交卷：走和桌面专属任务相同的三种形态探测（earn 页 / quest 页 / 普通 UA），
+           成功形态会被记住（Config.questVariant），下次直接用命中的那一种。 */
+        async submitMonthlyCard(parentId, card) {
+            try {
+                const r = await this.submitQuestCard(parentId, card);
+                return r || { accepted: false, status: 0, raw: "", variant: "" };
+            } catch (e) {
+                return { accepted: false, status: 0, raw: e.message, variant: "", diag: e.message };
+            }
+        },
+
+        /* 完成一个子项：按类型执行动作 + 交卷，然后回读进度确认到底有没有记账。
+           返回 { credited, done, total, note } —— credited=false 表示「受理了但服务端没动」，
+           调用方据此决定是「今天再试一次」还是「等解锁/等复查」。 */
+        async completeMonthlyChild(parentId, card, pageUrl, before) {
+            const kind = this.monthlyChildKind(card.href);
+            const note = [];
+            let accepted = false;
+
+            if (kind === "search") {
+                /* 应用内搜索型：先用奖励搜索签名把这次搜索上报掉。
+                   reportAppSearchForCard 内部已封装 ncheader + reportActivity 两步。 */
+                try {
+                    const reported = await this.reportAppSearchForCard(card.href);
+                    note.push(reported ? "已上报应用内搜索" : "应用内搜索上报失败");
+                } catch (e) {
+                    note.push(`应用内搜索上报异常：${e.message}`);
+                }
+                await Utils.randomDelay(2500, 4500);
+            }
+
+            if (kind === "redeem") {
+                /* 领取型：带上会话 cookie GET 一次兑换链接就等效于在页面上点「领取」。 */
+                try {
+                    await Utils.xhr({
+                        url: card.href,
+                        headers: {
+                            "user-agent": RewardsAuto.desktopAppHeaders["user-agent"],
+                            "referer": pageUrl,
+                        },
+                    });
+                    note.push("已访问兑换链接");
+                } catch (e) {
+                    note.push(`兑换链接访问失败：${e.message}`);
+                }
+                await Utils.delay(5000);
+            }
+
+            const sub = await this.submitMonthlyCard(parentId, card);
+            accepted = !!sub.accepted;
+            note.push(accepted
+                ? `交卷已受理${sub.variant ? `（${sub.variant}）` : ""}`
+                : `交卷未受理${sub.diag ? `：${sub.diag}` : (sub.status ? `（HTTP ${sub.status}）` : "")}`);
+
+            /* 回读确认：交卷被受理不等于记账，尤其应用搜索型和领取型。
+               桌面任务那套是 2~4 秒后回读，这里给 4~7 秒（月度子项服务端处理更慢）。 */
+            await Utils.randomDelay(4000, 7000);
+            let after = null;
+            try {
+                after = await this.fetchMonthlyQuest(parentId);
+            } catch (_) { after = null; }
+            const newDone = after && after.ok ? after.done : -1;
+            const credited = newDone > before.done;
+            if (credited) note.push(`进度 ${before.done}/${before.total} → ${newDone}/${after.total}`);
+            else if (newDone >= 0) note.push(`进度未推进（仍 ${newDone}/${after.total}）`);
+            else note.push("进度回读失败");
+
+            return {
+                credited,
+                accepted,
+                kind,
+                done: credited ? newDone : before.done,
+                total: (after && after.ok && after.total) ? after.total : before.total,
+                note: note.join("，"),
+            };
+        },
+
+        async runMonthlyPlan() {
+            const st = this.monthlyState();
+            const now = Date.now();
+            const today = Utils.getTodayNum();
+
+            /* 本月已全部完成：不是永久封存，而是「约一天内不再请求」。
+               月度 quest 偶尔会在月中换一批或补发新的子项，永久封存会整月漏掉；
+               每天复查一次只花 1 个 earn 页请求，代价可以接受。 */
+            if (st.paused && now - (Number(st.pausedAt) || 0) < MONTHLY.DONE_RECHECK_MS) {
+                Utils.log("📆", "月度计划：本月已全部完成，本轮不再执行");
+                const sumP = k => Object.keys(st.quests)
+                    .reduce((s, id) => s + (Number((st.quests[id] || {})[k]) || 0), 0);
+                return {
+                    found: Object.keys(st.quests).length, done: sumP("done"), total: sumP("total"),
+                    pending: 0, complete: true, skipped: true,
+                };
+            }
+
+            /* 零请求快速跳过：本轮既没有「今天还能再试」的子项，又还没到下一次复查时间。
+               没有这一步的话，cron 每 20 分钟就会拉一次 earn 页 + quest 详情页，
+               一个月下来上百次请求，既浪费也更容易被判异常。 */
+            const ids = Object.keys(st.quests);
+            const unfinished = ids.filter(id => !(st.quests[id] || {}).complete);
+            if (unfinished.length > 0) {
+                const attemptsTodayOf = id => {
+                    const q = st.quests[id] || {};
+                    return Number(q.attemptDate) === today ? Number(q.attempts) || 0 : 0;
+                };
+                const retryable = unfinished.filter(id => {
+                    const tried = attemptsTodayOf(id);
+                    return tried > 0 && tried < MONTHLY.MAX_ATTEMPTS_PER_DAY;
+                });
+                const allCooling = unfinished.every(id =>
+                    now - (Number((st.quests[id] || {}).lastCheckAt) || 0) < MONTHLY.RECHECK_MS);
+                if (retryable.length === 0 && allCooling) {
+                    const hours = Math.max(1, Math.ceil(MONTHLY.RECHECK_MS / 3600000));
+                    this.monthlyLog(st, "📆",
+                        `月度计划已检查过，约 ${hours} 小时后复查（${unfinished.map(id => {
+                            const q = st.quests[id] || {};
+                            return `${q.done || 0}/${q.total || 0}`;
+                        }).join("，")}）`);
+                    const sum = k => ids.reduce((s, id) => s + (Number((st.quests[id] || {})[k]) || 0), 0);
+                    return {
+                        found: ids.length, done: sum("done"), total: sum("total"),
+                        pending: unfinished.length, complete: false, skipped: true,
+                    };
+                }
+            }
+
+            try { await this.getCookieHeader(); } catch (_) {}
+
+            /* 1) 从 earn 页找出所有月度 punchcard 父任务。
+               排除桌面奖励应用每周专属任务（RewardsApp 前缀）——那个由 runDesktopWeeklyQuests 负责，
+               两边都跑会对同一批子项重复交卷。 */
+            let earnHtml = "";
+            try {
+                earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn", headers: RewardsAuto.desktopAppHeaders });
+            } catch (e) {
+                Utils.log("🔴", `月度计划：拉取 earn 页失败（${e.message}），本轮跳过`);
+                return { found: 0, done: 0, total: 0, pending: 0, complete: false, failed: 1 };
+            }
+            if (!earnHtml) {
+                Utils.log("🔴", "月度计划：earn 页返回空，本轮跳过");
+                return { found: 0, done: 0, total: 0, pending: 0, complete: false, failed: 1 };
+            }
+            const parentIds = this._questLinksFromEarn(earnHtml)
+                .filter(id => !this.QUESTS.weeklyPrefix.test(id));
+            if (parentIds.length === 0) {
+                this.monthlyLog(st, "📆", "月度计划：当前没有进行中的月度 punchcard（可能本月未发布或已完成）");
+                return { found: 0, done: 0, total: 0, pending: 0, complete: false };
+            }
+            /* 又发现入口了：解除「已完成」的封存，正常走一遍（可能是月中换批/补发） */
+            if (st.paused) {
+                st.paused = false;
+                st.pausedAt = 0;
+                st.logDate = 0;
+                Utils.log("📆", "月度计划：重新发现月度任务入口，解除封存");
+            }
+            this.saveMonthlyState(st);
+
+            let totalDone = 0, totalTotal = 0, pendingCount = 0, anyProgress = false;
+            const reports = [];
+
+            for (const parentId of parentIds) {
+                const cached = st.quests[parentId] || {};
+                if (cached.complete) {
+                    totalDone += Number(cached.done) || 0;
+                    totalTotal += Number(cached.total) || 0;
+                    reports.push(`${cached.done}/${cached.total}`);
+                    continue;
+                }
+
+                let snap;
+                try {
+                    snap = await this.fetchMonthlyQuest(parentId);
+                } catch (e) {
+                    Utils.log("🔴", `月度计划：读取 ${parentId} 失败（${e.message}），本轮跳过这一个`);
+                    pendingCount++;
+                    continue;
+                }
+                if (!snap.ok || snap.cards.length === 0) {
+                    if (!snap.ok) Utils.log("🟡", `月度计划：${parentId} ${snap.reason}`);
+                    else Utils.log("🟡", `月度计划：${parentId} 未解析到子项（页面结构可能已变更）`);
+                    /* 解析不到不等于完成了，但只要没有待办就不该反复拉页面 */
+                    const q = {
+                        ...cached, done: cached.done || 0, total: cached.total || 0,
+                        complete: false, lastCheckAt: now,
+                        attemptDate: cached.attemptDate || 0, attempts: cached.attempts || 0,
+                    };
+                    st.quests[parentId] = q;
+                    this.saveMonthlyState(st);
+                    pendingCount++;
+                    reports.push(`${q.done}/${q.total}`);
+                    continue;
+                }
+
+                totalDone += snap.done;
+                totalTotal += snap.total;
+                Utils.log("📆", `月度计划：${parentId} 进度 ${snap.done}/${snap.total}`
+                    + `（子项 ${snap.cards.filter(c => c.isCompleted).length} 已完成 / `
+                    + `${snap.cards.filter(c => !c.isCompleted && c.isLocked).length} 未解锁）`);
+
+                const q = {
+                    done: snap.done,
+                    total: snap.total,
+                    complete: snap.total > 0 && snap.done >= snap.total,
+                    lastCheckAt: now,
+                    lastDoneAt: Number(cached.lastDoneAt) || 0,
+                    attemptDate: Number(cached.attemptDate) || 0,
+                    attempts: Number(cached.attempts) || 0,
+                };
+
+                if (q.complete) {
+                    q.attemptDate = 0;
+                    q.attempts = 0;
+                    st.quests[parentId] = q;
+                    this.saveMonthlyState(st);
+                    reports.push(`${q.done}/${q.total}`);
+                    Utils.log("✅", `月度计划：${parentId} 本月已全部完成`);
+                    continue;
+                }
+
+                /* 2) 挑一个能做的子项：未完成、已解锁、未禁用。
+                   服务端一次只解锁一个，所以取第一个即可，一轮只推进一个子项。 */
+                const open = snap.cards.filter(c => !c.isCompleted && !c.isLocked && !c.isDisabled);
+                if (open.length === 0) {
+                    const locked = snap.cards.filter(c => !c.isCompleted);
+                    st.quests[parentId] = q;
+                    this.saveMonthlyState(st);
+                    reports.push(`${q.done}/${q.total}`);
+                    Utils.log("📆", `月度计划：${locked.length} 个子项都还没解锁，`
+                        + `约 ${Math.round(MONTHLY.RECHECK_MS / 60000)} 分钟后复查（进度 ${q.done}/${q.total}）`);
+                    pendingCount++;
+                    continue;
+                }
+
+                const card = open[0];
+                const attemptsToday = Number(q.attemptDate) === today ? Number(q.attempts) || 0 : 0;
+                if (attemptsToday >= MONTHLY.MAX_ATTEMPTS_PER_DAY) {
+                    st.quests[parentId] = q;
+                    this.saveMonthlyState(st);
+                    reports.push(`${q.done}/${q.total}`);
+                    Utils.log("📆", `月度计划：子项「${card.title}」今天已尝试 ${attemptsToday} 次仍没推进，`
+                        + `约 ${Math.round(MONTHLY.RECHECK_MS / 60000)} 分钟后复查服务端进度`);
+                    pendingCount++;
+                    continue;
+                }
+
+                /* 有轮次在跑就确认它还活着：本轮超时/锁被别的上下文接管时必须立刻停手，
+                   不能继续往微软发请求。异常要往上抛（runAll 的 withRetry 对 roundAborted 直接透传），
+                   所以这里不能 try/catch 吞掉。手动诊断（没有轮次在跑）时跳过这个检查。 */
+                if (TaskManager.running) TaskManager.tick();
+
+                Utils.log("📆", `月度计划：正在完成子项「${card.title}」`
+                    + `（${this.monthlyChildKind(card.href) === "search" ? "应用内搜索型"
+                        : this.monthlyChildKind(card.href) === "redeem" ? "领取型" : "交卷型"}）`);
+
+                const res = await this.completeMonthlyChild(parentId, card, snap.url, {
+                    done: snap.done, total: snap.total,
+                });
+                Utils.log(res.credited ? "🟢" : "🟡", `月度计划：${res.note}`);
+
+                if (res.credited) {
+                    anyProgress = true;
+                    q.done = res.done;
+                    q.total = res.total || q.total;
+                    q.complete = q.total > 0 && q.done >= q.total;
+                    q.lastDoneAt = Date.now();
+                    q.attemptDate = 0;
+                    q.attempts = 0;
+                    /* totalDone 在循环开头已经按 snap.done 累加过，这里只补差额 */
+                    totalDone += Math.max(0, res.done - snap.done);
+                } else {
+                    q.done = snap.done;
+                    if (Number(q.attemptDate) === today) q.attempts = (Number(q.attempts) || 0) + 1;
+                    else { q.attemptDate = today; q.attempts = 1; }
+                }
+                q.lastCheckAt = Date.now();
+                st.quests[parentId] = q;
+                this.saveMonthlyState(st);
+                reports.push(`${q.done}/${q.total}`);
+                if (!q.complete) pendingCount++;
+            }
+
+            /* 全部父任务都完成 → 一天内不再请求（次日复查一次，防止月中换批/补发） */
+            const allComplete = parentIds.length > 0
+                && parentIds.every(id => (st.quests[id] || {}).complete);
+            if (allComplete) {
+                st.paused = true;
+                st.pausedAt = Date.now();
+                this.saveMonthlyState(st);
+                this.monthlyLog(st, "🔵",
+                    `月度计划本月全部完成（${reports.join("，")}），${Math.round(MONTHLY.DONE_RECHECK_MS / 3600000)} 小时后再复查一次`, true);
+            } else if (anyProgress) {
+                this.monthlyLog(st, "📆",
+                    `月度计划已推进：本次完成 1 个子项（${reports.join("，")}）`, true);
+            } else {
+                this.monthlyLog(st, "📆", `月度计划进度：${reports.join("，") || "无"}`);
+            }
+
+            return {
+                found: parentIds.length,
+                done: totalDone,
+                total: totalTotal,
+                pending: allComplete ? 0 : Math.max(pendingCount, 1),
+                complete: allComplete,
+                unlocked: 0,
+            };
+        },
+
         async _rawXhr(options) {
             const start = Date.now();
             return await new Promise((resolve) => {
@@ -5265,6 +5720,27 @@ const __scBgKeepAlive = (function() {
             }
         },
 
+        async doMonthlyPlan() {
+            if (!GM_getValue("Tasks.monthly", true)) {
+                RewardsAuto.state.monthlyComplete = false;
+                RewardsAuto.state.monthlyFound = 0;
+                RewardsAuto.state.monthlyPending = 0;
+                return true;
+            }
+            try {
+                const res = await API.runMonthlyPlan();
+                RewardsAuto.state.monthlyFound = res.found || 0;
+                RewardsAuto.state.monthlyDone = res.done || 0;
+                RewardsAuto.state.monthlyTotal = res.total || 0;
+                RewardsAuto.state.monthlyPending = res.pending || 0;
+                RewardsAuto.state.monthlyComplete = !!res.complete;
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `月度计划异常：${e && e.message ? e.message : e}`);
+                return true;
+            }
+        },
+
         async doPromos(roundDeadline) {
             if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 2) return true;
             if (this.promosDate === RewardsAuto.state.dateNowNum) {
@@ -5824,6 +6300,11 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.weeklyQuestDone = 0;
                 RewardsAuto.state.weeklyQuestPending = 0;
                 RewardsAuto.state.weeklyQuestFailed = 0;
+                RewardsAuto.state.monthlyFound = 0;
+                RewardsAuto.state.monthlyDone = 0;
+                RewardsAuto.state.monthlyTotal = 0;
+                RewardsAuto.state.monthlyPending = 0;
+                RewardsAuto.state.monthlyComplete = false;
                 RewardsAuto.state.webNoAuth = false;
                 RewardsAuto.state.webFailStreak = 0;
                 RewardsAuto.state.startTime = Utils.getTimestamp();
@@ -5881,6 +6362,8 @@ const __scBgKeepAlive = (function() {
                 }
 
                 await this.doDesktopWeekly();
+                await Utils.randomDelay();
+                await withRetry(() => this.doMonthlyPlan(), "月度计划");
                 await Utils.randomDelay();
                 await withRetry(() => this.doPromos(roundDeadline), "活动卡片");
                 await Utils.randomDelay();
@@ -5964,6 +6447,7 @@ const __scBgKeepAlive = (function() {
                     const signOn = on("Tasks.sign"), readOn = on("Tasks.read");
                     const searchOn = on("Tasks.search"), promosOn = on("Tasks.promos");
                     const desktopOn = on("Tasks.desktopWeekly");
+                    const monthlyOn = on("Tasks.monthly");
                     const goals = [];
                     if (signOn) goals.push(signOk);
                     if (readOn) goals.push(readOk);
@@ -6019,6 +6503,18 @@ const __scBgKeepAlive = (function() {
                     row("🖥️ 桌面专属任务", desktopOn, desktopPending === 0 && desktopFailed === 0,
                         desktopPending > 0 ? `${desktopPending} 张未记账`
                             : (desktopFailed > 0 ? `${desktopFailed} 个入口读取失败` : ""));
+                    /* 月度计划是「按月」的，子项按天解锁，不属于当天的达标口径：
+                       只报进度，不参与 allDone 判定，也不进「受限制未完成」。 */
+                    if (monthlyOn && RewardsAuto.state.monthlyFound > 0) {
+                        const mDone = Number(RewardsAuto.state.monthlyDone) || 0;
+                        const mTotal = Number(RewardsAuto.state.monthlyTotal) || 0;
+                        rows.push("📆 月度计划 · " + (RewardsAuto.state.monthlyComplete ? "✅" : "⏳")
+                            + ` ${mDone}/${mTotal}`
+                            + (RewardsAuto.state.monthlyPending > 0 && !RewardsAuto.state.monthlyComplete
+                                ? "，子项按天解锁" : ""));
+                    } else if (monthlyOn) {
+                        rows.push("📆 月度计划 · ⏭️ 本月无进行中任务");
+                    }
                     row("📅 签到", signOn, signOk, this.streakDays > 0 ? "连签 " + this.streakDays + " 天" : "");
                     row("📋 阅读", readOn, readOk, readProg + "/" + readMaxProg);
                     row("🔍 PC 搜索", searchOn, searchOk, info.pc.progress + "/" + info.pc.max);
@@ -6789,7 +7285,7 @@ const __scBgKeepAlive = (function() {
         try {
             __MP_TEST_HOOK__({ Utils, API, RewardsAuto, RegionGuard, Webhooks, Sched, TaskManager, Auth,
                 CardLock, SEARCH_PACER, EdgeStreak, EdgePacer, UA, EDGE, CDP,
-                BrowserEnv, ActionMap, ClaimPoints });
+                BrowserEnv, ActionMap, ClaimPoints, MONTHLY });
         } catch (_) {}
     }
 
