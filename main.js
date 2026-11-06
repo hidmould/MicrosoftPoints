@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.7
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
+// @version      1.2.8
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）、✅桌面/待领取/月度三类走 CDP 页面通道（Edge 免换 Chrome）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -887,6 +887,18 @@ const __scBgKeepAlive = (function() {
             return { hasMuid, hasSession, names: [...found].slice(0, 20) };
         },
 
+        /* Edge 上后台直发会被打回登录页，这三类任务（桌面专属 / 首页待领取 / 月度计划）
+           都依赖「先读到真实页面，再决定做什么」，所以读取也必须能走 CDP。
+           CDP 可用时优先在页面上下文里读；读不到再退回后台直发（Chrome 上直发本来就通）。
+           返回值与 Utils.xhr 一致：成功是文本，失败抛错。 */
+        async rewardsPageText(url, { headers, viaCdpFirst = true } = {}) {
+            if (viaCdpFirst && GM_getValue("Config.questViaCdp", true)) {
+                const txt = await CDP.fetchInPage(url);
+                if (txt) return txt;
+            }
+            return await this.xhr({ url, headers });
+        },
+
         async getCookieHeader(force = false) {
             const now = Date.now();
             if (!force && this._ckCache && now - this._ckAt < 5 * 60 * 1000) return this._ckCache;
@@ -1685,14 +1697,24 @@ const __scBgKeepAlive = (function() {
             Utils.log("🔴", msg);
         },
 
+        /* 可用性探测带短 TTL：这三类任务现在每轮要读好几个页面，
+           每次都探一次 /json/version 是纯浪费；连不上时也避免反复打端口。 */
+        _availAt: 0,
+        _availVal: false,
+        AVAIL_TTL: 60 * 1000,
+
         async available() {
             if (typeof WebSocket === "undefined") return false;
+            const now = Date.now();
+            if (now - this._availAt < this.AVAIL_TTL) return this._availVal;
             try {
                 const r = await Utils.xhr({ url: this.base() + "/json/version", timeout: 3000 });
-                return !!(r && String(r).indexOf("Browser") >= 0);
+                this._availVal = !!(r && String(r).indexOf("Browser") >= 0);
             } catch (_) {
-                return false;
+                this._availVal = false;
             }
+            this._availAt = now;
+            return this._availVal;
         },
 
         async targets() {
@@ -1707,7 +1729,14 @@ const __scBgKeepAlive = (function() {
         async earnPage() {
             const list = await this.targets();
             if (!list) return null;
-            const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
+            /* 优先 earn 页（交卷类请求需要它），但任意 rewards 页面都能用于「页面同源读取」：
+               用户很可能就停在 /dashboard 上看待领积分，此时不该判定成「没有可用页面」。
+               以前只认 /earn 开头，页面停在 dashboard 时 fetchInPage 直接返回 null，
+               表现就是「CDP 明明连着，却读不到任何东西」。 */
+            const rewardsPages = list.filter(t => t.type === "page" && t.url
+                && /^https:\/\/rewards\.bing\.com\//i.test(t.url));
+            const hit = rewardsPages.find(t => t.url.indexOf("https://rewards.bing.com/earn") === 0)
+                || rewardsPages[0];
             if (hit) return hit;
             if (!GM_getValue("Config.cdpAllowNewTab", false)) return null;
             try {
@@ -1807,6 +1836,27 @@ const __scBgKeepAlive = (function() {
                 if (!j.ok || !j.text) return null;
                 return String(j.text);
             } catch (_) { return null; }
+        },
+
+        /* 在页面上下文里 GET 一个 rewards 页面（带登录态）。
+           与 fetchPageText 的区别：这个函数自己负责「找页面 / 连上 / 保持连接」，
+           可以在一轮任务里被反复调用而不必每次重连。
+           Edge 上这是唯一可靠的读取方式：后台直发（GM_xhr）拿到的会是登录页。
+           返回文本；失败返回 null（调用方据此退回后台直发）。 */
+        async fetchInPage(url, { reuse = true } = {}) {
+            try {
+                if (!(await this.available())) return null;
+                const page = await this.earnPage();
+                if (!page || !page.webSocketDebuggerUrl) return null;
+                if (!this._ws || this._ws.readyState !== 1) {
+                    await this.connect(page.webSocketDebuggerUrl);
+                }
+                const text = await this.fetchPageText(url);
+                if (!reuse) this.close();
+                return text;
+            } catch (_) {
+                return null;
+            }
         },
 
         async claimInPage(pageUrl, headers, body) {
@@ -2143,24 +2193,58 @@ const __scBgKeepAlive = (function() {
         KEY_EMPTY_AT: "Config.claimEmptyAt",
         EMPTY_TTL: 15 * 60 * 1000,
 
+        /* 待领积分判定。
+           ⚠️ 这里有两个历史坑，都修在此处：
+           1) 页面里有两个同名键：
+                · "PointClaim"（大写 P）= i18n 文案表，出现在页面很靠前的位置（~138K）
+                · "pointClaim"（小写 p）= 真正的待领数据，{"points":N,"entries":[...]}（~182K）
+              原来正则带 /i，先命中 i18n 那一处，于是把「文案表」当成「待领数据」。
+              所以必须区分大小写：数据键首字母小写。
+           2) _amount() 原来只从命中位置往后读 1200 字符。命中 i18n 时，真实数据在几万字符之外，
+              永远读不到 → 金额恒为 0 → 明明有 3 分待领却报「金额为 0」。
+              现在改成扫全页所有 "pointClaim":{...} 对象，取 points>0 的最大值。 */
         parse(html) {
             const raw = String(html || "");
             if (!raw) return { known: false, has: false, amount: 0 };
             const clean = raw.replace(/\\"/g, '"');
-            const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/i);
-            if (m) {
-                if (m[1] === "null") return { known: true, has: false, amount: 0, source: "pointClaim" };
-                /* pointClaim 是个非 null 的空壳对象（如 {"points":0}）时，原来会一直当成「有待领」
-                   去发领取请求，失败了每轮再通知一次。这里必须用金额二次判定。 */
-                const amount = this._amount(clean);
-                if (amount > 0) return { known: true, has: true, amount, source: "pointClaim" };
+
+            /* 只认小写 p 的数据键；m[1] 是 null / { / [ */
+            const keys = [...clean.matchAll(/"pointClaim"\s*:\s*(null|\{|\[)/g)];
+            if (keys.length > 0) {
+                let best = 0;
+                let sawObject = false;
+                for (const k of keys) {
+                    /* 该键后面紧跟 null 就跳过，但继续看其它出现处（可能前一个是 null、后一个才是数据） */
+                    if (k[1] === "null") continue;
+                    sawObject = true;
+                    const amt = this._amountAt(clean, k.index);
+                    if (amt > best) best = amt;
+                }
+                if (best > 0) return { known: true, has: true, amount: best, source: "pointClaim" };
+                if (sawObject) {
+                    /* 确实是数据对象但金额读成 0（空池/条目为空）→ 才算无可领 */
+                    const badge = this._badge(clean);
+                    if (badge > 0) return { known: true, has: true, amount: badge, source: "badge" };
+                    return { known: true, has: false, amount: 0, source: "pointClaim-empty", uncertain: true };
+                }
+                /* 只见到 "pointClaim":null：池子确实是空的，这是最确定的「无可领」 */
                 const badge = this._badge(clean);
                 if (badge > 0) return { known: true, has: true, amount: badge, source: "badge" };
-                return { known: true, has: false, amount: 0, source: "pointClaim-empty", uncertain: true };
+                return { known: true, has: false, amount: 0, source: "pointClaim" };
             }
             const badge = this._badge(clean);
             if (badge >= 0) return { known: true, has: badge > 0, amount: badge, source: "badge" };
             return { known: false, has: false, amount: 0 };
+        },
+
+        /* 从某个 "pointClaim" 位置往后截取该对象所在窗口，读 points。
+           窗口放大到 4000 字符：entries 数组里每条都有 category/date/expiryDate/points，
+           真实数据块也就几百字符；放大只是为了容错字段顺序，不会跨到别的对象。 */
+        _amountAt(clean, from) {
+            const start = Math.max(0, from);
+            const win = clean.slice(start, start + 4000);
+            const m = win.match(/"points"\s*:\s*(\d+)/i);
+            return m ? (parseInt(m[1], 10) || 0) : 0;
         },
 
         /* 页面徽标上的「可领取 N」数字，仅用于 pointClaim 金额读到 0 时的兜底确认。
@@ -2181,23 +2265,34 @@ const __scBgKeepAlive = (function() {
             return m ? (parseInt(m[1], 10) || 0) : 0;
         },
 
+        /* 保留这个入口给诊断代码用：扫全页所有小写 "pointClaim" 数据键，取最大金额。
+           （不要改回「命中第一处再往后读 1200 字符」——那会被 i18n 的 PointClaim 带偏。） */
         _amount(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
-            const win = clean.slice(Math.max(0, clean.search(/"pointClaim"/i)), clean.search(/"pointClaim"/i) + 1200);
-            const m = win.match(/"(?:points|amount|availablePoints|totalPoints)"\s*:\s*(\d+)/i);
-            return m ? (parseInt(m[1], 10) || 0) : 0;
+            let best = 0;
+            for (const k of clean.matchAll(/"pointClaim"\s*:\s*(?:\{|\[)/g)) {
+                const amt = this._amountAt(clean, k.index);
+                if (amt > best) best = amt;
+            }
+            return best;
         },
 
         _request(actionMap) {
             const id = (actionMap && actionMap.reportClaimAllPoints) || ActionMap.FALLBACK.reportClaimAllPoints;
             const dpl = (actionMap && actionMap.dpl) || RewardsAuto._dpl || GM_getValue("Config.dpl", "");
+            /* ⚠️ 目标必须是 /dashboard，不能是 /earn。
+               实测（Edge 156 + CDP 页面上下文，同一个兜底 action id）：
+                   POST /dashboard → 响应 "1:true"   （受理，余额 +3）
+                   POST /earn      → 响应 "1:false"  （拒绝）
+               领取组件挂在首页，Next.js 只在该路由注册了 reportClaimAllPoints；
+               发到 /earn 会拿到 false 帧，看起来像「通道没受理」，其实是发错了地方。 */
             return {
-                url: "https://rewards.bing.com/earn",
+                url: "https://rewards.bing.com/dashboard",
                 headers: {
                     "content-type": "text/plain;charset=UTF-8",
                     "next-action": id,
-                    "next-router-state-tree": Utils.routerStateTree("earn"),
-                    "referer": "https://rewards.bing.com/earn",
+                    "next-router-state-tree": Utils.routerStateTree("dashboard"),
+                    "referer": "https://rewards.bing.com/dashboard",
                     "accept": "text/x-component",
                     "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
                     "origin": "https://rewards.bing.com",
@@ -2215,22 +2310,11 @@ const __scBgKeepAlive = (function() {
             );
         },
 
-        async _cdpPage() {
-            return await API._anyRewardsPage();
-        },
-
         async run({ name = "领取积分" } = {}) {
             const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "", uncertain: false };
-            let dashHtml = "";
-            try {
-                if (await CDP.available()) {
-                    const page = await this._cdpPage();
-                    if (page) {
-                        if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
-                        dashHtml = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
-                    }
-                }
-            } catch (_) { dashHtml = ""; }
+            /* 首页待领取：Edge 上必须走 CDP 页面上下文读 dashboard，
+               后台直发拿到的是登录页（读不到 pointClaim），这也是它「Edge 上做不到」的原因。 */
+            let dashHtml = await CDP.fetchInPage("https://rewards.bing.com/dashboard") || "";
             if (!dashHtml) {
                 try { dashHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" }); } catch (_) { dashHtml = ""; }
             }
@@ -2268,25 +2352,19 @@ const __scBgKeepAlive = (function() {
             if (!accepted.ok) return out;
 
             await Utils.delay(1200);
-            let afterHtml = "";
-            try {
-                if (accepted.variant === "page") {
-                    const page = await this._cdpPage();
-                    if (page) afterHtml = await CDP.fetchPageText("https://rewards.bing.com/earn") || "";
-                }
-                if (!afterHtml) afterHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
-            } catch (_) { afterHtml = ""; }
+            /* 回读余额同样要走页面上下文：Edge 上直发回的是登录页，_balance() 会读成 0，
+               于是「已受理但余额未变」被误判成领取失败。 */
+            let afterHtml = await CDP.fetchInPage("https://rewards.bing.com/earn") || "";
+            if (!afterHtml) {
+                try { afterHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" }); } catch (_) { afterHtml = ""; }
+            }
             out.after = this._balance(afterHtml);
             out.claimed = (out.before > 0 && out.after > out.before) ? (out.after - out.before) : 0;
 
             if (out.claimed <= 0) {
                 await Utils.delay(2500);
                 try {
-                    let again = "";
-                    if (accepted.variant === "page") {
-                        const page = await this._cdpPage();
-                        if (page) again = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
-                    }
+                    let again = await CDP.fetchInPage("https://rewards.bing.com/dashboard") || "";
                     if (!again) again = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
                     const later = this._balance(again);
                     if (out.before > 0 && later > out.before) {
@@ -3881,10 +3959,7 @@ const __scBgKeepAlive = (function() {
 
         async fetchQuestCards(parentId) {
             const url = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
-            const html = await Utils.xhr({
-                url,
-                headers: RewardsAuto.desktopAppHeaders
-            });
+            const html = await Utils.rewardsPageText(url, { headers: RewardsAuto.desktopAppHeaders });
             if (!html) return { parentId, url, html: "", cards: [] };
             const text = this._flightText(html);
             const cards = [];
@@ -3980,7 +4055,9 @@ const __scBgKeepAlive = (function() {
             for (const idn of identities) {
                 let html = "";
                 try {
-                    html = await Utils.xhr({ url, headers: idn.headers });
+                    /* 优先在 CDP 页面上下文里读：Edge 后台直发会拿到登录页，
+                       读不到子项，后面的交卷分支再强也用不上。 */
+                    html = await Utils.rewardsPageText(url, { headers: idn.headers });
                 } catch (e) {
                     lastReason = `详情页请求失败：${e.message}`;
                     continue;
@@ -4161,7 +4238,7 @@ const __scBgKeepAlive = (function() {
                两边都跑会对同一批子项重复交卷。 */
             let earnHtml = "";
             try {
-                earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn", headers: RewardsAuto.desktopAppHeaders });
+                earnHtml = await Utils.rewardsPageText("https://rewards.bing.com/earn", { headers: RewardsAuto.desktopAppHeaders });
             } catch (e) {
                 Utils.log("🔴", `月度计划：拉取 earn 页失败（${e.message}），本轮跳过`);
                 return { found: 0, done: 0, total: 0, pending: 0, complete: false, failed: 1 };
@@ -4541,9 +4618,7 @@ const __scBgKeepAlive = (function() {
             let encEarn;
             try {
 
-                encEarn = await Utils.xhr({
-                    url: "https://rewards.bing.com/earn",
-
+                encEarn = await Utils.rewardsPageText("https://rewards.bing.com/earn", {
                     headers: {
                         ...RewardsAuto.desktopAppHeaders
                     }
@@ -6535,9 +6610,14 @@ const __scBgKeepAlive = (function() {
                     let logMsg = head + "\n\n" + rows.join("\n")
                         + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
                     if (blocked.length > 0) {
+                        /* Edge 新版会把握把后台直发打回登录页，所以这几类要么换 Chrome，
+                           要么在 Edge 上开 CDP 走页面同源请求；两种都能自动完成。 */
+                        const viaCdp = CDP._availVal;
                         logMsg += "\n\n⏳ 受限制未完成：\n"
                             + blocked.map(s => "· " + s).join("\n")
-                            + "\n💡 上面三项要自动完成，需用 Chrome 浏览器运行脚本";
+                            + (viaCdp
+                                ? "\n💡 已连上 CDP 页面通道，这几项会在后续轮次重试"
+                                : "\n💡 上面几项要自动完成：用 Chrome 运行，或在 Edge 上开 CDP（见 README）");
                     }
 
                     /* 通知策略：常规任务全达标才推一条汇总；中间轮次只写日志。
