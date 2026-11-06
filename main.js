@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.0
+// @version      1.2.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -630,24 +630,37 @@ const __scBgKeepAlive = (function() {
         xhrFull(options) {
             return new Promise((resolve, reject) => {
                 const start = Date.now();
+                /* 同 xhr()：后台被冻结时回调不会来，用计时器保证一定会 settle */
+                const softMs = (Number(options && options.timeout) || 15000) + 10000;
+                let settled = false;
+                let guard = null;
+                const finish = (fn, arg) => {
+                    if (settled) return;
+                    settled = true;
+                    if (guard) clearTimeout(guard);
+                    fn(arg);
+                };
+                guard = setTimeout(() => {
+                    finish(reject, new Error(`请求无响应（${Math.round(softMs / 1000)} 秒未回调），已放弃`));
+                }, softMs);
                 GM_xmlhttpRequest({
                     ...options,
                     timeout: Number(options && options.timeout) || 15000,
                     onload: (res) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
                         if (res.status >= 200 && res.status < 300) {
-                            resolve({ text: res.responseText, finalUrl: res.finalUrl || "", status: res.status });
+                            finish(resolve, { text: res.responseText, finalUrl: res.finalUrl || "", status: res.status });
                         } else {
-                            reject(new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
+                            finish(reject, new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
                         }
                     },
                     onerror: (err) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
-                        reject(new Error(`${err?.error || "网络错误"}，用时 ${cost} 秒`));
+                        finish(reject, new Error(`${err?.error || "网络错误"}，用时 ${cost} 秒`));
                     },
                     ontimeout: () => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
-                        reject(new Error(`请求超时，用时 ${cost} 秒`));
+                        finish(reject, new Error(`请求超时，用时 ${cost} 秒`));
                     }
                 });
             });
@@ -665,6 +678,22 @@ const __scBgKeepAlive = (function() {
                     const ck = this._ckReady();
                     if (ck) hdr["cookie"] = ck;
                 }
+                /* GM_xmlhttpRequest 的 timeout 只管网络层。
+                   MV3 后台被冻结/回收时，请求就悬在半空，onload/onerror/ontimeout
+                   一个都不会来，await 永远不返回 —— 这正是「一直卡着」的根源之一。
+                   这里补一个纯计时器的兜底：到点一定 settle，绝不让调用方挂死。 */
+                const softMs = (Number(options && options.timeout) || 15000) + 10000;
+                let settled = false;
+                let guard = null;
+                const finish = (fn, arg) => {
+                    if (settled) return;
+                    settled = true;
+                    if (guard) clearTimeout(guard);
+                    fn(arg);
+                };
+                guard = setTimeout(() => {
+                    finish(reject, new Error(`请求无响应（${Math.round(softMs / 1000)} 秒未回调），已放弃`));
+                }, softMs);
                 GM_xmlhttpRequest({
                     ...options,
                     headers: hdr,
@@ -672,21 +701,21 @@ const __scBgKeepAlive = (function() {
                     onload: (res) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
                         if (res.status >= 200 && res.status < 300) {
-                            resolve(res.responseText);
+                            finish(resolve, res.responseText);
                         } else if ([301, 302, 307, 308].includes(res.status)) {
                             const match = res.responseHeaders?.match(/Location:\s*(.*?)\s*\r?\n/i);
-                            resolve(match ? match[1] : false);
+                            finish(resolve, match ? match[1] : false);
                         } else {
-                            reject(new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
+                            finish(reject, new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
                         }
                     },
                     onerror: (err) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
-                        reject(new Error(`${err?.error || "网络错误"}，用时 ${cost} 秒`));
+                        finish(reject, new Error(`${err?.error || "网络错误"}，用时 ${cost} 秒`));
                     },
                     ontimeout: () => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
-                        reject(new Error(`请求超时，用时 ${cost} 秒`));
+                        finish(reject, new Error(`请求超时，用时 ${cost} 秒`));
                     }
                 });
             });
@@ -934,8 +963,24 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
-        refreshLock(key) {
-            GM_setValue(key, { id: Utils.lockId(), ts: Date.now() });
+        refreshLock(key, ttlMs = 20 * 60 * 1000) {
+            const now = Date.now();
+            const holder = GM_getValue(key, null);
+            const mine = Utils.lockId();
+            /* 只在「锁是自己的」或「锁已过期」时续期：
+               否则一个被冻结的上下文醒来后会把别人正在跑的那一轮锁抢成自己的。 */
+            if (holder && typeof holder === "object" && holder.id && holder.id !== mine
+                && now - (holder.ts || 0) < ttlMs) {
+                return false;
+            }
+            GM_setValue(key, { id: mine, ts: now });
+            return true;
+        },
+
+        lockInfo(key) {
+            const h = GM_getValue(key, null);
+            if (!h || typeof h !== "object" || !h.id) return null;
+            return { id: h.id, ts: Number(h.ts) || 0, mine: h.id === Utils.lockId() };
         },
 
         releaseLock(key) {
@@ -4840,6 +4885,102 @@ const __scBgKeepAlive = (function() {
         signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
         claimSummary: "",
         running: false, runningSince: 0,
+        abortRound: false, hbTimer: null, roundSeq: 0, roundId: 0, lastRunStarted: false,
+
+        /* 心跳：证明「这个上下文还活着」，同时给运行锁续期。
+           注意只写 aliveAt（存活时间），不写 at（最后进展时间）——
+           at 由真正的任务推进刷新，两个时间分开才能区分
+           「活着但卡在某个请求上」和「已经彻底断开」。 */
+        heartbeat() {
+            if (!this.running) return false;
+            /* 只允许「当前这一轮」动状态：被强制收尾后，旧轮的 promise 链
+               还可能继续往下走，它的心跳不能把新一轮的标记覆盖掉。 */
+            if (this.roundId !== this.roundSeq) return false;
+            const now = Date.now();
+            if (now - (this.runningSince || now) > ROUND_HARD_LIMIT) {
+                const msg = this.abortRound
+                    ? ""
+                    : `本轮已超过硬上限 ${Math.round(ROUND_HARD_LIMIT / 60000)} 分钟没有收尾，强制释放运行标记（下一轮重新开始）`;
+                this.forceCleanupOwnRound(msg);
+                return false;
+            }
+            /* 上下文还活着但任务长时间没有推进：同样要收尾。
+               MV3 后台被冻结时 setInterval 会跟着停，这种情况心跳本身就是死的；
+               而「心跳活着、at 不动」是卡在永不 settle 的 await 上，必须主动打断。 */
+            const st = Sched.getState() || {};
+            const lastProgress = Math.max(Number(st.at) || 0, Number(st.since) || 0, this.runningSince || 0);
+            if (now - lastProgress > ROUND_STALL) {
+                if (!this.abortRound) {
+                    Utils.log("🔴", `本轮已经 ${Math.round((now - lastProgress) / 60000)} 分钟没有任何进展（多半卡在一个不会返回的请求上），强制收尾并交给下一轮`);
+                }
+                this.forceCleanupOwnRound("");
+                return false;
+            }
+            GM_setValue("Config.runState", Object.assign({}, st, {
+                phase: "running",
+                aliveAt: now,
+                ctx: Sched.ctxName(),
+                since: this.runningSince
+            }));
+            Utils.refreshLock("Config.runLock", RUN_LOCK_TTL);
+            return true;
+        },
+
+        startHeartbeat() {
+            this.stopHeartbeat();
+            this.heartbeat();
+            this.hbTimer = setInterval(() => {
+                try { this.heartbeat(); } catch (_) {}
+            }, RUN_HEARTBEAT_GAP);
+        },
+
+        stopHeartbeat() {
+            if (this.hbTimer) {
+                clearInterval(this.hbTimer);
+                this.hbTimer = null;
+            }
+        },
+
+        /* 强制收尾：只放掉「确实是自己」的锁。
+           如果锁已经被别的上下文接手，那这里清掉会把别人正在跑的一轮搞坏。 */
+        forceCleanupOwnRound(reason) {
+            this.abortRound = true;
+            this.stopHeartbeat();
+            this.running = false;
+            this.runningSince = 0;
+            /* 换一代，旧轮后续的心跳/收尾都不再被认为属于当前这一轮 */
+            this.roundSeq++;
+            this.roundId = this.roundSeq;
+            const lock = Utils.lockInfo("Config.runLock");
+            if (!lock || lock.mine) GM_setValue("Config.runLock", null);
+            try { Sched.state("done"); } catch (_) {}
+            try { Sched.clearClaim(); } catch (_) {}
+            if (reason) Utils.log("🔴", reason);
+        },
+
+        /* 到点或被强制收尾后，长循环要尽快退出，别再往微软发请求 */
+        aborted() { return !!this.abortRound; },
+        ensureAlive() {
+            const err = msg => {
+                const e = new Error(msg);
+                e.roundAborted = true;
+                return e;
+            };
+            if (this.abortRound) throw err("本轮已超时收尾");
+            /* 已经换代 = 这一轮被强制收尾过，旧链不该再往下跑 */
+            if (this.roundId !== this.roundSeq) throw err("本轮已被新的轮次取代");
+            /* 锁被别人拿走了（另一个上下文接手）也要停手，避免并发重复上报 */
+            const info = Utils.lockInfo("Config.runLock");
+            if (info && !info.mine) throw err("运行锁已被其它上下文接管");
+            Utils.refreshLock("Config.runLock", RUN_LOCK_TTL);
+        },
+
+        /* 长循环里的进度打点：既证明「还活着」，也证明「还在动」。
+           每处理完一张卡/一篇文章调一次，卡死检测就不会误伤正常的长任务。 */
+        tick() {
+            this.ensureAlive();
+            try { Sched.progress(); } catch (_) {}
+        },
 
         init() {
             RewardsAuto.state.dateNowNum = Utils.getTodayNum();
@@ -4942,6 +5083,7 @@ const __scBgKeepAlive = (function() {
             let successCount = 0;
             let stagnant = 0;
             for (let i = 0; i < target; i++) {
+                this.tick();
                 if (!SEARCH_PACER.fits(readDeadline, gap)) {
                     Utils.log("🟡", `阅读到点交班，还剩 ${target - i} 篇交给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
                     break;
@@ -5075,6 +5217,7 @@ const __scBgKeepAlive = (function() {
             let outOfTime = false;
             for (const card of cards) {
                 await RegionGuard.guard("活动卡片");
+                this.tick();
                 Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
                 if (shouldSkip(card)) continue;
                 if (!SEARCH_PACER.fits(roundDeadline, gap)) {
@@ -5173,9 +5316,8 @@ const __scBgKeepAlive = (function() {
             Utils.log("🔍", `单轮搜索最多 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），起始节拍 ${Math.round(gap / 1000)} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
 
             while (attempts < attemptCap && Date.now() < hardDeadline) {
-                Utils.refreshLock("Config.runLock");
-                try { Sched.state("running"); } catch (_) {}
-
+                /* 每轮搜索前确认这一轮还活着（超时就抛错退出，锁被接管也退出） */
+                this.tick();
                 await RegionGuard.guard("PC 搜索");
 
                 attempts++;
@@ -5353,6 +5495,7 @@ const __scBgKeepAlive = (function() {
                 for (const card of cards) {
                     if (doneIds.has(card.offerId)) continue;
                     await RegionGuard.guard("每日活动领取");
+                    this.tick();
                     Utils.log("📅", `领取每日活动: ${card.title} +${card.points}p`);
                     if (!SEARCH_PACER.fits(roundDeadline, gap)) {
                         Utils.log("🟡", `每日活动到点交班，剩余卡片留给下一轮（当前节拍 ${Math.round(gap / 1000)} 秒）`);
@@ -5533,22 +5676,43 @@ const __scBgKeepAlive = (function() {
         },
 
         async runAll() {
-            if (this.running && Date.now() - (this.runningSince || 0) < RUN_STALE) {
-                Utils.log("🟡", "任务正在运行中，请勿重复触发");
+            this.lastRunStarted = false;
+            if (this.running) {
+                /* 本上下文内存标记还立着：只有心跳/进展都停了才算残留。
+                   以前这里只看 runningSince + 40 分钟，卡住的轮次会一直拦着自己。 */
+                const st = Sched.getState() || {};
+                const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0, this.runningSince || 0);
+                if (Date.now() - lastAct < RUN_STALE) {
+                    Utils.log("🟡", "任务正在运行中，请勿重复触发");
+                    return;
+                }
+                Utils.log("🟡", "上一轮的运行标记是残留的（上下文被冻结过），清理后继续");
+                this.forceCleanupOwnRound("");
+            }
+            /* 先回收已经死掉的轮次（条目不新鲜就清掉），再看是否真的有人在跑。
+               顺序不能反：反了的话一条死记录会永远拦住新的一轮。 */
+            Sched.reap();
+            if (Sched.isBusy()) {
+                const st = Sched.getState() || {};
+                const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0);
+                Utils.log("🟡", `上一轮（${st.ctx || "未知"}）还在执行中（最后活动 ${Math.round((Date.now() - lastAct) / 1000)} 秒前），本次触发跳过`);
                 return;
             }
-            if (this.running) {
-                Utils.log("🟡", "上一轮的运行标记是残留的（上下文被冻结过），清理后继续");
-                this.running = false;
-            }
             Utils.log("▶️", `本轮进入执行流程（${Utils.hasDOM() ? "页面" : "后台"}上下文）`);
-            if (!Utils.acquireLock("Config.runLock", 45 * 60 * 1000)) {
-                Utils.log("⏳", "另一个上下文正在运行任务，本次跳过（避免并发重复上报）");
+            this.abortRound = false;
+            if (!Utils.acquireLock("Config.runLock", RUN_LOCK_TTL)) {
+                const hold = Utils.lockInfo("Config.runLock");
+                Utils.log("⏳", `另一个上下文正在运行任务（锁 ${hold ? Math.round((Date.now() - hold.ts) / 1000) + " 秒前更新" : "未知"}），本次跳过（避免并发重复上报）`);
                 return;
             }
             this.running = true;
             this.runningSince = Date.now();
+            this.lastRunStarted = true;
+            this.roundSeq++;
+            this.roundId = this.roundSeq;
+            const myRound = this.roundId;
             Sched.state("running");
+            this.startHeartbeat();
             const roundDeadline = this.runningSince + ROUND_BUDGET_MS;
             try {
                 this.signTimes = 0;
@@ -5572,10 +5736,13 @@ const __scBgKeepAlive = (function() {
                 const retryDelay = 60000;
                 const maxRetries = 2;
                 const withRetry = async (taskFn, taskName, retries = 0) => {
-                    Utils.refreshLock("Config.runLock");
+                    /* 进每个阶段都先确认这一轮还活着，并标记一次真实进展 */
+                    this.ensureAlive();
+                    Sched.progress();
                     try {
                         const result = await taskFn();
                         if (result === false && retries < maxRetries) {
+                            if (this.aborted()) return result;
                             Utils.log("🟡", `${taskName} 失败，${retryDelay/1000}秒后重试 (${retries + 1}/${maxRetries})`);
                             await Utils.delay(retryDelay);
                             return withRetry(taskFn, taskName, retries + 1);
@@ -5583,7 +5750,9 @@ const __scBgKeepAlive = (function() {
                         return result;
                     } catch (e) {
                         if (e && e.regionBlocked) throw e;
+                        if (e && e.roundAborted) throw e;
                         if (retries < maxRetries) {
+                            if (this.aborted()) return false;
                             Utils.log("🟡", `${taskName} 异常: ${e.message}，${retryDelay/1000}秒后重试`);
                             await Utils.delay(retryDelay);
                             return withRetry(taskFn, taskName, retries + 1);
@@ -5637,6 +5806,7 @@ const __scBgKeepAlive = (function() {
                         let rescanGap = SEARCH_PACER.startGap();
                         for (const card of newCards) {
                             await RegionGuard.guard("二次扫描");
+                            this.tick();
                             Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
                             if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
                             if (!SEARCH_PACER.fits(roundDeadline, rescanGap)) {
@@ -5728,14 +5898,24 @@ const __scBgKeepAlive = (function() {
             } catch (e) {
                 if (e && e.regionBlocked) {
                     Utils.log("🛑", `本轮已中止：${e.message}`);
+                } else if (this.aborted()) {
+                    Utils.log("🛑", "本轮已超时收尾，剩余任务交给下一轮");
                 } else {
                     Utils.log("🔴", `本轮任务异常终止: ${e.message}`);
                 }
             } finally {
-                Utils.releaseLock("Config.runLock");
-                this.running = false;
-                this.runningSince = 0;
-                Sched.state("done");
+                /* 被强制收尾后可能已经有新的一轮接上来了：
+                   旧轮的 finally 不能把新一轮的 running/锁/阶段清掉。 */
+                if (myRound === this.roundId) {
+                    this.stopHeartbeat();
+                    this.running = false;
+                    this.runningSince = 0;
+                    this.abortRound = false;
+                    Utils.releaseLock("Config.runLock");
+                    Sched.state("done");
+                } else {
+                    Utils.log("🟡", "上一轮的收尾被跳过（已经由更新的那一轮接管）");
+                }
             }
         }
     };
@@ -5863,18 +6043,35 @@ const __scBgKeepAlive = (function() {
 
     GM_registerMenuCommand("🚀 立即运行", () => {
         Utils.log("🚀", "手动触发：立即运行一轮");
+        /* 手动触发前先把卡死的记录收掉：否则用户点一次还是只会看到
+           「上一轮任务还在执行中」，那正是这次要修的现象。 */
+        const reaped = Sched.reapDeadRound();
+        if (!reaped && Sched.isBusy()) {
+            const st = Sched.getState() || {};
+            Utils.log("🟡", `上一轮任务还在执行中（${st.ctx || "未知"}，最后活动 ${Sched.fmt(st.at)}），请等它跑完或先用「🔓 释放运行锁」`);
+            return;
+        }
+        if (TaskManager.running) {
+            Utils.log("🟡", "当前上下文已有一轮在跑，本次手动触发跳过");
+            return;
+        }
         Promise.resolve()
             .then(() => TaskManager.runAll())
             .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
-            .finally(() => Sched.finish(true));
+            /* runAll 因为拿不到锁而直接返回时 lastRunStarted 仍是 false：
+               用它区分「真的跑了一轮」和「没跑起来」，后者 2 分钟后就重试。 */
+            .finally(() => Sched.finish(true, TaskManager.lastRunStarted));
     });
 
     const diagReleaseLock = () => {
         try { Utils.releaseLock("Config.runLock"); } catch (_) {}
+        try { GM_setValue("Config.runLock", null); } catch (_) {}
         try { Sched.clearClaim(); } catch (_) {}
         GM_setValue("Config.runState", null);
+        try { TaskManager.stopHeartbeat(); } catch (_) {}
         TaskManager.running = false;
         TaskManager.runningSince = 0;
+        TaskManager.abortRound = false;
         Utils.log("🔓", "已强制释放运行锁并清理运行状态，下一轮可正常触发");
     };
 
@@ -5982,7 +6179,27 @@ const __scBgKeepAlive = (function() {
     const CRON_HEARTBEAT_LOG = 10 * 60 * 1000;
     const CRON_HEARTBEAT_LOG_IDLE = 60 * 60 * 1000;
     const CRON_STALL = 3 * 60 * 1000;
-    const RUN_STALE = 40 * 60 * 1000;
+    /* 「心跳」判据：真正在跑的上下文每 20 秒刷一次 aliveAt。
+       超过 RUN_STALE 两个时间都没动，就判定它已经死了。
+       以前只按「开始时间」算且窗口是 40 分钟，于是一轮卡住后
+       每次触发都只打印「上一轮任务还在执行中」，看起来就是永久卡进程。 */
+    const RUN_STALE = 5 * 60 * 1000;
+    /* 孤儿轮次的宽限期：浏览器重启回来时，上一个上下文的 aliveAt 可能只过去几秒，
+       等 3 个心跳周期还不刷新，就说明那是残留而不是真的在跑。 */
+    const ORPHAN_GRACE = 45 * 1000;
+    /* 运行锁租期：心跳每 20 秒续期一次，正常跑永不过期；
+       中断后最多这么久就会被下一个上下文抢走，不再永久占位。 */
+    const RUN_LOCK_TTL = 6 * 60 * 1000;
+    const RUN_HEARTBEAT_GAP = 20 * 1000;
+    /* 「活着但不动」判据：上下文还在心跳，可任务已经这么久没有任何推进，
+       说明卡在某个永不 settle 的 await 上（典型是 MV3 后台被杀后
+       GM_xmlhttpRequest 的回调永远不会来）。这种情况不能再等，
+       否则就是用户看到的「一直卡着，重启浏览器也没用」。
+       取 15 分钟：单张卡最长要约 8 分钟，正常长任务不会被误伤。 */
+    const ROUND_STALL = 15 * 60 * 1000;
+    /* 单轮硬上限：预算 20 分钟 + 收尾阶段（连签/领奖/Edge），
+       留 20 分钟余量，到点无论卡在哪都由心跳强制收尾。 */
+    const ROUND_HARD_LIMIT = ROUND_BUDGET_MS + 20 * 60 * 1000;
 
     const Sched = {
         timer: null,
@@ -6019,28 +6236,65 @@ const __scBgKeepAlive = (function() {
         clearClaim() { GM_setValue("Config.cronClaim", null); },
 
         state(phase, extra) {
-            GM_setValue("Config.runState", Object.assign({ phase, at: Date.now(), ctx: this.ctxName() }, extra || {}));
+            const now = Date.now();
+            const base = { phase, at: now, ctx: this.ctxName() };
+            /* running 阶段一定要带上 aliveAt：它是「这个上下文还活着」的唯一凭据，
+               下一轮/下一个上下文靠它区分「真的在跑」和「早就断了」。 */
+            if (phase === "running") base.aliveAt = now;
+            GM_setValue("Config.runState", Object.assign(base, extra || {}));
         },
         getState() {
             const s = GM_getValue("Config.runState", null);
             return s && typeof s === "object" ? s : null;
         },
 
-        isBusy(now = Date.now()) {
-            const s = this.getState();
-            return !!(s && s.phase === "running" && now - (s.at || 0) < RUN_STALE);
+        /* 任务真的有推进时调一次：只更新 at（最后进展），不碰 aliveAt */
+        progress(extra) {
+            const st = this.getState() || {};
+            GM_setValue("Config.runState", Object.assign({}, st, { phase: "running", at: Date.now() }, extra || {}));
         },
 
-        finish(ok) {
+        isBusy(now = Date.now()) {
+            const s = this.getState();
+            if (!s || s.phase !== "running") return false;
+            /* 存活判据取两个时间的较大者：
+               at       = 最后一次「任务真的有推进」
+               aliveAt  = 最后一次心跳（证明上下文没被冻结）
+               两个都停了才算死。只卡在一个 await 上时 aliveAt 还在走，
+               说明上下文活着，不该被新的一轮插进来并发。 */
+            const last = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
+            return now - last < RUN_STALE;
+        },
+
+        /* 收掉一条已经死掉的 running 记录：清阶段 + 清认领 + 放掉那个上下文留下的锁。
+           返回被回收的记录（没什么可收就返回 null）。
+           能走到这里说明心跳和进展都停了 = 持有锁的那个上下文已经不在了，
+           所以连锁一起收掉，否则下一轮会卡在「另一个上下文正在运行」上。 */
+        reap(now = Date.now()) {
+            const s = this.getState();
+            if (!s || s.phase !== "running") return null;
+            if (this.isBusy(now)) return null;
+            this.state("done");
+            if (this.getClaim()) this.clearClaim();
+            const lock = Utils.lockInfo("Config.runLock");
+            if (lock && !lock.mine) GM_setValue("Config.runLock", null);
+            return s;
+        },
+
+        finish(ok, ran = true) {
             const now = Date.now();
             const claim = this.getClaim();
             if (claim && claim.id && claim.id !== Utils.lockId()) return;
             const base = (claim && claim.at) || now;
+            /* ran=false 表示这一轮根本没拿到锁、什么也没做：
+               不要按 20 分钟排下一轮，否则一次抢锁失败就要干等一整轮。 */
             this.clearClaim();
             GM_setValue("Config.cronLastRun", now);
             const next = base + CRON_PERIOD;
             let plan = next > now + 60 * 1000 ? next : now + 60 * 1000;
-            if (GM_getValue("Tasks.search", true) && SEARCH_PACER.isPending()) {
+            if (!ran) {
+                plan = Math.min(plan, now + 2 * 60 * 1000);
+            } else if (GM_getValue("Tasks.search", true) && SEARCH_PACER.isPending()) {
                 const sooner = now + SEARCH_PACER.RETRY_GAP;
                 if (sooner < plan) {
                     plan = sooner;
@@ -6049,7 +6303,11 @@ const __scBgKeepAlive = (function() {
             }
             this.saveNext(plan);
             this.state(ok ? "done" : "idle");
-            if (ok) Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟，上限 ${ROUND_BUDGET_MS / 60000} 分钟），下一轮 ${this.fmt(this.plan(now))}`);
+            if (!ran) {
+                Utils.log("🕒", `本轮没有真正开始（多半在等上一轮的锁），${Math.max(1, Math.round((plan - now) / 60000))} 分钟后重试`);
+            } else if (ok) {
+                Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟，上限 ${ROUND_BUDGET_MS / 60000} 分钟），下一轮 ${this.fmt(this.plan(now))}`);
+            }
         },
 
         start(task) {
@@ -6058,13 +6316,39 @@ const __scBgKeepAlive = (function() {
             this.startedAt = Date.now();
             this.task = task;
 
-            const claim = this.getClaim();
-            if (claim && claim.at) {
-                const age = this.startedAt - claim.at;
-                if (age > CRON_STALL) {
-                    Utils.log("♻️", `上次触发（${claim.ctx || "未知"}）已过去 ${Math.round(age / 60000)} 分钟仍没跑完，重新补跑`);
-                    this.clearClaim();
-                }
+            /* 新上下文启动时先看遗留记录。
+               执行者每 20 秒刷一次 aliveAt，所以「aliveAt 已经超过 ORPHAN_GRACE」
+               就足以证明那个上下文已经不在了（浏览器关过 / 脚本重载 / 页面被回收）。
+               这种情况下不用等满 RUN_STALE —— 用户关了浏览器再打开，
+               旧记录可能才过去几十秒，以前就是卡在这一步：
+               新实例看到「上一轮还在执行」直接不动，于是无论重开几次都一样。 */
+            const st = this.getState();
+            const staleRunning = st && st.phase === "running";
+            const lastAct = staleRunning ? Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0) : 0;
+            /* 有 aliveAt = 新版记录，心跳 20 秒一跳，45 秒没 Refresh 就肯定是残留；
+               没有 aliveAt = 老版本留下的记录，分不清它是不是还在跑，
+               保守一点，只按 RUN_STALE 判定。 */
+            const grace = (st && Number(st.aliveAt) > 0) ? ORPHAN_GRACE : RUN_STALE;
+            const ownerGone = staleRunning && (this.startedAt - lastAct) >= grace;
+            const lock = Utils.lockInfo("Config.runLock");
+            const lockGrace = (st && Number(st.aliveAt) > 0) ? ORPHAN_GRACE : RUN_LOCK_TTL;
+            const lockOrphan = lock && !lock.mine && (this.startedAt - lock.ts) >= lockGrace;
+
+            if (ownerGone) {
+                this.state("done");
+                Utils.log("♻️", `上一轮（${st.ctx || "未知"}）的执行上下文已不存在（最后心跳 ${this.fmt(lastAct)}），继续沿用它的遗留标记并接手`);
+            } else if (staleRunning && this.isBusy(this.startedAt)) {
+                Utils.log("🕒", `检测到另一个上下文正在执行（${st.ctx || "未知"}，最后心跳 ${this.fmt(lastAct)}），本上下文只负责调度，不重复跑`);
+            }
+            if ((ownerGone || lockOrphan) && lock && !lock.mine) {
+                GM_setValue("Config.runLock", null);
+                Utils.log("♻️", `已清理上一轮遗留的运行锁（${this.fmt(lock.ts)} 写入）`);
+            }
+            if (ownerGone && this.getClaim()) this.clearClaim();
+            if (!staleRunning && !lockOrphan) {
+                /* 没有遗留执行痕迹：顺手把过期的认领也清掉 */
+                const claim = this.getClaim();
+                if (claim && claim.at && this.startedAt - claim.at >= ORPHAN_GRACE) this.clearClaim();
             }
 
             const next = this.plan(this.startedAt);
@@ -6098,6 +6382,9 @@ const __scBgKeepAlive = (function() {
             this.timer = null;
             try {
                 const now = Date.now();
+                /* 先回收死掉的轮次，再算计划和补跑：
+                   顺序反了的话 watchdog / fire 会对着一条死记录反复跳过。 */
+                this.reapDeadRound(now);
                 const next = this.plan(now);
                 this.watchdog(now);
                 EdgePacer.maybeReport().catch(() => {});
@@ -6108,10 +6395,12 @@ const __scBgKeepAlive = (function() {
                 } else if (now - this.lastHbLog >= (stopped ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
                     this.lastHbLog = now;
                     GM_setValue("Config.heartbeatAt", now);
+                    const st = this.getState() || {};
+                    const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0);
                     const tip = stopped
                         ? "，今日任务已全部完成、检测已停止，明天自动恢复"
                         : this.isBusy(now)
-                            ? `，本轮正在执行中（已 ${Math.round((now - ((this.getState() || {}).at || now)) / 60000)} 分钟）`
+                            ? `，本轮正在执行中（最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前）`
                             : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
                     Utils.log("💓", `常驻调度心跳：后台实例已存活 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
                 }
@@ -6121,17 +6410,39 @@ const __scBgKeepAlive = (function() {
             this.arm(false);
         },
 
+        /* 关键修复：一轮要是被挂死了（请求卡住 / 上下文被冻结），
+           以前它的 running 阶段会一直挂着，于是每次触发都只会打印
+           「上一轮任务还在执行中」然后跳过，看起来就是永久卡进程。
+           这里按「最后活动时间」判定，超时就直接收掉，让下一轮正常进来。 */
+        reapDeadRound(now = Date.now()) {
+            const dead = this.reap(now);
+            if (!dead) return false;
+            Utils.log("♻️", `上一轮（${dead.ctx || "未知"}）已经 ${Math.max(0, Math.round((now - (dead.at || now)) / 60000))} 分钟没有动静，判定为卡死，已回收运行标记`);
+            return true;
+        },
+
         fire(now) {
             if (this.isBusy(now)) {
-                this.saveNext(now + 5 * 60 * 1000);
-                Utils.log("🟡", "上一轮任务还在执行中，本次触发跳过");
+                const s = this.getState() || {};
+                this.saveNext(now + 2 * 60 * 1000);
+                Utils.log("🟡", `上一轮任务还在执行中（${s.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - (s.at || now)) / 60000))} 分钟前），本次触发跳过`);
                 return;
             }
             this.claim();
             this.state("claimed");
             Utils.log("⏰", `常驻调度：开始本轮任务（${this.ctxName()}上下文）`);
             try {
-                this.task();
+                const started = this.task();
+                /* 任务入口是 async 的：必须把返回的 Promise 接住，
+                   否则内部异常会变成未处理的 rejection，
+                   finished 永远不跑，claim 也就一直挂着。 */
+                if (started && typeof started.then === "function") {
+                    started.catch(e => {
+                        Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
+                        this.clearClaim();
+                        this.saveNext(Date.now() + CRON_PERIOD);
+                    });
+                }
             } catch (e) {
                 Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
                 this.clearClaim();
@@ -6207,7 +6518,7 @@ const __scBgKeepAlive = (function() {
             Promise.resolve()
                 .then(() => TaskManager.runAll())
                 .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
-                .finally(() => Sched.finish(true));
+                .finally(() => Sched.finish(true, TaskManager.lastRunStarted));
         }, delay);
     };
 
@@ -6265,14 +6576,26 @@ const __scBgKeepAlive = (function() {
         const last = Sched.lastRun();
         const st = Sched.getState();
         const claim = Sched.getClaim();
+        const lock = Utils.lockInfo("Config.runLock");
         const phaseText = { claimed: "已触发，等待执行", waiting: "等待延时结束", running: "正在执行", done: "上一轮已完成", idle: "空闲" };
+        const lastAct = st ? Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0) : 0;
         let text = "🕒 常驻调度状态\n\n";
         text += `调度间隔：${CRON_PERIOD / 60000} 分钟\n`;
         text += `最近结束：${Sched.fmt(last)}\n`;
         text += `下次触发：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
-        text += `运行阶段：${st ? (phaseText[st.phase] || st.phase) : "未知"}${st && st.ctx ? `（${st.ctx}，${Sched.fmt(st.at)}）` : ""}\n`;
+        text += `运行阶段：${st ? (phaseText[st.phase] || st.phase) : "未知"}${st && st.ctx ? `（${st.ctx}）` : ""}\n`;
+        if (st) {
+            text += `  最后进展：${Sched.fmt(st.at)}（${Math.max(0, Math.round((now - (Number(st.at) || 0)) / 60000))} 分钟前）\n`;
+            text += `  最后心跳：${Sched.fmt(st.aliveAt)}${st.aliveAt ? `（${Math.max(0, Math.round((now - Number(st.aliveAt)) / 1000))} 秒前）` : "（未记录）"}\n`;
+        }
+        if (lock) text += `运行锁：${lock.mine ? "✅ 本上下文持有" : "🔒 其它上下文持有"}（${Sched.fmt(lock.ts)} 更新）\n`;
+        else text += "运行锁：空闲\n";
         if (claim) text += `当前认领：${claim.ctx || "未知"}，${Sched.fmt(claim.at)}\n`;
-        text += `本次上下文：${Sched.ctxName()}（已运行 ${Math.round((now - Sched.startedAt) / 60000)} 分钟）\n\n`;
+        text += `本次上下文：${Sched.ctxName()}（已运行 ${Math.round((now - Sched.startedAt) / 60000)} 分钟）\n`;
+        text += `卡死阈值：心跳 ${RUN_STALE / 60000} 分钟 / 无进展 ${ROUND_STALL / 60000} 分钟 / 单轮硬上限 ${ROUND_HARD_LIMIT / 60000} 分钟\n\n`;
+        if (st && st.phase === "running" && !Sched.isBusy(now)) {
+            text += `⚠️ 有一条 running 记录已经 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟没动静，下一次调度会自动回收它。\n\n`;
+        }
         text += "「运行阶段」一直停在「已触发」或「等待延时结束」，说明触发它的上下文被打断了，\n调度会自动补跑；也可以打开任意 rewards.bing.com 页面立刻救一轮。";
         return text;
     };
@@ -6281,7 +6604,8 @@ const __scBgKeepAlive = (function() {
         Sched.clearClaim();
         GM_setValue("Config.runState", null);
         GM_setValue("Config.cronNextRun", null);
-        Utils.log("🧹", "调度计划已重置，下一轮将立刻开始");
+        try { GM_setValue("Config.runLock", null); } catch (_) {}
+        Utils.log("🧹", "调度计划已重置（含运行锁），下一轮将立刻开始");
         Sched.arm(true);
     };
 
