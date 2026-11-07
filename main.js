@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.8
+// @version      1.3.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -5419,30 +5419,53 @@ const __scBgKeepAlive = (function() {
     const ROUND_BUDGET_MS = 20 * 60 * 1000;
 
     const SEARCH_PACER = {
+        /* 节拍口径：以 Config.span（默认 30 秒）为基准，每次在 ±JITTER_MS 范围内
+           随机取一个值，做完一次搜索后按「本次已用掉多少」补齐差额，
+           使「搜索→搜索」的间隔稳定落在 span±10 秒。
+
+           早期版本是「没记账就退让」：×1.5 一路涨到 180 秒，再叠 35% 抖动和
+           每 5 次 20~60 秒惩罚，单次最坏 303 秒；后来压到 ×1.2 / 100 秒封顶，
+           但行为没变 —— 一次比一次大。这跟「我配了 30 秒就该是 30 秒」的预期
+           相悖，所以退让机制整个去掉：间隔恒等于配置值，只保留随机抖动。
+           限流保护不再靠拖慢，而是靠下面两条刹车：
+             NO_CREDIT_LIMIT（连续 10 分钟没记账就本轮收手）
+             MAX_ATTEMPTS（单轮最多尝试次数） */
         MIN_MS: 30 * 1000,
-        MAX_MS: 3 * 60 * 1000,
-        OBSERVE_MIN: 8 * 1000,
-        OBSERVE_MAX: 16 * 1000,
+        JITTER_MS: 10 * 1000,
+        OBSERVE_MIN: 5 * 1000,
+        OBSERVE_MAX: 10 * 1000,
+        VERIFY_MIN: 5 * 1000,
+        VERIFY_MAX: 9 * 1000,
         MAX_ATTEMPTS: 60,
         NO_CREDIT_LIMIT: 10 * 60 * 1000,
         MIN_ATTEMPTS_BEFORE_GIVEUP: 8,
-        GROW: 1.5,
         RETRY_GAP: 5 * 60 * 1000,
 
-        minMs() {
+        /* 用户配置的间隔基准。上限留 180 秒（与 Config.span 的 max 一致），
+           下限 MIN_MS（30 秒）—— 再快会明显增加被限流的概率。 */
+        spanMs() {
             const span = Number(GM_getValue("Config.span", 30)) || 30;
-            return Math.min(this.MAX_MS, Math.max(this.MIN_MS, Math.max(30, span) * 1000));
+            return Math.min(180 * 1000, Math.max(this.MIN_MS, Math.max(30, span) * 1000));
         },
+
+        minMs() { return this.spanMs(); },
 
         startGap() { return this.minMs(); },
 
+        /* 兼容旧调用点：现在没有退让，上限就等于基准值。 */
+        maxMs() { return this.spanMs(); },
+
+        /* 对称抖动：span ± JITTER_MS，两侧都不是单向放大。 */
         jitter(ms) {
-            const v = ms * (1 + Math.random() * 0.35);
-            return Math.max(5 * 1000, Math.round(v / 1000) * 1000);
+            const base = Number(ms) || this.minMs();
+            const delta = (Math.random() * 2 - 1) * this.JITTER_MS;
+            return Math.max(5 * 1000, Math.round((base + delta) / 1000) * 1000);
         },
 
+        /* 不再退让：无论上一轮是否记账，下一次都用同一个基准间隔。
+           保留 (gap, progressed) 形参是为了不改所有调用点。 */
         nextGap(gap, progressed) {
-            return progressed ? this.startGap() : Math.min(this.MAX_MS, Math.round(gap * this.GROW));
+            return this.startGap();
         },
 
         async beat(gap) {
@@ -5452,7 +5475,9 @@ const __scBgKeepAlive = (function() {
         fits(deadline, gap) {
             const d = Number(deadline) || 0;
             if (d <= 0) return true;
-            return Date.now() + Math.round(gap * 1.35) <= d;
+            /* 预留「最大抖动 + 5 秒余量」：抖动改成正负绝对值后，
+               不能再按百分比（gap × 1.35）估，否则小间隔时预留不足。 */
+            return Date.now() + Math.round((Number(gap) || 0) + this.JITTER_MS + 5000) <= d;
         },
         saveGap(ms) {
             GM_setValue("Config.searchGap", { date: Utils.getTodayNum(), ms: Math.round(ms) });
@@ -5461,7 +5486,7 @@ const __scBgKeepAlive = (function() {
             const saved = GM_getValue("Config.searchGap", null);
             if (!saved || typeof saved !== "object" || saved.date !== Utils.getTodayNum()) return 0;
             const ms = Number(saved.ms) || 0;
-            return (ms <= 0 || ms > this.MAX_MS) ? 0 : ms;
+            return (ms <= 0 || ms > this.maxMs()) ? 0 : ms;
         },
         setLast(stat) {
             GM_setValue("Config.searchLast", stat ? { date: Utils.getTodayNum(), ...stat } : null);
@@ -5946,7 +5971,9 @@ const __scBgKeepAlive = (function() {
             const hardDeadline = softDeadline;
             const deadlineMin = Math.max(0, Math.round((softDeadline - startedAt) / 60000));
             let gap = SEARCH_PACER.startGap();
+            /* 固定节拍：gap 全程不变，这里只记录实际观测到的最大间隔，用于日志自证。 */
             let peakGap = gap;
+            let lastStart = 0;
             const needed = Math.max(1, Math.ceil((max - progress) / 3));
             const attemptCap = Math.min(SEARCH_PACER.MAX_ATTEMPTS, Math.max(12, needed * 2));
             let attempts = 0, credits = 0, sinceCredit = 0, verifyFails = 0;
@@ -5954,7 +5981,7 @@ const __scBgKeepAlive = (function() {
             const usedQueries = new Set();
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
-            Utils.log("🔍", `单轮搜索最多 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），起始节拍 ${Math.round(gap / 1000)} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
+            Utils.log("🔍", `单轮搜索最多 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），固定间隔 ${Math.round(gap / 1000)}±${SEARCH_PACER.JITTER_MS / 1000} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
 
             while (attempts < attemptCap && Date.now() < hardDeadline) {
                 /* 每轮搜索前确认这一轮还活着（超时就抛错退出，锁被接管也退出） */
@@ -5988,7 +6015,7 @@ const __scBgKeepAlive = (function() {
                 const before = progress;
                 let quota = await API.getPcQuota();
                 if (quota && quota.progress <= before) {
-                    await Utils.delay(Utils.randomRange(8000, 14000));
+                    await Utils.delay(Utils.randomRange(SEARCH_PACER.VERIFY_MIN, SEARCH_PACER.VERIFY_MAX));
                     const again = await API.getPcQuota();
                     if (again) quota = again;
                 }
@@ -6000,21 +6027,19 @@ const __scBgKeepAlive = (function() {
                         credits++;
                         sinceCredit = 0;
                         lastCreditAt = Date.now();
-                        gap = SEARCH_PACER.minMs();
-                        Utils.log("✅", `记账成功 +${progress - before}（${progress}/${max}），节拍回到 ${Math.round(gap / 1000)} 秒`);
+                        Utils.log("✅", `记账成功 +${progress - before}（${progress}/${max}）`);
                     } else {
                         progress = Math.max(progress, quota.progress);
                         sinceCredit++;
-                        gap = Math.min(SEARCH_PACER.MAX_MS, Math.round(gap * SEARCH_PACER.GROW));
-                        peakGap = Math.max(peakGap, gap);
-                        Utils.log("🟡", `本次未记账（${progress}/${max}，连续 ${sinceCredit} 次），节拍放慢到 ${Math.round(gap / 1000)} 秒`);
+                        /* 间隔不再随失败放大：保持配置值，只把「连续未记账」记进日志。
+                           连续太多次会有 NO_CREDIT_LIMIT 兜底收手。 */
+                        const left = Math.round((SEARCH_PACER.NO_CREDIT_LIMIT - (Date.now() - lastCreditAt)) / 60000);
+                        Utils.log("🟡", `本次未记账（${progress}/${max}，连续 ${sinceCredit} 次；再 ${Math.max(0, left)} 分钟没进展就本轮收手）`);
                     }
                 } else {
                     verifyFails++;
                     sinceCredit++;
                     progress = Math.min(max, progress + 3);
-                    gap = Math.min(SEARCH_PACER.MAX_MS, Math.round(gap * SEARCH_PACER.GROW));
-                    peakGap = Math.max(peakGap, gap);
                 }
                 RewardsAuto.state.pcProgress = progress;
 
@@ -6029,16 +6054,20 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮按乐观估计结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
                     break;
                 }
-                if (Date.now() + gap > softDeadline) {
-                    Utils.log("🟡", `已到本轮上限（${deadlineMin} 分钟），剩下的 ${Math.max(0, max - progress)} 分交给下一轮`);
-                    break;
-                }
+                /* 固定节拍：从「本次搜索开始」起算，到下一次搜索开始前一共隔 gap±抖动。
+                   把观察/复核已经花掉的时间扣掉，所以相邻两次搜索的间隔是稳定的，
+                   不会因为检查耗时不同而忽长忽短。 */
                 const cycle = SEARCH_PACER.jitter(gap);
-                let wait = Math.max(5000, cycle - (Date.now() - iterStart));
-                if (attempts % 5 === 0) wait += Utils.randomRange(20000, 60000);
-                else if (Math.random() < 0.08) wait += Utils.randomRange(60000, 150000);
-                const aparts = Math.round((Date.now() - iterStart + wait) / 1000);
-                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（两次搜索相隔约 ${aparts} 秒，含观察与核对）`);
+                const now = Date.now();
+                if (lastStart > 0) peakGap = Math.max(peakGap, now - lastStart);
+                lastStart = now;
+                const spent = now - iterStart;
+                const wait = Math.max(3000, cycle - spent);
+                /* 搜完 + 观察 + 复核已经花掉 spent，补到 cycle 就是下一次搜索的间隔。
+                   网络慢到 spent 本身超过 cycle 时，下限 3 秒兜底，此时间隔 = spent + 3，
+                   日志里如实报出来，不假装还在 ±10 秒内。 */
+                const actual = Math.round((spent + wait) / 1000);
+                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（两次搜索相隔约 ${actual} 秒）`);
                 await Utils.delay(wait);
             }
 
@@ -6056,11 +6085,11 @@ const __scBgKeepAlive = (function() {
             if (finalInfo && progress >= max) {
                 markDone();
                 Utils.log("🔵",
-                    `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最高节拍 ${Math.round(peakGap / 1000)}s）`, true);
+                    `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s）`, true);
             } else {
                 SEARCH_PACER.setPending(true);
                 Utils.log("🟡",
-                    `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最高节拍 ${Math.round(peakGap / 1000)}s，已安排提前续做`);
+                    `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s，已安排提前续做`);
                 this.save();
             }
         },
@@ -6760,12 +6789,13 @@ const __scBgKeepAlive = (function() {
         const restricted = Number(GM_getValue("Config.restrictedTimes", 0)) || 0;
         let text = "🔍 PC 搜索诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
-        text += `最小间隔：${pacer.min} 秒（Config.span，搜索/阅读/卡片共用，不会快于它，只会更慢）\n`;
-        text += `每轮起始节拍：${pacer.min} 秒（每轮重置，不继承上一轮被放大的节拍）\n`;
-        text += `单轮内退让上限：${SEARCH_PACER.MAX_MS / 1000} 秒；连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手\n`;
-        text += `阅读/卡片节拍：复用同一套（起步 ${pacer.min} 秒，没进展放慢到 ${SEARCH_PACER.MAX_MS / 1000} 秒，带动随机抖动）\n`;
+        text += `固定间隔：${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒（Config.span，搜索/阅读/卡片共用）\n`;
+        text += `节拍策略：固定间隔，不随成功/失败放大（旧版会一路涨到 100 秒）\n`;
+        text += `间隔自证：日志里的「两次搜索相隔约 N 秒」就是实际补到的间隔\n`;
+        text += `限流刹车：连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手（间隔本身不再拖慢）\n`;
+        text += `阅读/卡片节拍：复用同一套，间隔同为 ${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒\n`;
         if (pacer.last) {
-            text += `上一轮：${pacer.last.attempts} 次搜索 / 记账 ${pacer.last.credits} 次（最高节拍 ${pacer.last.peak} 秒）\n`;
+            text += `上一轮：${pacer.last.attempts} 次搜索 / 记账 ${pacer.last.credits} 次（实测最大间隔 ${pacer.last.peak} 秒）\n`;
         } else {
             text += `上一轮：还没有记录\n`;
         }
