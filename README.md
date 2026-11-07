@@ -26,19 +26,41 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 ```
 
 
-## ⚠️ 二、必须在Chrome浏览器才能完成的任务(须知)
+## ⚠️ 二、Edge 与 Chrome 的差别（必读）
 
-脚本大部分任务用 Edge 也能跑，但下面**三类任务需在Chrome上完成**。
+下面这几类任务走的是微软的 Next.js Server Action 接口，服务端会强制校验 `Origin`：
 
+- **Chrome**：扩展后台发出的请求可以用 declarativeNetRequest 把 `Origin` 摘掉，直接就能用。
+- **Edge**：同一套规则会被 Edge 网络层覆盖（`Origin` 被重新写回），扩展后台这条路必被 500。
 
-所以：**想拿满这三类分数，请用 Chrome 跑本脚本。**
+所以 Edge 上这几类任务改走 **CDP 页面通道**：在真正的 rewards 页面里发同源请求，`Origin` 天然是
+`https://rewards.bing.com`，服务端正常 200。
 
 | 任务 | 在 Chrome | 在 Edge |
 | --- | --- | --- |
-| 带锁 🔒 卡片(已解锁) | ✅  | ✅ 需先配好 CDP (不建议配置CDP) |
-| 桌面端任务 | ✅ | ❌ |
-| 首页待领取 | ✅ | ❌ |
-| 月度计划 | ✅ | ❌ |
+| 带锁 🔒 卡片(已解锁) | ✅ | ✅ 需开启 CDP |
+| 桌面端任务 | ✅ | ✅ 需开启 CDP |
+| 首页待领取 | ✅ | ✅ 需开启 CDP |
+| 月度计划 | ✅ | ✅ 需开启 CDP |
+
+### 在 Edge 上开启 CDP（一次性）
+
+1. 用带调试端口的快捷方式启动 Edge（脚本「诊断」里可以直接复制现成命令）：
+
+```
+"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9224 --remote-allow-origins=* --user-data-dir="%LOCALAPPDATA%\Microsoft\Edge\CDPUserData" --profile-directory="Profile 2"
+```
+
+2. 首次在这个独立窗口里登录一次 rewards.bing.com（登录态和平时那个窗口是分开的）。
+3. 之后不用手动开页面：脚本会自己找现成的 rewards 标签页，没有就新开一个（`Config.cdpAutoTab`，默认开）。
+
+相关开关：
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `Config.cdpPort` | `9224` | 调试端口 |
+| `Config.cdpAutoTab` | `true` | 没有 rewards 页面时自动开一个 |
+| `Config.pageAppUa` | `false` | 把页面请求的 UA 覆盖成脚本配的 UA（桌面专属任务被拒时可打开试） |
 
 ## 说明
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.0
+// @version      1.4.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -1643,6 +1643,13 @@ const __scBgKeepAlive = (function() {
         _pending: null,
         _warnedAt: 0,
         WARN_GAP: 30 * 60 * 1000,
+        _pageTarget: null,
+        _wsUrl: "",
+        _autoTabBlockedUntil: 0,
+        _noPageWarnAt: 0,
+        _avail: false,
+        _availAt: 0,
+        AVAIL_TTL: 60000,
 
         base() {
             const p = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
@@ -1674,25 +1681,30 @@ const __scBgKeepAlive = (function() {
             this._warnedAt = now;
             const msg = [
                 "CDP 未连接：" + reason,
-                "应用内搜索型卡片（带锁标识）需要浏览器级真实点击才能记账。",
-                "页面内 JS 模拟点击无效 —— isTrusted=false 时浏览器直接拒绝导航，这是安全边界。",
+                "两类事需要它：① 带锁卡片要浏览器级真实点击（isTrusted=false 的模拟点击会被直接拒绝）；",
+                "② Edge 上桌面端任务/首页待领取/月度计划走 Server Action，扩展后台的 Origin 摘不掉，只能由页面同源发。",
                 "",
                 "【启用方法】用桌面上的「Rewards Edge」快捷方式启动（或粘下面这条命令）：",
                 this.launchCommand(),
                 "",
-                "它会在一个独立小窗口打开（不影响你平时的 Edge）。首次需要在该窗口登录 rewards.bing.com。"
+                "它会在一个独立小窗口打开（不影响你平时的 Edge）。首次需要在该窗口登录 rewards.bing.com。",
+                "之后脚本会自己找/开 rewards 标签页，不用手动开。"
             ].join(String.fromCharCode(10));
             Utils.log("🔴", msg);
         },
 
-        async available() {
+        async available(force) {
             if (typeof WebSocket === "undefined") return false;
+            const now = Date.now();
+            if (!force && this._availAt && now - this._availAt < this.AVAIL_TTL) return this._avail;
             try {
                 const r = await Utils.xhr({ url: this.base() + "/json/version", timeout: 3000 });
-                return !!(r && String(r).indexOf("Browser") >= 0);
+                this._avail = !!(r && String(r).indexOf("Browser") >= 0);
             } catch (_) {
-                return false;
+                this._avail = false;
             }
+            this._availAt = now;
+            return this._avail;
         },
 
         async targets() {
@@ -1704,17 +1716,24 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async earnPage() {
-            const list = await this.targets();
-            if (!list) return null;
-            const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
-            if (hit) return hit;
-            if (!GM_getValue("Config.cdpAllowNewTab", false)) return null;
+        _isRewardsPage(t) {
+            return !!t && t.type === "page" && /^https:\/\/rewards\.bing\.com\//i.test(t.url || "");
+        },
+
+        autoTabEnabled() {
+            return !!GM_getValue("Config.cdpAutoTab", true) || !!GM_getValue("Config.cdpAllowNewTab", false);
+        },
+
+        async _createTab(url) {
+            if (!this.autoTabEnabled()) return null;
+            /* 上次开出来落到登录页：5 分钟内别再开，否则每轮都堆一个新标签 */
+            if (this._autoTabBlockedUntil && Date.now() < this._autoTabBlockedUntil) return null;
+            let id = "";
             try {
                 const res = await new Promise((resolve, reject) => {
                     GM_xmlhttpRequest({
                         method: "PUT",
-                        url: this.base() + "/json/new?" + encodeURIComponent("https://rewards.bing.com/earn"),
+                        url: this.base() + "/json/new?" + encodeURIComponent(url),
                         onload: r => resolve(r.responseText),
                         onerror: e => reject(new Error((e && e.error) || "new tab failed")),
                         ontimeout: () => reject(new Error("timeout")),
@@ -1722,11 +1741,131 @@ const __scBgKeepAlive = (function() {
                     });
                 });
                 const j = JSON.parse(res);
-                await Utils.delay(3000);
-                return j;
+                id = (j && j.id) || "";
             } catch (_) {
                 return null;
             }
+            if (!id) return null;
+            /* 关键：/json/list 的 url 会先变成目标地址，但文档可能还是 about:blank。
+               必须以 location.origin 为准，否则同源不成立，页内 fetch 直接 Failed to fetch */
+            for (let i = 0; i < 20; i++) {
+                await Utils.delay(800);
+                const t = ((await this.targets()) || []).find(x => x.id === id);
+                if (!t) continue;
+                if (/^https:\/\/login\.live\.com\//i.test(t.url || "")) {
+                    this._autoTabBlockedUntil = Date.now() + 5 * 60 * 1000;
+                    return null;
+                }
+                if (!this._isRewardsPage(t)) continue;
+                if ((await this._pageOrigin(t)) === "https://rewards.bing.com") return t;
+            }
+            return null;
+        },
+
+        async _pageOrigin(page) {
+            try {
+                if (!this._ws || this._ws.readyState !== 1 || this._wsUrl !== page.webSocketDebuggerUrl) {
+                    await this.connect(page.webSocketDebuggerUrl);
+                }
+                return String((await this.evaluate("location.origin")) || "");
+            } catch (_) {
+                return "";
+            }
+        },
+
+        async earnPage() {
+            const list = await this.targets();
+            if (!list) return null;
+            const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
+            if (hit) return hit;
+            return await this._createTab("https://rewards.bing.com/earn");
+        },
+
+        /* 任意 rewards 源页面即可：earn / dashboard / quest 都行，只要 origin 对得上 */
+        async ensurePage() {
+            const list = await this.targets();
+            if (!list) return null;
+            if (this._pageTarget) {
+                const t = list.find(x => x.id === this._pageTarget.id);
+                if (this._isRewardsPage(t) && (await this._pageOrigin(t)) === "https://rewards.bing.com") return t;
+                this._pageTarget = null;
+            }
+            const pages = list.filter(t => this._isRewardsPage(t));
+            const ordered = [
+                ...pages.filter(t => /\/earn/i.test(t.url)),
+                ...pages.filter(t => !/\/earn/i.test(t.url))
+            ];
+            for (const p of ordered) {
+                if ((await this._pageOrigin(p)) === "https://rewards.bing.com") {
+                    this._pageTarget = p;
+                    return p;
+                }
+            }
+            const created = await this._createTab("https://rewards.bing.com/earn");
+            this._pageTarget = created || null;
+            return created;
+        },
+
+        /* 页面里 fetch 改不了 UA（禁改头），只能靠 CDP 的 UA 覆盖；
+           默认关闭：多数领取不校验 UA，开了反而多一层不一致风险。桌面专属任务被拒时可打开 Config.pageAppUa */
+        async _overrideUa(ua) {
+            if (!ua) return "";
+            let cur = "";
+            try { cur = String(await this.evaluate("navigator.userAgent") || ""); } catch (_) { return ""; }
+            if (!cur || cur === ua) return "";
+            try {
+                await this.send("Emulation.setUserAgentOverride", { userAgent: ua });
+                return cur;
+            } catch (_) {
+                return "";
+            }
+        },
+
+        async _restoreUa(orig) {
+            if (!orig) return;
+            try { await this.send("Emulation.setUserAgentOverride", { userAgent: orig }); } catch (_) {}
+        },
+
+        /* 在页面上下文里发同源请求：Origin 天然是 https://rewards.bing.com，服务端 200 */
+        async pagePost(url, headers, body) {
+            let last = { accepted: false, status: 0, text: "CDP 页面通道无响应" };
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const page = await this.ensurePage();
+                if (!page) {
+                    if (!this._noPageWarnAt || Date.now() - this._noPageWarnAt > 10 * 60 * 1000) {
+                        this._noPageWarnAt = Date.now();
+                        Utils.log("🟡", "CDP 里没有可用的 rewards 页面：那个窗口多半还没登录 rewards（或被跳到登录页）");
+                    }
+                    return { accepted: false, status: 0, text: "没有可用的 rewards 页面（CDP 窗口未登录？）" };
+                }
+                try {
+                    if (!this._ws || this._ws.readyState !== 1 || this._wsUrl !== page.webSocketDebuggerUrl) {
+                        await this.connect(page.webSocketDebuggerUrl);
+                    }
+                } catch (e) {
+                    last = { accepted: false, status: 0, text: "CDP 连接失败：" + e.message };
+                    await Utils.delay(700);
+                    continue;
+                }
+                const wanted = GM_getValue("Config.pageAppUa", false)
+                    ? String((headers && (headers["user-agent"] || headers["User-Agent"])) || "")
+                    : "";
+                let prevUa = "";
+                let r;
+                try {
+                    prevUa = await this._overrideUa(wanted);
+                    r = await this.claimInPage(url, headers, body);
+                } finally {
+                    await this._restoreUa(prevUa);
+                }
+                if (r && r.status > 0) return r;
+                last = r || last;
+                /* status=0：页面正在跳转或执行上下文失效，换一次连接再来 */
+                this.close();
+                this._pageTarget = null;
+                await Utils.delay(900);
+            }
+            return last;
         },
 
         async connect(wsUrl) {
@@ -1734,6 +1873,7 @@ const __scBgKeepAlive = (function() {
                 try { this._ws.close(); } catch (_) {}
                 this._ws = null;
             }
+            this._wsUrl = "";
             this._pending = new Map();
             this._id = 0;
             const ws = new WebSocket(wsUrl);
@@ -1752,17 +1892,19 @@ const __scBgKeepAlive = (function() {
                 else p.resolve(m.result);
             };
             this._ws = ws;
+            this._wsUrl = wsUrl;
             return ws;
         },
 
-        send(method, params) {
+        send(method, params, timeoutMs) {
             if (!this._ws) return Promise.reject(new Error("ws not connected"));
             const mid = ++this._id;
+            const wait = Number(timeoutMs) || 10000;
             return new Promise((resolve, reject) => {
                 const timer = setTimeout(() => {
                     if (this._pending) this._pending.delete(mid);
                     reject(new Error("cdp timeout: " + method));
-                }, 10000);
+                }, wait);
                 this._pending.set(mid, {
                     resolve: v => { clearTimeout(timer); resolve(v); },
                     reject: e => { clearTimeout(timer); reject(e); }
@@ -1775,6 +1917,7 @@ const __scBgKeepAlive = (function() {
         close() {
             try { if (this._ws) this._ws.close(); } catch (_) {}
             this._ws = null;
+            this._wsUrl = "";
             this._pending = null;
         },
 
@@ -1797,7 +1940,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const r = await this.send("Runtime.evaluate", {
                     expression: expr, awaitPromise: true, returnByValue: true, userGesture: true
-                });
+                }, 30000);
                 raw = r && r.result ? r.result.value : "";
             } catch (e) {
                 return null;
@@ -1832,7 +1975,7 @@ const __scBgKeepAlive = (function() {
                     awaitPromise: true,
                     returnByValue: true,
                     userGesture: true
-                });
+                }, 30000);
                 raw = r && r.result ? r.result.value : "";
             } catch (e) {
                 return { accepted: false, status: 0, text: `CDP 求值失败：${e.message}` };
@@ -2266,7 +2409,10 @@ const __scBgKeepAlive = (function() {
         },
 
         async _cdpPage() {
-            return await API._anyRewardsPage();
+            const page = await API._anyRewardsPage();
+            if (page) return page;
+            /* 没有现成的 rewards 标签就自己开一个（Config.cdpAutoTab 默认开） */
+            return await CDP.ensurePage();
         },
 
         async run({ name = "领取积分" } = {}) {
@@ -2887,8 +3033,7 @@ const __scBgKeepAlive = (function() {
                 const actType = typeMatch ? Number(typeMatch[1]) : 714;
                 if (!hash || hash === "$undefined") return "failed";
                 const nextAction = await this.getNextActionHash(html);
-                await Utils.xhr({
-                    method: "POST",
+                await API.postAction({
                     url: earnUrl,
                     headers: {
                         "content-type": "text/plain;charset=UTF-8",
@@ -2897,7 +3042,7 @@ const __scBgKeepAlive = (function() {
                         "user-agent": RewardsAuto.ua.pc,
                     },
                     data: JSON.stringify([hash, actType, { offerid: offerId, isPromotional: "$undefined", timezoneOffset: "-480" }])
-                });
+                }, { savedKey: "Config.edgeActivateVariant" });
                 return "activated";
             } catch (e) {
                 Utils.log("🟡", `Edge 连签激活失败: ${e.message}`);
@@ -3592,7 +3737,7 @@ const __scBgKeepAlive = (function() {
             const diag = [];
 
             if (this.isManualCard(offerId)) {
-                Utils.log("🖐️", `已自动上报搜索，完成状态需手动点击确认：${name}`);
+                /* 已自动上报过搜索、只差人工点击：静默跳过，不写日志也不推送 */
                 return false;
             }
 
@@ -4497,13 +4642,17 @@ const __scBgKeepAlive = (function() {
             else headers["user-agent"] = RewardsAuto.ua.pc;
             Object.assign(headers, variant.headers);
 
-            const res = await this._rawXhr({ method: "POST", url: target, headers, data: payload });
+            const res = await this.postAction(
+                { url: target, headers, data: payload },
+                { savedKey: "Config.questActionVariant" }
+            );
             return {
                 status: res.status,
-                accepted: res.status >= 200 && res.status < 300 && this._actionLooksAccepted(res.text),
+                accepted: !!res.ok,
                 text: res.text,
-                cost: res.cost,
-                variant: variant.name
+                cost: Number(res.cost) || 0,
+                variant: res.variant || variant.name,
+                tried: res.tried
             };
         },
 
@@ -4546,23 +4695,15 @@ const __scBgKeepAlive = (function() {
             if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
                 try {
                     if (await CDP.available()) {
-                        const page = await CDP.earnPage();
-                        if (page && page.webSocketDebuggerUrl) {
-                            if (!CDP._ws || CDP._ws.readyState !== 1) {
-                                await CDP.connect(page.webSocketDebuggerUrl);
-                            }
-                            const r = await CDP.claimInPage(pageUrl, baseHeaders, payload);
-                            if (r.accepted && this._actionLooksAccepted(r.text)) {
-                                Utils.log("🖥️", "  经由 CDP 页面通道交卷成功");
-                                return { accepted: true, raw: r.text, status: r.status, variant: "CDP页面通道" };
-                            }
-                            Utils.log("🟡", `CDP 页面通道未受理（HTTP ${r.status}）：${String(r.text).replace(/\s+/g, " ").slice(0, 90)}`);
+                        const r = await CDP.pagePost(pageUrl, baseHeaders, payload);
+                        if (r.accepted && this._actionLooksAccepted(r.text)) {
+                            Utils.log("🖥️", "  经由 CDP 页面通道交卷成功");
+                            return { accepted: true, raw: r.text, status: r.status, variant: "CDP页面通道" };
                         }
+                        Utils.log("🟡", `CDP 页面通道未受理（HTTP ${r.status}）：${String(r.text).replace(/\s+/g, " ").slice(0, 90)}`);
                     }
                 } catch (eCdp) {
                     Utils.log("🟡", `CDP 页面通道异常：${eCdp.message}`);
-                } finally {
-                    try { CDP.close(); } catch (_) {}
                 }
             }
 
@@ -4789,9 +4930,14 @@ const __scBgKeepAlive = (function() {
 
         async postAction(req, { savedKey = "Config.actionVariant" } = {}) {
             const saved = String(GM_getValue(savedKey, "") || "");
-            const order = (saved && BrowserEnv.channelOrder().includes(saved))
-                ? [saved, ...BrowserEnv.channelOrder().filter(v => v !== saved)]
-                : BrowserEnv.channelOrder();
+            const base = BrowserEnv.channelOrder();
+            let order = (saved && base.includes(saved))
+                ? [saved, ...base.filter(v => v !== saved)]
+                : base.slice();
+            /* Edge 上 xhr 走扩展后台必被 500（Origin 改不掉），页面通道优先，别先浪费一次请求 */
+            if (BrowserEnv.info().name === "Edge") {
+                order = ["page", ...order.filter(v => v !== "page")];
+            }
             const tried = [];
             let accepted = null;
             let last = null;
@@ -4811,6 +4957,12 @@ const __scBgKeepAlive = (function() {
                 GM_setValue(savedKey, accepted.variant);
                 if (saved) Utils.log("🎁", `动作请求通道已切换：${saved} → ${accepted.variant}`);
             }
+            /* Edge 上扩展后台的 Server Action 必被 500：直接点出缺什么，别让人对着 500 猜 */
+            if (!accepted && last && last.status === 500
+                && BrowserEnv.info().name === "Edge"
+                && !(await CDP.available())) {
+                CDP.warn("Edge 的扩展后台请求被服务端判 500（Origin 改不掉），需要 CDP 页面通道");
+            }
             return accepted || {
                 ok: false,
                 status: last ? last.status : 0,
@@ -4822,11 +4974,8 @@ const __scBgKeepAlive = (function() {
 
         async _postVia(variant, req) {
             if (variant === "page") {
-                if (!(await CDP.available())) return { ok: false, status: 0, text: "CDP 不可用", variant };
-                const page = await this._anyRewardsPage();
-                if (!page) return { ok: false, status: 0, text: "没有可用的 rewards 页面", variant };
-                if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
-                const r = await CDP.claimInPage(req.url, req.headers, req.data);
+                if (!(await CDP.available())) return { ok: false, status: 0, text: "CDP 不可用（调试端口没开）", variant };
+                const r = await CDP.pagePost(req.url, req.headers, req.data);
                 return {
                     ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
                     status: r.status, text: r.text, variant
@@ -4948,8 +5097,11 @@ const __scBgKeepAlive = (function() {
                         ActionMap.clear();
                         const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                         nextAction = await this.getNextActionHash(earnHtml);
-                        const retryRes = await Utils.xhr({ method: "POST", url: pageUrl, headers: buildHeaders(), data: payload });
-                        if (retryRes) return true;
+                        const retryRes = await this.postAction(
+                            { url: pageUrl, headers: buildHeaders(), data: payload },
+                            { savedKey: "Config.claimActionVariant" }
+                        );
+                        if (retryRes && retryRes.ok) return true;
                     } catch (_) {}
                 }
             }
@@ -5914,11 +6066,7 @@ const __scBgKeepAlive = (function() {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
             }
-            const manualCards = (RewardsAuto.state.manualCards || []);
-            if (manualCards.length > 0) {
-                Utils.log("🖐️", "以下 " + manualCards.length + " 张卡已自动上报搜索，请在 earn 页手动点一次："
-                    + manualCards.map(m => m.name).join("、"), true);
-            }
+            /* 手动确认型卡片不打扰：不弹通知、不写日志（state.manualCards 仍保留，用于去重） */
             if (lockedNow > 0) {
                 Utils.log("🔒", `另有 ${lockedNow} 张卡片处于锁定状态，不计入剩余量（满足条件后会自动重试）`);
             }
@@ -6278,7 +6426,7 @@ const __scBgKeepAlive = (function() {
                 lines.push(`Edge ${env.major} 对扩展源 origin 的 server action 会回 500 —— 这不是脚本参数错了，是浏览器强制的头。`);
             }
             const cdpPort = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
-            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），并留一个 rewards 页面开着；`);
+            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），脚本会自动找/开 rewards 页面；`);
             lines.push(`② 页面代发通道：在 rewards.bing.com 页面里跑过一次脚本后自动可用（Config.usePageChannel 打开）；`);
             lines.push(`③ 后台直发：Chrome / 旧版 Edge 上通常能过，新版 Edge 上常被拒。`);
             Utils.log("🟡", lines.join("\n"));
@@ -6756,8 +6904,8 @@ const __scBgKeepAlive = (function() {
             : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
         text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
         if (!pool.variant && !pool.empty) {
-            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）并留一个 rewards 页面，`
-                + "这样领取会走页面同源请求；Chrome 上后台直发通常也能过。";
+            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），脚本会自动找/开 rewards 页面，`
+                + "领取会走页面同源请求；Chrome 上后台直发通常也能过。";
         }
         text += "\n判定口径：余额上涨 > 待领池清空 > 待领金额下降；三者都拿不到才记「无法确认」。";
         if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
