@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.2.7
+// @version      1.2.8
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -2150,13 +2150,16 @@ const __scBgKeepAlive = (function() {
             const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/i);
             if (m) {
                 if (m[1] === "null") return { known: true, has: false, amount: 0, source: "pointClaim" };
-                /* pointClaim 是个非 null 的空壳对象（如 {"points":0}）时，原来会一直当成「有待领」
-                   去发领取请求，失败了每轮再通知一次。这里必须用金额二次判定。 */
                 const amount = this._amount(clean);
                 if (amount > 0) return { known: true, has: true, amount, source: "pointClaim" };
                 const badge = this._badge(clean);
                 if (badge > 0) return { known: true, has: true, amount: badge, source: "badge" };
-                return { known: true, has: false, amount: 0, source: "pointClaim-empty", uncertain: true };
+                /* 标记在、两处金额都读成 0：这是「读不到」，不是「确实为 0」。
+                   uncertain 必须让调用方继续尝试领取，否则页面结构一变就永远领不出来。 */
+                return {
+                    known: true, has: false, amount: 0, source: "pointClaim-empty", uncertain: true,
+                    snippet: this._snippet(clean)
+                };
             }
             const badge = this._badge(clean);
             if (badge >= 0) return { known: true, has: badge > 0, amount: badge, source: "badge" };
@@ -2168,24 +2171,71 @@ const __scBgKeepAlive = (function() {
            返回 -1 表示页面上根本找不到徽标。 */
         _badge(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
-            const near = clean.match(/alt="可领取"[^>]*>\s*([\d,]+)/i);
+            /* alt 和数字之间普遍隔着一两个标签（<span>/<div>），原来只允许空白，
+               真实页面必然漏判 —— 这里放开到 200 字符内任意内容。 */
+            const near = clean.match(/alt="(?:可领取|待领取)"[^>]*>[\s\S]{0,200}?(\d[\d,]*)/i);
             if (near) return parseInt(String(near[1]).replace(/,/g, ""), 10) || 0;
             const text = clean.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ");
-            const m = text.match(/待领取\s*[:：]?\s*([\d,]+)/);
-            return m ? (parseInt(String(m[1]).replace(/,/g, ""), 10) || 0) : -1;
+            /* 页面文案是「可领取」，原来只认「待领取」 */
+            const m1 = text.match(/(?:可领取|待领取|to claim)\s*[:：]?\s*([\d,]+)/i);
+            if (m1) return parseInt(String(m1[1]).replace(/,/g, ""), 10) || 0;
+            const m2 = text.match(/([\d,]+)\s*(?:可领取|待领取)/i);
+            if (m2) return parseInt(String(m2[1]).replace(/,/g, ""), 10) || 0;
+            return -1;
         },
 
         _balance(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
-            const m = clean.match(/"balance"\s*:\s*(\d+)/i);
+            /* dashboard 有的版本没有 "balance"，只有 availablePoints；读不到余额
+               会让「领取后余额差值」恒为 0，误判成没领到。 */
+            const m = clean.match(/"(?:balance|availablePoints)"\s*:\s*"?(\d+)"?/i);
             return m ? (parseInt(m[1], 10) || 0) : 0;
+        },
+
+        /* 从 pointClaim 起点按花括号配平截出这一个对象。
+           原来固定截 1200 字符：结构一变（字段增多/嵌套变深）金额就被切在窗口外，
+           于是「明明有积分却读成 0」。 */
+        _braceWindow(text, from) {
+            const open = text.indexOf("{", from);
+            const arr = text.indexOf("[", from);
+            const start = (open < 0) ? arr : ((arr >= 0 && arr < open) ? arr : open);
+            if (start < 0) return text.slice(from, from + 1200);
+            const [o, c] = text[start] === "{" ? ["{", "}"] : ["[", "]"];
+            let depth = 0;
+            for (let i = start; i < text.length && i < start + 6000; i++) {
+                if (text[i] === o) depth++;
+                else if (text[i] === c) {
+                    depth--;
+                    if (depth === 0) return text.slice(start, i + 1);
+                }
+            }
+            return text.slice(from, from + 1200);
         },
 
         _amount(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
-            const win = clean.slice(Math.max(0, clean.search(/"pointClaim"/i)), clean.search(/"pointClaim"/i) + 1200);
-            const m = win.match(/"(?:points|amount|availablePoints|totalPoints)"\s*:\s*(\d+)/i);
-            return m ? (parseInt(m[1], 10) || 0) : 0;
+            const at = clean.search(/"pointClaim"\s*:/i);
+            if (at < 0) return 0;
+            const win = this._braceWindow(clean, at);
+            /* 取该对象内所有「积分语义」字段的最大值：
+               字段名在不同部署里变过（points / claimablePoints / availablePoints …），
+               而且值可能被序列化成字符串（"35"），原来的 \d+ 无引号写法会直接漏掉。 */
+            const re = /"(?:points|claimablePoints|claimable|availablePoints|pendingPoints|amount|totalPoints|value)"\s*:\s*"?(-?\d+)"?/gi;
+            let best = 0;
+            let m;
+            while ((m = re.exec(win)) !== null) {
+                const v = parseInt(m[1], 10);
+                if (Number.isFinite(v) && v > best) best = v;
+            }
+            return best;
+        },
+
+        /* pointClaim 原文（压成一行），解析失败时写进日志：
+           下次再报「金额 0」就能直接看出是字段名变了，还是整页压根没登录。 */
+        _snippet(html) {
+            const clean = String(html || "").replace(/\\"/g, '"').replace(/\s+/g, " ");
+            const at = clean.search(/"pointClaim"\s*:/i);
+            return at < 0 ? "" : clean.slice(at, at + 260);
         },
 
         _request(actionMap) {
@@ -2220,7 +2270,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async run({ name = "领取积分" } = {}) {
-            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "", uncertain: false };
+            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "", uncertain: false, settled: false };
             let dashHtml = "";
             try {
                 if (await CDP.available()) {
@@ -2242,11 +2292,14 @@ const __scBgKeepAlive = (function() {
                 out.reason = "读不到待领池标记（页面可能是登录页或结构已变）";
                 return out;
             }
-            if (!pool.has) {
-                /* 空壳 pointClaim（金额 0）也走这里：直接判定无可领，不再发请求、不再推通知 */
-                const kind = pool.uncertain ? "待领池标记存在但金额为 0（按无可领处理）" : "待领池为空";
+            /* 关键判定：pool.has 只代表「解析器看见了金额」。uncertain（标记在、金额读 0）
+               说明的是「读不到」，不是「没有」。原来这里直接 return，于是页面一改版
+               就永远读 0、永远不领 —— 注释里自称「按无可领处理」正是那句话的来源。
+               领取接口本身幂等，空池调用没有副作用，所以读不准时先打一发再回读判定。 */
+            if (!pool.has && !pool.uncertain) {
+                const kind = "待领池为空";
                 const last = Number(GM_getValue(this.KEY_EMPTY_AT, 0)) || 0;
-                if (Date.now() - last < this.EMPTY_TTL && !pool.amount) {
+                if (Date.now() - last < this.EMPTY_TTL) {
                     out.empty = true;
                     out.reason = `${kind}（15 分钟内已确认过）`;
                     return out;
@@ -2255,6 +2308,10 @@ const __scBgKeepAlive = (function() {
                 out.empty = true;
                 out.reason = kind;
                 return out;
+            }
+            if (pool.uncertain) {
+                Utils.log("🔍", "待领池标记存在但解析不出金额，改为直接发领取请求再回读判定"
+                    + `（pointClaim 片段：${pool.snippet || "无"}）`);
             }
             GM_setValue(this.KEY_EMPTY_AT, 0);
 
@@ -2279,6 +2336,8 @@ const __scBgKeepAlive = (function() {
             out.after = this._balance(afterHtml);
             out.claimed = (out.before > 0 && out.after > out.before) ? (out.after - out.before) : 0;
 
+            /* 到账证据三选一（按可信度排序）：余额确实上涨 → 池子被清空 → 池子金额变小。
+               原来只看余额差，读不到余额就一律判失败，领取明明生效了也报「未成功」。 */
             if (out.claimed <= 0) {
                 await Utils.delay(2500);
                 try {
@@ -2292,16 +2351,29 @@ const __scBgKeepAlive = (function() {
                     if (out.before > 0 && later > out.before) {
                         out.after = later;
                         out.claimed = later - out.before;
+                        out.reason = "";
                     }
                     const poolAgain = this.parse(again);
                     if (out.claimed <= 0 && poolAgain.known && !poolAgain.has) {
-                        out.reason = "已受理，池子已清空（该账号余额差读不到，按已领取处理）";
-                        out.claimed = pool.amount;
+                        /* 池子清空是最硬的证据：待领标记没了，说明服务端收下了这次领取。
+                           金额读不到（uncertain）时用 before 快照的金额，读不到就记 0 但判成功。 */
+                        out.claimed = Math.max(pool.amount || 0, 0);
+                        out.empty = true;
+                        out.settled = true;
+                        out.reason = out.claimed > 0
+                            ? "已受理，待领池已清空（余额差读不到，按页面金额计）"
+                            : "已受理，待领池已清空（金额与余额都读不到，按已领取处理）";
+                    } else if (out.claimed <= 0 && poolAgain.known && poolAgain.has
+                        && pool.amount > 0 && poolAgain.amount > 0 && poolAgain.amount < pool.amount) {
+                        out.claimed = pool.amount - poolAgain.amount;
+                        out.reason = "已受理，待领金额下降（余额差读不到）";
                     }
                 } catch (_) {}
             }
-            if (out.claimed <= 0) {
-                out.reason = `已受理但余额未变（页面可领取 ${pool.amount}）`;
+            if (out.claimed <= 0 && !out.settled) {
+                out.reason = pool.amount > 0
+                    ? `已受理但余额未变（页面可领取 ${pool.amount}）`
+                    : "已受理，但金额与余额都读不到，无法确认到账；下一轮再复核";
             }
             return out;
         }
@@ -6139,9 +6211,13 @@ const __scBgKeepAlive = (function() {
                 try { await API.getCookieHeader(); } catch (_) {}
                 const res = await ClaimPoints.run();
                 if (res.empty) {
-                    this.claimSummary = "✅ 无可领";
-                    /* uncertain = pointClaim 标记还在但金额读到 0，按无可领处理，只记日志不通知 */
-                    Utils.log(res.uncertain ? "🟡" : "✅", `无可领取积分（${res.reason}）`);
+                    /* empty 现在有两层含义：池子确认为空 / 池子被本次领取清空。
+                       后者是真领到了，不能再报「无可领」。 */
+                    this.claimSummary = res.settled
+                        ? (res.claimed > 0 ? `✅ +${res.claimed} · 池已清空` : "✅ 已领取 · 池已清空")
+                        : "✅ 无可领";
+                    this.claimReason = res.settled ? "" : (res.uncertain ? (res.reason || "") : "");
+                    Utils.log("🎁", res.reason || "已领取");
                     return;
                 }
                 if (res.claimed > 0) {
@@ -6151,7 +6227,7 @@ const __scBgKeepAlive = (function() {
                 } else if (res.variant) {
                     this.claimSummary = "⏳ 已受理待复核";
                     this.claimReason = res.reason || "";
-                    Utils.log("🟡", `积分领取请求已受理，但余额没有变化（${res.reason}）；下一轮再复核`);
+                    Utils.log("🟡", `积分领取请求已受理，但没能确认到账（${res.reason}）；下一轮再复核`);
                 } else {
                     this.claimSummary = "⏳ 未成功";
                     this.claimReason = res.reason || "";
@@ -6635,13 +6711,26 @@ const __scBgKeepAlive = (function() {
         const table = ActionMap._readMap();
         text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
         text += `领取标识：${ActionMap.get("reportClaimAllPoints").slice(0, 12)}…\n\n`;
+        /* 先把原始解析结果打出来：金额读到 0 时，这一段能直接看出是字段名变了、
+           还是 dashboard 根本不是登录态（这时 pointClaim 片段是空的）。 */
+        let dashHtml = "";
+        try { dashHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" }); } catch (_) { dashHtml = ""; }
+        const raw = ClaimPoints.parse(dashHtml);
+        text += `dashboard 抓取：${dashHtml ? `${dashHtml.length} 字节` : "❌ 失败（请求没回来 / 未登录）"}\n`;
+        text += `原始解析：known=${raw.known} has=${raw.has} amount=${raw.amount} source=${raw.source || "-"}`
+            + `${raw.uncertain ? "（金额读不准）" : ""}\n`;
+        if (raw.snippet) text += `pointClaim 片段：${raw.snippet}\n`;
+        text += `余额：${ClaimPoints._balance(dashHtml) || "读不到"}\n\n`;
         const pool = await ClaimPoints.run();
-        text += `待领状态：${pool.empty ? (pool.uncertain ? "空（标记存在但金额读为 0）" : "空池") : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
+        text += `待领状态：${pool.empty
+            ? (pool.settled ? "已领取，池已清空" : (pool.uncertain ? "读不准（标记在、金额 0）" : "空池"))
+            : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
         text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
         if (!pool.variant && !pool.empty) {
             text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）并留一个 rewards 页面，`
                 + "这样领取会走页面同源请求；Chrome 上后台直发通常也能过。";
         }
+        text += "\n判定口径：余额上涨 > 待领池清空 > 待领金额下降；三者都拿不到才记「无法确认」。";
         if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
         return text;
     };
