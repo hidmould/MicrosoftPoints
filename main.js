@@ -1679,15 +1679,20 @@ const __scBgKeepAlive = (function() {
 
         launchCommand() {
             const port = this.port();
-            const profile = String(GM_getValue("Config.cdpProfileDir", "") || "%LOCALAPPDATA%\\Microsoft\\Edge\\CDPUserData");
-            const profDir = String(GM_getValue("Config.cdpProfileName", "") || "Profile 2");
+            const profile = String(GM_getValue("Config.cdpProfileDir", "") || "%LOCALAPPDATA%\\Microsoft\\Edge\\CDPUser Data");
+            /* --profile-directory 只在真的配置了、且不是 Default 时才加。
+               以前这里默认写死 "Profile 2"，而 CDP 配置目录里通常只有 Default：
+               照着这条命令启动会开出一个没登录 rewards、也没装脚本的空配置，
+               于是又变成「端口能连、页面用不了」。 */
+            const profDir = String(GM_getValue("Config.cdpProfileName", "") || "");
             return "& \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\""
                 + " --remote-debugging-port=" + port
                 + " --remote-allow-origins=* --user-data-dir=\""
                 + profile
-                + "\" --profile-directory=\""
-                + profDir
-                + "\"";
+                + "\""
+                + (profDir && profDir !== "Default"
+                    ? " --profile-directory=\"" + profDir + "\""
+                    : "");
         },
 
         warn(reason) {
@@ -1705,7 +1710,11 @@ const __scBgKeepAlive = (function() {
                 "应用内搜索型卡片（带锁标识）需要浏览器级真实点击才能记账。",
                 "页面内 JS 模拟点击无效 —— isTrusted=false 时浏览器直接拒绝导航，这是安全边界。",
                 "",
-                "【启用方法】用桌面上的「Rewards Edge」快捷方式启动（或粘下面这条命令）：",
+                "【最可能的原因】用 --remote-debugging-port 启动时漏了 --remote-allow-origins=*。",
+                "这时端口能连、/json/version 也正常，但脚本（扩展源）发起 WebSocket 会被",
+                "DevTools 直接 403 拒绝，表现就是「能连上端口，但拿不到可用的 rewards 页」。",
+                "",
+                "【启用方法】关掉那个调试窗口，再用带完整参数的快捷方式启动（或粘下面这条命令）：",
                 this.launchCommand(),
                 "",
                 "它会在一个独立小窗口打开（不影响你平时的 Edge）。首次需要在该窗口登录 rewards.bing.com。"
@@ -1828,11 +1837,19 @@ const __scBgKeepAlive = (function() {
             this._bpending = new Map();
             this._bid = 0;
             const ws = new WebSocket(info.webSocketDebuggerUrl);
-            await new Promise((resolve, reject) => {
-                const t = setTimeout(() => reject(new Error("browser ws timeout")), 6000);
-                ws.onopen = () => { clearTimeout(t); resolve(); };
-                ws.onerror = () => { clearTimeout(t); reject(new Error("browser ws error")); };
-            });
+            try {
+                await new Promise((resolve, reject) => {
+                    const t = setTimeout(() => reject(new Error("browser ws timeout")), 6000);
+                    ws.onopen = () => { clearTimeout(t); resolve(); };
+                    ws.onerror = () => { clearTimeout(t); reject(new Error("browser ws error")); };
+                });
+            } catch (e) {
+                /* 握手被拒（典型：启动参数缺 --remote-allow-origins=*）时把半成品清干净，
+                   否则 _bpending 会一直留着、下次还会复用这个坏连接。 */
+                try { ws.close(); } catch (_) {}
+                this._bpending = null;
+                throw e;
+            }
             ws.onmessage = ev => {
                 let m;
                 try { m = JSON.parse(ev.data); } catch (_) { return; }
@@ -2085,6 +2102,28 @@ const __scBgKeepAlive = (function() {
             return await this.ensurePage("https://rewards.bing.com/earn");
         },
 
+        /* 分辨「端口通但打不开页」到底是哪一种：
+           1) /json/version 就失败 —— 端口上根本没 CDP；
+           2) HTTP 通、WebSocket 握手失败 —— 启动参数缺 --remote-allow-origins=*，
+              DevTools 会对扩展源发起的握手直接回 403（新版 Edge 默认策略）；
+           3) 都通 —— 那就只是页面本身没打开/没登录。
+           以前这一律报「拿不到可用的 rewards 页」，等于把最关键的配置问题藏起来了。 */
+        async whyNoPage() {
+            const info = await this.browserInfo();
+            if (!info) return "本地调试端口（" + this.ports().join("/") + "）上没有 CDP 服务";
+            try {
+                const ws = await this.browserConnect();
+                if (!ws) return "能连上端口，但拿不到浏览器级 ws 通道";
+                return "能连上端口，但打不开可用的 rewards 页";
+            } catch (e) {
+                const msg = String((e && e.message) || e);
+                if (/ws (error|timeout)/i.test(msg)) {
+                    return "端口能连，但 WebSocket 被 DevTools 拒绝：启动参数缺 --remote-allow-origins=*";
+                }
+                return "端口能连，但建立 ws 失败：" + msg;
+            }
+        },
+
         async connect(wsUrl) {
             if (this._ws) {
                 try { this._ws.close(); } catch (_) {}
@@ -2137,6 +2176,41 @@ const __scBgKeepAlive = (function() {
         async evaluate(expression) {
             const r = await this.send("Runtime.evaluate", { expression: expression, returnByValue: true, userGesture: true });
             return r && r.result ? r.result.value : undefined;
+        },
+
+        /* ---------------- 真 UA 覆盖 ----------------
+           为什么必须用 CDP 覆盖：user-agent 和 cookie 都是**浏览器禁止脚本设置**的请求头，
+           写进 GM_xmlhttpRequest / fetch 的 headers 里会被静默丢弃。
+           而「奖励应用专属」卡片（offerId 带 RewardsApp）服务端只认桌面应用身份：
+           实测同样的 cookie、同样的 action、同样的 hash，只把 UA 换成
+           MSRewards/Desktop/1.13.0，进度才从 1/8 变成 2/8；用普通 Edge UA 一律
+           返回 true（受理）却不记账 —— 这正是「已受理但未记账」的真因。
+           只有 CDP 的 Network.setUserAgentOverride 能真正改变网络层 UA。 */
+        _uaOverrideAt: 0,
+
+        async setAppUA(on = true) {
+            try {
+                if (on) {
+                    await this.send("Network.enable", {});
+                    await this.send("Network.setUserAgentOverride", {
+                        userAgent: RewardsAuto.ua.rewardsApp,
+                        acceptLanguage: "zh-CN,zh;q=0.9,en;q=0.8",
+                        platform: "Win32"
+                    });
+                    await this.send("Network.setExtraHTTPHeaders", {
+                        headers: { "x-rewards-source": "msrewards-desktop" }
+                    });
+                    this._uaOverrideAt = Date.now();
+                } else {
+                    /* 恢复成浏览器自己的 UA：传空字符串即清除覆盖 */
+                    await this.send("Network.setUserAgentOverride", { userAgent: "" });
+                    await this.send("Network.setExtraHTTPHeaders", { headers: {} });
+                    this._uaOverrideAt = 0;
+                }
+                return true;
+            } catch (_) {
+                return false;
+            }
         },
 
         async fetchPageText(url) {
@@ -2282,8 +2356,10 @@ const __scBgKeepAlive = (function() {
                否则会把你正在看的 rewards 页导走。 */
             let page = await this.ensurePage("https://rewards.bing.com/earn", { nav: true });
             if (!page) {
-                this.warn("能连上端口，但拿不到可用的 rewards 页");
-                return { ok: false, reason: "打不开 rewards 页" };
+                /* 开不出页时把真正的原因查出来再报，不要笼统说「拿不到 rewards 页」。 */
+                const why = await this.whyNoPage();
+                this.warn(why);
+                return { ok: false, reason: why };
             }
             const result = { ok: true, handled: 0, done: 0, total: 0 };
             try {
@@ -3872,6 +3948,114 @@ const __scBgKeepAlive = (function() {
             return isBingSearch && hasSign;
         },
 
+        /* 应用内搜索上报。
+           关键修复：以前这里自带一个 "cookie" 头、里面只有 _Rwho，
+           而请求头的 cookie 是**整体覆盖**语义 —— 浏览器/扩展不会把你设的值和真实 cookie 合并，
+           于是登录态（MSPAuth / MUID / WLS 等）被整个顶掉，服务端认不出账号：
+           reportActivity 照样返回 200（所以看起来「已受理」），但响应里
+           IsAuthenticated=false、IsRewardUser=false，这张卡永远不记账。
+           实测三组对照（同一请求、只差 cookie 头）：
+             自动带完整 cookie   → IsAuthenticated=true  能记账
+             只发 _Rwho（旧做法）→ IsAuthenticated=false 不记账
+             _Rwho + 完整 cookie → IsAuthenticated=true  能记账
+           因此现在把 _Rwho 拼在真实 cookie **后面**，不再覆盖登录态。 */
+        _rwhoCookie(deviceType = "d") {
+            const today = new Date();
+            const p2 = n => String(n).padStart(2, "0");
+            return `_Rwho=u=${deviceType}&ts=${today.getFullYear()}-${p2(today.getMonth() + 1)}-${p2(today.getDate())}`;
+        },
+
+        /* 拼出「真实登录 cookie + _Rwho」的完整取值。
+           Utils.xhr 在没显式给 cookie 时会自动补 _ckReady()，那种情况不用我们操心；
+           但只要显式设了 cookie，就必须把真实值一起带上。 */
+        _cookieWithRwho(deviceType = "d") {
+            let real = "";
+            try { real = (Utils._ckReady && Utils._ckReady()) || ""; } catch (_) { real = ""; }
+            const rwho = this._rwhoCookie(deviceType);
+            if (!real) return rwho;
+            /* 已有 _Rwho 就替换成目标设备类型，避免 d/m 混用 */
+            if (/(?:^|;\s*)_Rwho=/.test(real)) {
+                return real.replace(/_Rwho=[^;]*/, this._rwhoCookie(deviceType));
+            }
+            return real + "; " + rwho;
+        },
+
+        /* 在 CDP 后台页里完成「应用内搜索上报」，全程带桌面应用 UA。
+           返回 true/false 表示成功与否；返回 null 表示 CDP 不可用，
+           调用方回退到后台 GM_xhr（那种方式对应用专属卡不记账，但聊胜于无）。 */
+        async _reportAppSearchViaCdp(query, params, origin) {
+            if (typeof WebSocket === "undefined") return null;
+            if (!GM_getValue("Config.questViaCdp", true)) return null;
+            let page = null;
+            try {
+                if (!(await CDP.available())) return null;
+                /* 用带查询串的入口页：需要先拿到 IG */
+                page = await CDP._ownedPage(query);
+                if (!page || !page.webSocketDebuggerUrl) return null;
+                if (!CDP._ws || CDP._ws.readyState !== 1) {
+                    await CDP.connect(page.webSocketDebuggerUrl);
+                }
+                const uaOk = await CDP.setAppUA(true);
+                if (!uaOk) return null;
+
+                /* 先真实导航到搜索页（不只用 fetch）：服务端要看到「真的搜过」 */
+                await CDP.goto(page, query);
+                await Utils.randomDelay(1500, 2500);
+
+                const expr = `(async function(){
+                    try {
+                        var origin = ${JSON.stringify(origin)};
+                        var params = ${JSON.stringify(params)};
+                        var flat = (document.documentElement.outerHTML || "").replace(/\\s/g, "");
+                        var m = flat.match(/,IG:"([^"]+)"/);
+                        var ig = m ? m[1] : (String(Date.now()) + Math.floor(Math.random()*1e6));
+                        var href = location.href;
+                        var out = { ig: ig, hasIG: !!m, steps: [] };
+                        try {
+                            var r1 = await fetch(origin + "/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=" + ig + "&ajaxreq=1", {
+                                method: "POST", credentials: "include",
+                                headers: { "content-type": "application/x-www-form-urlencoded" },
+                                body: "wb=1%3bi%3d1%3bv%3d1"
+                            });
+                            out.steps.push({ s: "ncheader", status: r1.status });
+                        } catch (e) { out.steps.push({ s: "ncheader", err: String(e) }); }
+                        try {
+                            var r2 = await fetch(origin + "/rewardsapp/reportActivity?IG=" + ig + "&IID=SERP.5047&" + params + "&ajaxreq=1", {
+                                method: "POST", credentials: "include",
+                                headers: { "content-type": "application/x-www-form-urlencoded" },
+                                body: "url=" + encodeURIComponent(href) + "&V=web"
+                            });
+                            var t = await r2.text();
+                            out.steps.push({ s: "reportActivity", status: r2.status,
+                                authed: (t.match(/"IsAuthenticated":(true|false)/) || [])[1] || null,
+                                increment: (t.match(/"RewardsIncrement":(\\\\d+)/) || [])[1] || null });
+                        } catch (e) { out.steps.push({ s: "reportActivity", err: String(e) }); }
+                        return JSON.stringify(out);
+                    } catch (e) {
+                        return JSON.stringify({ fatal: String(e && e.message || e) });
+                    }
+                })()`;
+
+                const raw = await CDP.evaluate(expr);
+                let res = null;
+                try { res = JSON.parse(raw || "{}"); } catch (_) { res = null; }
+                if (!res || res.fatal) return false;
+                const ra = (res.steps || []).find(s => s.s === "reportActivity") || {};
+                if (ra.authed === "false") {
+                    Utils.log("🟠", "应用内搜索上报未被识别为登录态（CDP 通道），这张卡可能不记账");
+                    return false;
+                }
+                Utils.log("🖥️", `  应用内搜索已在应用 UA 下上报（IG ${res.hasIG ? "取自页面" : "随机"}`
+                    + `${ra.status ? "，HTTP " + ra.status : ""}）`);
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `CDP 应用搜索上报异常：${e.message}`);
+                return false;
+            } finally {
+                try { await CDP.setAppUA(false); } catch (_) {}
+            }
+        },
+
         async reportAppSearchForCard(href) {
             const raw = String(href || "").trim();
             if (!/bing\.com\/search/i.test(raw)) return false;
@@ -3882,12 +4066,27 @@ const __scBgKeepAlive = (function() {
             if (!origin) return false;
             const query = origin + pathname + search;
             const params = search.replace(/^\?/, "");
-            const today = new Date();
-            const p2 = n => String(n).padStart(2, "0");
+
+            /* 先把 cookie 读出来 —— 否则 _cookieWithRwho() 拿不到真实登录态 */
+            try { await this.getCookieHeader(); } catch (_) {}
+
             const baseHeaders = {
                 "user-agent": RewardsAuto.desktopAppHeaders["user-agent"],
-                "cookie": `_Rwho=u=d&ts=${today.getFullYear()}-${p2(today.getMonth() + 1)}-${p2(today.getDate())}`,
+                "cookie": this._cookieWithRwho(),
             };
+
+            /* 地域跳转：www.bing.com 在本机会 302 到 cn.bing.com，
+               rewardsapp 端点两个域都存在，但 IG 必须取自**真正落地**的那个域，
+               否则跨域取不到 IG、上报也会打错主机。 */
+            const host = (() => {
+                try { return new URL(origin).host; } catch (_) { return ""; }
+            })();
+
+            /* 首选 CDP 页面通道：只有它能真正把 UA 换成桌面应用身份。
+               后台 GM_xhr 设的 user-agent 会被浏览器丢弃，服务端因此把这次上报
+               当普通网页搜索处理 —— 不报错，但那几张应用专属卡不会记账。 */
+            const viaCdp = await this._reportAppSearchViaCdp(query, params, origin);
+            if (viaCdp !== null) return viaCdp;
 
             let ig = "";
             try {
@@ -3899,6 +4098,7 @@ const __scBgKeepAlive = (function() {
             if (!ig) ig = Utils.getRandomUUID();
             const reportHeaders = { ...baseHeaders, "referer": query };
 
+            let authed = null;
             try {
                 await Utils.xhr({
                     method: "POST",
@@ -3909,14 +4109,21 @@ const __scBgKeepAlive = (function() {
             } catch (_) {}
 
             try {
-                await Utils.xhr({
+                const txt = await Utils.xhr({
                     method: "POST",
                     url: `${origin}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
                     headers: { ...reportHeaders, "content-type": "application/x-www-form-urlencoded" },
                     data: `url=${encodeURIComponent(query)}&V=web`
                 });
+                /* 服务端会回一帧报告模块配置，里面的 IsAuthenticated 是「这次上报有没有算在你头上」
+                   的直接证据。以前这里不看它，才会出现「已受理但未记账」还查不出原因。 */
+                const m = String(txt || "").match(/"IsAuthenticated":(true|false)/);
+                authed = m ? m[1] === "true" : null;
+                if (authed === false) {
+                    Utils.log("🟠", `应用内搜索上报未被识别为登录态（${host}）：cookie 可能不完整，这张卡大概率不会记账`);
+                }
             } catch (_) {}
-            return true;
+            return authed !== false;
         },
 
         async _claimLevelGatedViaAppSearch(card, { diag = [], name = "" } = {}) {
@@ -4301,7 +4508,33 @@ const __scBgKeepAlive = (function() {
         },
 
         QUESTS: {
-            weeklyPrefix: /WW_pcparent_RewardsApp_weekly_Exclusive/i
+            weeklyPrefix: /WW_pcparent_RewardsApp_weekly_Exclusive/i,
+            /* 桌面周任务子项的 offerId 里直接带星期：
+                 WW_pcchild2_urlreward_Sunday_...weekly_Exclusive_Novw2_2026_punchcard
+                 WW_pcchild3_urlreward_Monday_ ...
+               服务端按「周一算一周开始」逐日解锁：周日是第 7 天（索引 6），周一回到索引 0。
+               这是不依赖 UA 渲染的强信号 —— 网页端对非应用 UA 会把所有子项都渲染成
+               isLocked=true（实测 7/7 全锁），只靠 isLocked 数会把「今天该做的那一张」
+               也算进未解锁里，于是出现「网站说 6 张未解锁、脚本报 7 张」。 */
+            weekdayTokens: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+
+            /* 从 offerId 里取「周内第几天」（周一=0 … 周日=6）；取不到返回 -1。
+               注意 weekdayTokens 是 Date 的周日优先顺序，这里统一换算成周一优先，
+               否则周日会被当成第 0 天，和周任务实际顺序正好错开一天。 */
+            weekdayIndex(offerId) {
+                const m = String(offerId || "").match(/_pcchild\d+_[A-Za-z0-9]*?_(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)_/i);
+                const name = m ? m[1] : String(offerId || "").match(/(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)/i)?.[1];
+                if (!name) return -1;
+                const lower = name.toLowerCase();
+                const sundayBased = this.weekdayTokens.findIndex(w => w.toLowerCase() === lower);
+                if (sundayBased < 0) return -1;
+                return (sundayBased + 6) % 7;
+            },
+
+            /* 今天在周内的位置（周一=0 … 周日=6），与 weekdayIndex 同一套口径。 */
+            todayIndex(now = new Date()) {
+                return (now.getDay() + 6) % 7;
+            }
         },
 
         _questLinksFromEarn(earnHtml) {
@@ -4355,7 +4588,43 @@ const __scBgKeepAlive = (function() {
                     href: item.href || item.destination || ""
                 });
             }
-            return { parentId, url, html, text, cards };
+            /* 父任务的「M/N 个任务」文案：只用于日志对照，不参与判定
+               （它不说明是哪几张完成，拿它反推会把当天要做的卡误标成已完成） */
+            const pm = text.match(/(\d+)\s*\/\s*(\d+)\s*个任务/);
+            const progress = pm ? { done: parseInt(pm[1], 10) || 0, total: parseInt(pm[2], 10) || 0 } : null;
+            return { parentId, url, html, text, progress, cards: this._reconcileWeeklyLocks(cards) };
+        },
+
+        /* 用 offerId 里的星期把 isLocked 校正一遍。
+           为什么需要：网页端对「非应用 UA」的请求会把周任务子项全部渲染成 isLocked=true
+           （实测 7/7），但真实是「已过去的+今天」才解锁。脚本用 GM_xmlhttpRequest 发请求，
+           user-agent 属于禁止修改的请求头，设了也是无效，所以永远拿不到应用态渲染。
+           这里的规则来自服务端实际数据：子项按周一→周日逐日解锁，
+           所以「周内位置 <= 今天位置」即为已解锁；比网页渲染更接近真实。
+           只有在 offerId 带得出星期时才改，带不出的原样保留，避免误判别的 punchcard。
+
+           注意：这里**不用**「M/N 个任务」去反推哪几张已完成。
+           进度只说明完成了 M 张，不说明是哪几张；周任务按星期递进，
+           周一当天进度 1/8 时，已完成的是上一周周期里的周日那张，而不是周一这张。
+           拿 M 去标记「最前面 M 张」会把当天要做的卡误标成已完成（实测就会这样），
+           所以已完成状态一律只信服务端给的 isCompleted。 */
+        _reconcileWeeklyLocks(cards) {
+            const today = this.QUESTS.todayIndex();
+            let changed = 0;
+            const out = (cards || []).map(c => {
+                if (c.isCompleted) return c;
+                const idx = this.QUESTS.weekdayIndex(c.offerId);
+                if (idx < 0) return c;
+                const shouldUnlock = idx <= today;
+                if (shouldUnlock === !c.isLocked) return c;
+                changed++;
+                return { ...c, isLocked: !shouldUnlock, lockByWeekday: true };
+            });
+            if (changed > 0) {
+                Utils.log("🖥️", `桌面周任务：按星期校正了 ${changed} 张卡的解锁态`
+                    + `（网页渲染不可信，今天是周${"一二三四五六日".charAt(Math.min(6, Math.max(0, today)))}）`);
+            }
+            return out;
         },
 
         /* ===== 月度计划（月度 punchcard）=====
@@ -4935,9 +5204,16 @@ const __scBgKeepAlive = (function() {
                             if (!CDP._ws || CDP._ws.readyState !== 1) {
                                 await CDP.connect(page.webSocketDebuggerUrl);
                             }
+                            /* 关键：先把网络层 UA 切成桌面应用身份。
+                               普通 UA 下这个 action 会返回 true 但服务端不记账，
+                               所以「请求成功」在这里完全不等于「卡片完成」。 */
+                            const uaOk = await CDP.setAppUA(true);
+                            if (!uaOk) {
+                                Utils.log("🟡", "CDP 无法覆盖 UA，桌面应用专属卡大概率不会被记账");
+                            }
                             const r = await CDP.claimInPage(pageUrl, baseHeaders, payload);
                             if (r.accepted && this._actionLooksAccepted(r.text)) {
-                                Utils.log("🖥️", "  经由 CDP 页面通道交卷成功");
+                                Utils.log("🖥️", `  经由 CDP 页面通道交卷成功${uaOk ? "（已切换桌面应用 UA）" : ""}`);
                                 return { accepted: true, raw: r.text, status: r.status, variant: "CDP页面通道" };
                             }
                             Utils.log("🟡", `CDP 页面通道未受理（HTTP ${r.status}）：${String(r.text).replace(/\s+/g, " ").slice(0, 90)}`);
@@ -4946,6 +5222,8 @@ const __scBgKeepAlive = (function() {
                 } catch (eCdp) {
                     Utils.log("🟡", `CDP 页面通道异常：${eCdp.message}`);
                 } finally {
+                    /* 恢复浏览器本来的 UA，别把调试窗口的其它页面也带成应用身份 */
+                    try { await CDP.setAppUA(false); } catch (_) {}
                     try { CDP.close(); } catch (_) {}
                 }
             }
@@ -5056,12 +5334,23 @@ const __scBgKeepAlive = (function() {
                 }
 
                 const unlocked = open.filter(c => !c.isLocked);
+                const lockedNow = open.length - unlocked.length;
                 if (unlocked.length === 0) {
                     Utils.log("🖥️", `桌面专属任务：${open.length} 张待办全部未解锁（未到对应星期），本轮不处理`);
                 } else {
                     Utils.log("🖥️", `桌面奖励应用专属任务：${unlocked.length} 张已解锁待办`
-                        + `（另有 ${open.length - unlocked.length} 张未解锁，不处理）（${parentId}）`);
+                        + `（另有 ${lockedNow} 张未解锁，不处理）（${parentId}）`);
                     for (const c of unlocked) Utils.log("🖥️", `  · [已解锁] ${c.title}`);
+                    /* 未解锁的也列出来并带上星期，方便对照「网站说 6 张、脚本说 7 张」这类偏差 */
+                    const pendingDays = open
+                        .filter(c => c.isLocked)
+                        .map(c => this.QUESTS.weekdayIndex(c.offerId))
+                        .filter(i => i >= 0)
+                        .sort((a, b) => a - b)
+                        .map(i => "周" + "一二三四五六日".charAt(i));
+                    if (pendingDays.length) {
+                        Utils.log("🖥️", `  未解锁的：${pendingDays.join("、")}（到对应那天自动处理）`);
+                    }
                 }
 
                 let doneHere = 0, failedHere = 0;
@@ -5136,7 +5425,8 @@ const __scBgKeepAlive = (function() {
                 } else {
 
                     const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !c.isLocked) : [];
-                    const leftLocked = verify ? verify.cards.filter(c => !c.isCompleted && c.isLocked).length : 0;
+                    const leftLockedCards = verify ? verify.cards.filter(c => !c.isCompleted && c.isLocked) : [];
+                    const leftLocked = leftLockedCards.length;
                     if (leftUnlocked.length > 0) {
                         /* 记下待记账的标题，供收尾通知点名 */
                         try {
@@ -5147,11 +5437,19 @@ const __scBgKeepAlive = (function() {
                             }
                         } catch (_) {}
                     }
+                    /* 未解锁的按星期列出，避免只给一个数字看不懂「到底还差哪几天」 */
+                    const lockedDays = leftLockedCards
+                        .map(c => this.QUESTS.weekdayIndex(c.offerId))
+                        .filter(i => i >= 0)
+                        .sort((a, b) => a - b)
+                        .map(i => "周" + "一二三四五六日".charAt(i));
                     Utils.log("🟡", `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张`
                         + (leftUnlocked.length > 0
                             ? `，仍剩 ${leftUnlocked.length} 张已解锁未完成（${leftUnlocked.map(c => c.title).join("、")}）`
                             : (leftLocked > 0 ? "，今日已解锁的都处理完了" : ""))
-                        + (leftLocked > 0 ? `（另有 ${leftLocked} 张未解锁，到对应那天自动处理）` : ""));
+                        + (leftLocked > 0
+                            ? `（另有 ${leftLocked} 张未解锁${lockedDays.length ? "：" + lockedDays.join("、") : ""}，到对应那天自动处理）`
+                            : ""));
                 }
             }
             if (totalFailed > 0) {
@@ -5413,11 +5711,13 @@ const __scBgKeepAlive = (function() {
         async getSearchPage(query, isMobile = false) {
             const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
             const deviceType = isMobile ? "m" : "d";
+            try { await this.getCookieHeader(); } catch (_) {}
             return Utils.xhr({
                 url: `https://${RewardsAuto.state.host}/search?q=${encodeURIComponent(query)}&form=QBLH${mkt}`,
                 headers: {
                     "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
-                    "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`,
+                    /* 不能只发 _Rwho：请求头 cookie 是整体覆盖，会把登录态顶掉 */
+                    "cookie": this._cookieWithRwho(deviceType),
                     "referer": `https://${RewardsAuto.state.host}/?form=QBLH`,
                     "cache-control": "no-cache",
                     "pragma": "no-cache"
@@ -5431,23 +5731,31 @@ const __scBgKeepAlive = (function() {
                 const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
                 const params = `q=${encodeURIComponent(query)}&form=QBLH${mkt}`;
                 const deviceType = isMobile ? "m" : "d";
+                try { await this.getCookieHeader(); } catch (_) {}
                 const headers = {
                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
                     "referer": `https://${RewardsAuto.state.host}/?form=QBLH`,
-                    "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`
+                    /* 只发 _Rwho 会把登录态整体顶掉 → 服务端 IsAuthenticated=false，
+                       上报「成功」却不记账。必须带上真实 cookie。 */
+                    "cookie": this._cookieWithRwho(deviceType)
                 };
                 await Utils.xhr({
                     method: "POST",
                     url: `https://${RewardsAuto.state.host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
                     headers, data: "wb=1%3bi%3d1%3bv%3d1"
                 });
-                await Utils.xhr({
+                const txt = await Utils.xhr({
                     method: "POST",
                     url: `https://${RewardsAuto.state.host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
                     headers,
                     data: `url=${encodeURIComponent(`https://${RewardsAuto.state.host}/search?${params}`)}&V=web`
                 });
+                const authed = String(txt || "").match(/"IsAuthenticated":(true|false)/);
+                if (authed && authed[1] === "false") {
+                    Utils.log("🟠", "搜索上报未被识别为登录态（IsAuthenticated=false），这次搜索可能不记账");
+                    return false;
+                }
                 return true;
             } catch (e) {
                 Utils.log("🟡", `搜索上报失败: ${e.message}`);
@@ -7818,6 +8126,25 @@ const __scBgKeepAlive = (function() {
             text += CDP.launchCommand() + "\n\n";
             text += "启动后脚本会自己探测端口，不需要你手动配置端口号。\n";
         } else {
+            /* 端口通 ≠ 通道可用：缺 --remote-allow-origins=* 时 HTTP 全正常，
+               但脚本发起的 WebSocket 会被 DevTools 403 拒掉。这一步必须单独验。 */
+            let wsOk = false;
+            let wsErr = "";
+            try {
+                wsOk = !!(await CDP.browserConnect());
+            } catch (e) {
+                wsErr = String((e && e.message) || e);
+            }
+            text += `浏览器级 ws 通道：${wsOk
+                ? "✅ 可用"
+                : "❌ 被拒绝" + (wsErr ? `（${wsErr}）` : "")}\n`;
+            if (!wsOk) {
+                text += "\n【原因】启动参数里缺 --remote-allow-origins=*。"
+                    + "端口能连、/json/version 也正常，但扩展源发起的 WebSocket 会被 DevTools 直接 403 拒绝，\n"
+                    + "所以脚本永远开不出标签页，日志就会写「能连上端口，但拿不到可用的 rewards 页」。\n"
+                    + "【修复】关掉那个调试窗口，再用这条命令重新启动：\n"
+                    + CDP.launchCommand() + "\n";
+            }
             text += `静默开页：${GM_getValue("Config.cdpAutoTab", true) ? "✅ 开启（后台创建，不抢焦点）" : "⏭️ 已关闭"}\n`;
             text += `今日封盘：${CDP.todayDone() ? "✅ 已封盘（今天的 CDP 任务都做完了，不再开新标签页）" : "⏳ 未封盘（需要时会静默开页）"}\n`;
             const mine = CDP.ownedStored();
