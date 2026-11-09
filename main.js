@@ -78,6 +78,20 @@ Config:
         title: 自动检测授权码(手动运行一次，token状态无则手动授权)
         type: checkbox
         default: true
+    cdpPort:
+        title: CDP 调试端口（浏览器需带 --remote-debugging-port 启动）
+        type: number
+        default: 9222
+        min: 1024
+        max: 65535
+    cdpAutoTab:
+        title: 需要 CDP 时静默开临时标签页（后台创建、不抢焦点、用完自动关闭）
+        type: checkbox
+        default: true
+    cdpHardTab:
+        title: 静默开页失败时改用会抢焦点的旧方式（一般不要开）
+        type: checkbox
+        default: false
 Tasks:
     sign:
         title: 每日签入
@@ -1644,13 +1658,27 @@ const __scBgKeepAlive = (function() {
         _warnedAt: 0,
         WARN_GAP: 30 * 60 * 1000,
 
+        /* 端口曾经三处不一致（base() 用 9222、提示文案用 9224），于是一边能连一边说连不上。
+           现在统一：配置项优先，其次按常见端口逐个探测，探测到哪个就用哪个。 */
+        DEFAULT_PORTS: [9222, 9224, 9223],
+        _port: 0,
+        _portAt: 0,
+
+        port() {
+            return Number(GM_getValue("Config.cdpPort", 9222)) || 9222;
+        },
+
+        ports() {
+            const list = [this.port()].concat(this.DEFAULT_PORTS);
+            return [...new Set(list.filter(n => Number(n) > 0))];
+        },
+
         base() {
-            const p = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
-            return "http://127.0.0.1:" + p;
+            return "http://127.0.0.1:" + (this._port || this.port());
         },
 
         launchCommand() {
-            const port = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
+            const port = this.port();
             const profile = String(GM_getValue("Config.cdpProfileDir", "") || "%LOCALAPPDATA%\\Microsoft\\Edge\\CDPUserData");
             const profDir = String(GM_getValue("Config.cdpProfileName", "") || "Profile 2");
             return "& \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\""
@@ -1685,14 +1713,36 @@ const __scBgKeepAlive = (function() {
             Utils.log("🔴", msg);
         },
 
+        /* 端口探测：按配置 + 常见端口逐个试，连上哪个就记住哪个。
+           以前 base() 固定 9222、提示文案固定 9224，同一份配置会一边能连一边说连不上。 */
         async available() {
             if (typeof WebSocket === "undefined") return false;
-            try {
-                const r = await Utils.xhr({ url: this.base() + "/json/version", timeout: 3000 });
-                return !!(r && String(r).indexOf("Browser") >= 0);
-            } catch (_) {
+            const now = Date.now();
+            /* 失败也缓存 60 秒：每轮会问很多次，端口全都不通时不该每次都串行试 3 个端口。 */
+            if (now - this._portAt < 60 * 1000) {
+                if (!this._port) return false;
+                try {
+                    const r = await Utils.xhr({ url: "http://127.0.0.1:" + this._port + "/json/version", timeout: 1500 });
+                    if (r && String(r).indexOf("Browser") >= 0) return true;
+                } catch (_) {}
+                this._port = 0;
+                this._portAt = now;
                 return false;
             }
+            for (const p of this.ports()) {
+                try {
+                    const r = await Utils.xhr({ url: "http://127.0.0.1:" + p + "/json/version", timeout: 1500 });
+                    if (r && String(r).indexOf("Browser") >= 0) {
+                        if (this._port && this._port !== p) Utils.log("🖱️", `CDP 端口 ${this._port} 已断开，改用 ${p}`);
+                        this._port = p;
+                        this._portAt = Date.now();
+                        return true;
+                    }
+                } catch (_) {}
+            }
+            this._port = 0;
+            this._portAt = Date.now();
+            return false;
         },
 
         async targets() {
@@ -1704,29 +1754,335 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async earnPage() {
-            const list = await this.targets();
-            if (!list) return null;
-            const hit = list.find(t => t.type === "page" && t.url && t.url.indexOf("https://rewards.bing.com/earn") === 0);
-            if (hit) return hit;
-            if (!GM_getValue("Config.cdpAllowNewTab", false)) return null;
+        /* ---------------- 静默标签页 ----------------
+           开：browser 级 Target.createTarget({background:true}) —— 新页在后台创建，
+               不激活、不抢焦点，你正在用的标签页/别的软件都不会被顶到前台。
+           关：Target.closeTarget，只关自己开的那几个（id 记在 _owned / Config.cdpOwned），
+               绝不碰你自己打开的 rewards 页。
+           闸门：先 available() 确认 CDP 真能用，才允许开页；当天 CDP 任务做完后不再开。 */
+        _bws: null,
+        _bid: 0,
+        _bpending: null,
+        _owned: [],
+        _wsUrl: "",
+
+        OWNED_KEY: "Config.cdpOwnedTabs",
+        DONE_KEY: "Config.cdpDoneDate",
+
+        todayDone() {
+            const d = Number(GM_getValue(this.DONE_KEY, 0)) || 0;
+            return !!d && d === Utils.getTodayNum();
+        },
+
+        markTodayDone() {
+            try { GM_setValue(this.DONE_KEY, Utils.getTodayNum()); } catch (_) {}
+        },
+
+        ownedStored() {
+            const raw = GM_getValue(this.OWNED_KEY, null);
+            return Array.isArray(raw) ? raw.filter(x => x && x.id) : [];
+        },
+
+        /* 「哪些标签页是本脚本开的」以持久化登记为准，内存 _owned 只是本上下文的快速视图。
+           上下文被重建后内存会清空，但登记还在 —— 否则上一轮开的页就再也认不出来、也关不掉。 */
+        isOwned(id) {
+            if (!id) return false;
+            if (this._owned.includes(id)) return true;
+            return this.ownedStored().some(x => x.id === id);
+        },
+
+        ownedIds() {
+            return [...new Set([].concat(this._owned, this.ownedStored().map(x => x.id)))];
+        },
+
+        _rememberOwned(id) {
+            if (!id) return;
+            if (!this._owned.includes(id)) this._owned.push(id);
+            const list = this.ownedStored().filter(x => x.id !== id);
+            list.push({ id, at: Date.now() });
+            try { GM_setValue(this.OWNED_KEY, list.slice(-8)); } catch (_) {}
+        },
+
+        _forgetOwned(ids) {
+            const drop = new Set(ids || []);
+            const left = this.ownedStored().filter(x => !drop.has(x.id));
+            try { GM_setValue(this.OWNED_KEY, left); } catch (_) {}
+            this._owned = this._owned.filter(id => !drop.has(id));
+        },
+
+        async browserInfo() {
             try {
-                const res = await new Promise((resolve, reject) => {
-                    GM_xmlhttpRequest({
-                        method: "PUT",
-                        url: this.base() + "/json/new?" + encodeURIComponent("https://rewards.bing.com/earn"),
-                        onload: r => resolve(r.responseText),
-                        onerror: e => reject(new Error((e && e.error) || "new tab failed")),
-                        ontimeout: () => reject(new Error("timeout")),
-                        timeout: 8000
-                    });
-                });
-                const j = JSON.parse(res);
-                await Utils.delay(3000);
-                return j;
+                const txt = await Utils.xhr({ url: this.base() + "/json/version", timeout: 4000 });
+                return JSON.parse(txt);
             } catch (_) {
                 return null;
             }
+        },
+
+        async browserConnect() {
+            if (this._bws && this._bws.readyState === 1) return this._bws;
+            if (this._bws) { try { this._bws.close(); } catch (_) {} }
+            this._bws = null;
+            const info = await this.browserInfo();
+            if (!info || !info.webSocketDebuggerUrl) return null;
+            this._bpending = new Map();
+            this._bid = 0;
+            const ws = new WebSocket(info.webSocketDebuggerUrl);
+            await new Promise((resolve, reject) => {
+                const t = setTimeout(() => reject(new Error("browser ws timeout")), 6000);
+                ws.onopen = () => { clearTimeout(t); resolve(); };
+                ws.onerror = () => { clearTimeout(t); reject(new Error("browser ws error")); };
+            });
+            ws.onmessage = ev => {
+                let m;
+                try { m = JSON.parse(ev.data); } catch (_) { return; }
+                const p = this._bpending && this._bpending.get(m.id);
+                if (!p) return;
+                this._bpending.delete(m.id);
+                if (m.error) p.reject(new Error(JSON.stringify(m.error)));
+                else p.resolve(m.result);
+            };
+            this._bws = ws;
+            return ws;
+        },
+
+        bsend(method, params) {
+            if (!this._bws || this._bws.readyState !== 1) return Promise.reject(new Error("browser ws not connected"));
+            const mid = ++this._bid;
+            return new Promise((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    if (this._bpending) this._bpending.delete(mid);
+                    reject(new Error("cdp timeout: " + method));
+                }, 10000);
+                this._bpending.set(mid, {
+                    resolve: v => { clearTimeout(timer); resolve(v); },
+                    reject: e => { clearTimeout(timer); reject(e); }
+                });
+                try { this._bws.send(JSON.stringify({ id: mid, method, params: params || {} })); }
+                catch (e) { clearTimeout(timer); reject(e); }
+            });
+        },
+
+        async openSilent(url) {
+            if (!(await this.available())) return null;
+            if (!GM_getValue("Config.cdpAutoTab", true)) return null;
+            const targetUrl = String(url || "https://rewards.bing.com/earn");
+            let targetId = "";
+            try {
+                await this.browserConnect();
+                /* background:true —— 关键就是它：后台建页，不切焦点 */
+                const r = await this.bsend("Target.createTarget", { url: targetUrl, background: true });
+                targetId = (r && r.targetId) || "";
+            } catch (e) {
+                GM_log("🖱️ 静默开页失败（browser 通道）：" + e.message);
+            }
+            if (!targetId && GM_getValue("Config.cdpHardTab", false)) {
+                /* 兜底：HTTP /json/new 也能建页，但会激活它（可能抢焦点），默认不开，
+                   除非你显式把 Config.cdpHardTab 打开。 */
+                try {
+                    const res = await new Promise((resolve, reject) => {
+                        GM_xmlhttpRequest({
+                            method: "PUT",
+                            url: this.base() + "/json/new?" + encodeURIComponent(targetUrl),
+                            onload: r => resolve(r.responseText),
+                            onerror: e => reject(new Error((e && e.error) || "new tab failed")),
+                            ontimeout: () => reject(new Error("timeout")),
+                            timeout: 8000
+                        });
+                    });
+                    const j = JSON.parse(res);
+                    targetId = (j && (j.id || j.targetId)) || "";
+                    if (targetId) GM_log("🖱️ 静默开页不可用，已用 HTTP 方式建页（该方式会激活标签页）");
+                } catch (_) {
+                    targetId = "";
+                }
+            }
+            if (!targetId) {
+                GM_log("🖱️ 开不出标签页：browser 通道被拒绝。请确认启动参数含 --remote-allow-origins=*");
+                return null;
+            }
+            this._rememberOwned(targetId);
+            return await this.waitPage(targetId, targetUrl);
+        },
+
+        async waitPage(targetId, url) {
+            const want = String(url || "");
+            let probe = "";
+            try { probe = new URL(want).host + new URL(want).pathname; } catch (_) { probe = ""; }
+            for (let i = 0; i < 40; i++) {
+                const list = await this.targets();
+                const hit = (list || []).find(t => t.type === "page" && (
+                    t.id === targetId
+                    || (probe && String(t.url || "").indexOf(probe) === 0)
+                ));
+                if (hit && hit.webSocketDebuggerUrl) {
+                    try {
+                        await this.usePage(hit);
+                        const st = await this.evaluate("document.readyState");
+                        if (st === "complete") return hit;
+                    } catch (_) {}
+                }
+                await Utils.delay(500);
+            }
+            return null;
+        },
+
+        /* 只导航「自己开的那一个」标签页：你的 rewards 页/正在看的页面一律不动。 */
+        async _ownedPage(fallbackUrl) {
+            const list = await this.targets();
+            const mine = (list || []).find(t => t.type === "page" && this.isOwned(t.id));
+            if (mine) {
+                if (!this._owned.includes(mine.id)) this._owned.push(mine.id);
+                return mine;
+            }
+            if (!(await this.available())) return null;
+            if (this.todayDone()) return null;
+            const page = await this.openSilent(fallbackUrl || "https://rewards.bing.com/earn");
+            return page;
+        },
+
+        async usePage(page) {
+            if (!page || !page.webSocketDebuggerUrl) return false;
+            if (this._ws && this._ws.readyState === 1 && this._wsUrl === page.webSocketDebuggerUrl) return true;
+            await this.connect(page.webSocketDebuggerUrl);
+            return true;
+        },
+
+        async goto(page, url) {
+            if (!(await this.usePage(page))) return false;
+            try { await this.send("Page.enable", {}); } catch (_) {}
+            try { await this.send("Page.navigate", { url: String(url) }); } catch (_) { return false; }
+            for (let i = 0; i < 50; i++) {
+                await Utils.delay(400);
+                let st = "";
+                try { st = String(await this.evaluate("document.readyState") || ""); } catch (_) { st = ""; }
+                if (st === "complete") return true;
+            }
+            return false;
+        },
+
+        /* 真实的浏览器级搜索：整页导航 + 真鼠标点击搜索框 + 页面自带的 sj_rra 上报。
+           返回 ok 只代表「确实执行了」，是否记账由服务端状态确认（不再拿端口通不通冒充成功）。 */
+        async realSearch(href) {
+            const url = String(href || "").trim();
+            if (!/^https?:\/\//i.test(url)) return { ok: false, reason: "没有搜索地址" };
+            if (!(await this.available())) return { ok: false, reason: "CDP 不可连" };
+            const page = await this._ownedPage("https://rewards.bing.com/earn");
+            if (!page) return { ok: false, reason: "开不出静默标签页" };
+            if (!(await this.goto(page, url))) return { ok: false, reason: "搜索页没加载完" };
+            let clicked = false;
+            try {
+                const raw = await this.evaluate([
+                    "(function(){",
+                    "  var el = document.querySelector('#sb_form_q') || document.querySelector('input[name=q]');",
+                    "  if (!el) return '';",
+                    "  var r = el.getBoundingClientRect();",
+                    "  if (!r || r.width <= 0 || r.height <= 0) return '';",
+                    "  return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });",
+                    "})()"
+                ].join("\n"));
+                const pt = raw ? JSON.parse(raw) : null;
+                if (pt && pt.y > 0) {
+                    await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y, button: "none" });
+                    await Utils.delay(120);
+                    await this.send("Input.dispatchMouseEvent", { type: "mousePressed", x: pt.x, y: pt.y, button: "left", buttons: 1, clickCount: 1 });
+                    await Utils.delay(120);
+                    await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0, clickCount: 1 });
+                    clicked = true;
+                }
+            } catch (_) {}
+            let reported = "";
+            try {
+                reported = String(await this.evaluate([
+                    "(function(){",
+                    "  try { if (typeof sj_rra === 'function') { sj_rra(location.href); return 'sj_rra'; } } catch (e) {}",
+                    "  return '';",
+                    "})()"
+                ].join("\n")) || "");
+            } catch (_) {}
+            return { ok: true, clicked, reported, url };
+        },
+
+        /* 收掉自己开过的标签页（包括上一个脚本上下文遗留的）。
+           only: 只关这一批 id（不给就关掉所有自己开过的）。 */
+        async closeOwned(only) {
+            const remembered = this.ownedStored();
+            const ids = Array.isArray(only)
+                ? [...new Set(only.map(x => (x && x.id) ? x.id : x).filter(Boolean))]
+                : [...new Set([].concat(this._owned, remembered.map(x => x.id)))];
+            this._owned = this._owned.filter(id => !ids.includes(id));
+            if (!ids.length) return 0;
+            let closed = 0;
+            let bws = null;
+            try { bws = await this.browserConnect(); } catch (_) { bws = null; }
+            for (const id of ids) {
+                let done = false;
+                if (bws) {
+                    try {
+                        await this.bsend("Target.closeTarget", { targetId: id });
+                        done = true;
+                    } catch (_) {}
+                }
+                if (!done) {
+                    try {
+                        await new Promise((resolve, reject) => {
+                            GM_xmlhttpRequest({
+                                method: "GET",
+                                url: this.base() + "/json/close/" + encodeURIComponent(id),
+                                onload: r => resolve(r.responseText),
+                                onerror: () => reject(new Error("close failed")),
+                                ontimeout: () => reject(new Error("timeout")),
+                                timeout: 4000
+                            });
+                        });
+                        done = true;
+                    } catch (_) {}
+                }
+                if (done) closed++;
+            }
+            this._forgetOwned(ids);
+            try { if (this._bws) this._bws.close(); } catch (_) {}
+            this._bws = null;
+            this._bpending = null;
+            return closed;
+        },
+
+        /* 只清理「很久以前遗留」的标签页，避免上下文重启后越攒越多；新开的一个都不碰。 */
+        async reapOwned(maxAgeMs = 3 * 60 * 1000) {
+            const now = Date.now();
+            const stale = this.ownedStored()
+                .filter(x => now - (Number(x.at) || 0) > maxAgeMs)
+                .map(x => x.id);
+            if (!stale.length) return 0;
+            return await this.closeOwned(stale);
+        },
+
+        /* 找一个能用的 rewards 页。
+           nav:false（默认，只读借用）——页面里只发 fetch，不改地址，用你已开着的 rewards 页也无感；
+           nav:true（需要导航/点击）——必须用本脚本自己开的页，绝不把你正在看的标签页导走。 */
+        async ensurePage(url, { nav = false } = {}) {
+            const want = String(url || "https://rewards.bing.com/earn");
+            if (nav) return await this._ownedPage(want);
+            const list = await this.targets();
+            if (!list) return null;
+            const pages = list.filter(t => t.type === "page" && t.url && /^https:\/\/rewards\.bing\.com\//i.test(t.url));
+            if (pages.length) {
+                /* 优先用自己开的，其次才是你已经开着的 rewards 页 */
+                return pages.find(t => this.isOwned(t.id))
+                    || pages.find(t => /\/earn/i.test(t.url))
+                    || pages[0];
+            }
+            if (!(await this.available())) return null;
+            if (!GM_getValue("Config.cdpAutoTab", true)) return null;
+            if (this.todayDone()) return null;
+            Utils.log("🖱️", "CDP 可用，静默打开一个后台标签页（不会切走你当前的页面）…");
+            const page = await this.openSilent(want);
+            if (page) Utils.log("🖱️", "后台标签页已就绪（本轮用完自动关闭）");
+            return page;
+        },
+
+        async earnPage() {
+            return await this.ensurePage("https://rewards.bing.com/earn");
         },
 
         async connect(wsUrl) {
@@ -1913,19 +2269,25 @@ const __scBgKeepAlive = (function() {
 
         async claimAll(maxCards) {
             const cap = Number(maxCards) || 6;
+            if (this.todayDone()) {
+                Utils.log("🖱️", "今天需要 CDP 的任务都已处理完，本轮不再连接浏览器调试端口");
+                return { ok: true, handled: 0, done: 0, total: 0, skipped: true };
+            }
             if (!(await this.available())) {
-                const reason = "端口 " + (Number(GM_getValue("Config.cdpPort", 9224)) || 9224) + " 上没有调试服务";
+                const reason = "本地调试端口（" + this.ports().join("/") + "）上都没有 CDP 服务";
                 this.warn(reason);
                 return { ok: false, reason: reason };
             }
-            let page = await this.earnPage();
+            /* 这里要整页导航（点卡会跳搜索页、之后还得回 earn），必须用自己开的标签页，
+               否则会把你正在看的 rewards 页导走。 */
+            let page = await this.ensurePage("https://rewards.bing.com/earn", { nav: true });
             if (!page) {
-                this.warn("能连上端口，但打不开 earn 页");
-                return { ok: false, reason: "打不开 earn 页" };
+                this.warn("能连上端口，但拿不到可用的 rewards 页");
+                return { ok: false, reason: "打不开 rewards 页" };
             }
             const result = { ok: true, handled: 0, done: 0, total: 0 };
             try {
-                await this.connect(page.webSocketDebuggerUrl);
+                await this.usePage(page);
                 const before = await this.progress();
                 result.done = before.done || 0;
                 result.total = before.total || 0;
@@ -1944,11 +2306,13 @@ const __scBgKeepAlive = (function() {
                 }
                 Utils.log("🖱️", "CDP：发现 " + cards.length + " 张待处理卡（用真实点击完成）");
 
+                /* 点一张卡会整页跳到搜索页，必须回到 earn 页才能找下一张。
+                   以前这里直接复用旧 page 对象，点完第一张后 DOM 里已经没有卡片了。 */
                 for (const card of cards.slice(0, cap)) {
-                    page = await this.earnPage();
-                    if (!page) break;
-                    if (!this._ws || this._ws.readyState !== 1) {
-                        await this.connect(page.webSocketDebuggerUrl);
+                    if (!(await this.usePage(page))) break;
+                    if (!(await this.goto(page, "https://rewards.bing.com/earn"))) {
+                        Utils.log("🟡", "  回到 earn 页失败，剩余卡片留给下一轮");
+                        break;
                     }
                     const ok = await this.clickCard(card.href);
                     if (ok) {
@@ -1960,9 +2324,7 @@ const __scBgKeepAlive = (function() {
 
                 for (let i = 0; i < 12; i++) {
                     await Utils.delay(10000);
-                    const pg = await this.earnPage();
-                    if (!pg) break;
-                    if (!this._ws || this._ws.readyState !== 1) await this.connect(pg.webSocketDebuggerUrl);
+                    if (!(await this.goto(page, "https://rewards.bing.com/earn"))) break;
                     const now = await this.progress();
                     result.done = now.done || 0;
                     result.total = now.total || 0;
@@ -2725,9 +3087,26 @@ const __scBgKeepAlive = (function() {
             if (!rawUrl) return false;
 
             if (!(await CDP.available())) {
-                CDP.warn("端口 " + (Number(GM_getValue("Config.cdpPort", 9224)) || 9224) + " 上没有调试服务");
+                CDP.warn("本地调试端口（" + CDP.ports().join("/") + "）上都没有 CDP 服务");
                 return false;
             }
+            /* 这里以前只判断端口通不通就 return true —— 一次搜索都没发出去，
+               调用方却当成「CDP 已点击」，于是带锁卡永远不记账。
+               现在做真的浏览器级搜索：整页导航 + 真鼠标点搜索框 + sj_rra 上报，
+               并且以服务端是否把这张卡标成完成作为成功判据。 */
+            let r;
+            try {
+                r = await CDP.realSearch(rawUrl);
+            } catch (e) {
+                Utils.log("🟡", `CDP 真实搜索异常：${e.message}`);
+                return false;
+            }
+            if (!r || !r.ok) {
+                Utils.log("🟡", `CDP 真实搜索未执行：${(r && r.reason) || "未知原因"}`);
+                return false;
+            }
+            Utils.log("🖱️", `CDP 已真实打开奖励搜索页（点击搜索框=${r.clicked ? "是" : "否"}`
+                + `${r.reported ? "，已调用 sj_rra" : ""}）`);
             return true;
         },
 
@@ -3796,7 +4175,12 @@ const __scBgKeepAlive = (function() {
         async _ensurePageChannel() {
 
             if (!GM_getValue("Config.allowOpenTab", false)) return null;
-
+            /* 这条路和 CDP 是两条独立通道：只要能用 CDP 静默开页，就不再用会抢焦点的 GM_openInTab。 */
+            if (await CDP.available()) {
+                Utils.log("🖥️", "CDP 可用，改用静默后台标签页代发（不抢焦点），跳过 GM_openInTab");
+                return null;
+            }
+            if (CDP.todayDone()) return null;
             const openedAt = Number(GM_getValue("Config.pageOpenedAt", 0)) || 0;
             const reallyAlive = this._pageChannelAlive();
             if (!reallyAlive && openedAt && (Date.now() - openedAt) < 10 * 60 * 1000) {
@@ -4825,7 +5209,7 @@ const __scBgKeepAlive = (function() {
                 if (!(await CDP.available())) return { ok: false, status: 0, text: "CDP 不可用", variant };
                 const page = await this._anyRewardsPage();
                 if (!page) return { ok: false, status: 0, text: "没有可用的 rewards 页面", variant };
-                if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
+                await CDP.usePage(page);
                 const r = await CDP.claimInPage(req.url, req.headers, req.data);
                 return {
                     ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
@@ -4848,12 +5232,9 @@ const __scBgKeepAlive = (function() {
             };
         },
 
+        /* 只读借用：页面里只发 fetch，不改地址，所以用你自己开着的 rewards 页也完全无感。 */
         async _anyRewardsPage() {
-            const list = await CDP.targets();
-            if (!list) return null;
-            const pages = list.filter(t => t.type === "page" && t.url && /^https:\/\/rewards\.bing\.com\//i.test(t.url));
-            if (!pages.length) return null;
-            return pages.find(t => /\/earn/i.test(t.url)) || pages[0];
+            return await CDP.ensurePage("https://rewards.bing.com/earn", { nav: false });
         },
 
         async claimCardWeb(card, { appChannel = false } = {}) {
@@ -5859,6 +6240,7 @@ const __scBgKeepAlive = (function() {
             if (cards.length === 0) {
                 Utils.log("✅", "未发现待处理活动卡片");
                 this.promosDate = RewardsAuto.state.dateNowNum;
+                CDP._promosClean = true;   /* 没有卡片 = 今天不需要 CDP，收尾时直接封盘 */
                 this.save();
                 return true;
             }
@@ -5913,6 +6295,18 @@ const __scBgKeepAlive = (function() {
             if (pending === 0) {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
+            }
+            /* 本轮 CDP 的结果先记下来：真正的「收标签页 + 封盘」放在整轮末尾做，
+               因为后面还有「首页待领取」等环节可能要借同一个页面通道。
+
+               判据要说清：能不能「今天不再开页」取决于「还有没有需要 CDP 的东西」。
+               pending 已经把「今天确定做不了（isUnoffered）」和「已交卷等手动点（isManualCard）」
+               排除掉了，那些不该让我们一直开着标签页；但 lockedNow（明确锁着的卡）
+               和 outOfTime（到点交班）说明还有活没干完，不能封盘。 */
+            const stillNeedsCdp = outOfTime || lockedNow > 0 || pending > 0;
+            CDP._promosClean = !stillNeedsCdp;
+            if (stillNeedsCdp) {
+                try { GM_setValue(CDP.DONE_KEY, 0); } catch (_) {}
             }
             const manualCards = (RewardsAuto.state.manualCards || []);
             if (manualCards.length > 0) {
@@ -6277,8 +6671,9 @@ const __scBgKeepAlive = (function() {
             if (env.extOriginRisky) {
                 lines.push(`Edge ${env.major} 对扩展源 origin 的 server action 会回 500 —— 这不是脚本参数错了，是浏览器强制的头。`);
             }
-            const cdpPort = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
-            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），并留一个 rewards 页面开着；`);
+            const cdpPort = CDP.port();
+            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）。`
+                + `连上后脚本会自己在后台开一个临时标签页（不抢焦点），用完自动关闭；`);
             lines.push(`② 页面代发通道：在 rewards.bing.com 页面里跑过一次脚本后自动可用（Config.usePageChannel 打开）；`);
             lines.push(`③ 后台直发：Chrome / 旧版 Edge 上通常能过，新版 Edge 上常被拒。`);
             Utils.log("🟡", lines.join("\n"));
@@ -6456,6 +6851,11 @@ const __scBgKeepAlive = (function() {
                         return false;
                     }
                 };
+                /* 开跑前先清掉上一轮遗留在窗口里的临时标签页（只清自己开过、且已经放很久的）。 */
+                try {
+                    const reapedTabs = await CDP.reapOwned(3 * 60 * 1000);
+                    if (reapedTabs > 0) Utils.log("🖱️", `已清理上一轮遗留的 ${reapedTabs} 个临时标签页`);
+                } catch (_) {}
                 await withRetry(() => this.doSign(), "签到");
                 await Utils.randomDelay();
                 if (isTokenOK) {
@@ -6522,6 +6922,21 @@ const __scBgKeepAlive = (function() {
                 }
                 Utils.log("🌐", "检查 Edge 浏览连签进度...");
                 await EdgePacer.maybeReport();
+                /* CDP 收尾（整轮唯一出口）：把本轮自己开的临时标签页全部关掉。
+                   只有「活动卡全清 + 首页待领取也过」才封盘到今天结束；
+                   否则下一轮（可能 20 分钟后）还允许再开一次。 */
+                try {
+                    const closed = await CDP.closeOwned();
+                    if (closed > 0) Utils.log("🖱️", `已关闭 ${closed} 个本轮临时标签页`);
+                    const claimBad = /未成功|异常|待复核/.test(this.claimSummary || "");
+                    if (CDP._promosClean && !claimBad) {
+                        CDP.markTodayDone();
+                        Utils.log("🖱️", "今天所有需要 CDP 的任务都处理完了，之后不再打开标签页（明天自动恢复）");
+                    } else {
+                        CDP._promosClean = false;
+                        Utils.log("🖱️", "还有需要 CDP 的项未完成，下一轮需要时再静默开页");
+                    }
+                } catch (_) {}
                 const endTime = Utils.getTimestamp();
                 const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
                 const endBalance = await API.getBalance();
@@ -6730,12 +7145,14 @@ const __scBgKeepAlive = (function() {
     const diagClaim = async () => {
         const env = BrowserEnv.info();
         const saved = String(GM_getValue("Config.claimVariant", "") || "");
-        const cdpPort = Number(GM_getValue("Config.cdpPort", 9224)) || 9224;
+        const cdpPort = CDP.port();
         let text = "🎁 待领积分 / 领取通道诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.claimPoints", true) ? "开启" : "关闭"}\n`;
         text += `当前浏览器：${BrowserEnv.summary()}${env.extOriginRisky ? "（新版本，后台直发大概率被拒）" : ""}\n`;
         text += `已记住通道：${saved || "未记录（会按 page → proxy → xhr 逐个试）"}\n`;
-        text += `CDP 调试端口 ${cdpPort}：${(await CDP.available()) ? "✅ 可连" : "❌ 不可连"}\n`;
+        const cdpOk = await CDP.available();
+        text += `CDP 调试端口（配置 ${cdpPort}，实际探测 ${CDP.ports().join("/")}）：${cdpOk ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
+        text += `临时标签页：${CDP.todayDone() ? "今日已封盘（CDP 任务都做完了，不再开页）" : "按需静默打开，用完自动关闭"}\n`;
         text += `页面代发服务：${API._pageChannelAlive() ? "✅ 在线" : "❌ 不在线"}\n`;
         const table = ActionMap._readMap();
         text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
@@ -6756,8 +7173,9 @@ const __scBgKeepAlive = (function() {
             : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
         text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
         if (!pool.variant && !pool.empty) {
-            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）并留一个 rewards 页面，`
-                + "这样领取会走页面同源请求；Chrome 上后台直发通常也能过。";
+            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），`
+                + "脚本检测到 CDP 会自己在后台开一个临时标签页做同源请求，用完自动关闭"
+                + "（不抢焦点、不切走你正在看的页面）；Chrome 上后台直发通常也能过。";
         }
         text += "\n判定口径：余额上涨 > 待领池清空 > 待领金额下降；三者都拿不到才记「无法确认」。";
         if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
@@ -7387,6 +7805,36 @@ const __scBgKeepAlive = (function() {
         Sched.arm(true);
     };
 
+    /* CDP / 临时标签页诊断：把「能不能连、开不开页、还开着几个、今天封没封盘」一次说清，
+       避免又要靠翻日志猜。 */
+    const diagCdp = async () => {
+        let text = "🖱️ CDP 与临时标签页\n\n";
+        text += `任务开关（活动卡片）：${GM_getValue("Tasks.promos", true) ? "开启" : "关闭"}\n`;
+        text += `配置端口：${CDP.port()}（实际会按 ${CDP.ports().join(" / ")} 逐个探测）\n`;
+        const okCdp = await CDP.available();
+        text += `CDP：${okCdp ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
+        if (!okCdp) {
+            text += "\n【怎么让它可连】用下面这条命令启动浏览器，再重新打开脚本页面：\n";
+            text += CDP.launchCommand() + "\n\n";
+            text += "启动后脚本会自己探测端口，不需要你手动配置端口号。\n";
+        } else {
+            text += `静默开页：${GM_getValue("Config.cdpAutoTab", true) ? "✅ 开启（后台创建，不抢焦点）" : "⏭️ 已关闭"}\n`;
+            text += `今日封盘：${CDP.todayDone() ? "✅ 已封盘（今天的 CDP 任务都做完了，不再开新标签页）" : "⏳ 未封盘（需要时会静默开页）"}\n`;
+            const mine = CDP.ownedStored();
+            text += `当前登记的本脚本临时页：${mine.length ? mine.length + " 个" : "无"}\n`;
+            const list = await CDP.targets();
+            if (list) {
+                const pages = list.filter(t => t.type === "page");
+                const ownedIds = new Set([].concat(CDP._owned, mine.map(x => x.id)));
+                text += `浏览器里共有 ${pages.length} 个标签页，其中本脚本开的 ${pages.filter(t => ownedIds.has(t.id)).length} 个\n`;
+            }
+        }
+        text += "\n行为约定：只有检测到 CDP 可用才会开页；用的过程中你在别的软件/标签页里不会被弹窗抢走；"
+            + "本次用完自动关闭；当天 CDP 任务全部完成后再也不开，第二天自动恢复。";
+        return text;
+    };
+    try { GM_registerMenuCommand("🖱️ CDP / 临时标签页状态", () => diagCdp().then(t => Utils.uiAlert(t))); } catch (_) {}
+
     try {
         const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : globalThis;
         host.__MPDiagnostics = {
@@ -7396,7 +7844,8 @@ const __scBgKeepAlive = (function() {
             schedule: diagSchedStatus,
             resetSchedule: diagResetSchedule,
             releaseLock: diagReleaseLock,
-            claim: diagClaim
+            claim: diagClaim,
+            cdp: diagCdp
         };
     } catch (_) {}
 
