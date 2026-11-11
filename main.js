@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.0
+// @version      1.5.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -78,20 +78,6 @@ Config:
         title: 自动检测授权码(手动运行一次，token状态无则手动授权)
         type: checkbox
         default: true
-    cdpPort:
-        title: CDP 调试端口（浏览器需带 --remote-debugging-port 启动）
-        type: number
-        default: 9222
-        min: 1024
-        max: 65535
-    cdpAutoTab:
-        title: 需要 CDP 时静默开临时标签页（后台创建、不抢焦点、用完自动关闭）
-        type: checkbox
-        default: true
-    cdpHardTab:
-        title: 静默开页失败时改用会抢焦点的旧方式（一般不要开）
-        type: checkbox
-        default: false
 Tasks:
     sign:
         title: 每日签入
@@ -1658,27 +1644,17 @@ const __scBgKeepAlive = (function() {
         _warnedAt: 0,
         WARN_GAP: 30 * 60 * 1000,
 
-        /* 端口曾经三处不一致（base() 用 9222、提示文案用 9224），于是一边能连一边说连不上。
-           现在统一：配置项优先，其次按常见端口逐个探测，探测到哪个就用哪个。 */
-        DEFAULT_PORTS: [9222, 9224, 9223],
-        _port: 0,
+        /* 端口固定 9222，不再提供配置项、也不再扫描其它端口。
+           浏览器请用带 --remote-debugging-port=9222 的方式启动。 */
+        PORT: 9222,
         _portAt: 0,
 
-        port() {
-            return Number(GM_getValue("Config.cdpPort", 9222)) || 9222;
-        },
-
-        ports() {
-            const list = [this.port()].concat(this.DEFAULT_PORTS);
-            return [...new Set(list.filter(n => Number(n) > 0))];
-        },
-
         base() {
-            return "http://127.0.0.1:" + (this._port || this.port());
+            return "http://127.0.0.1:" + this.PORT;
         },
 
         launchCommand() {
-            const port = this.port();
+            const port = this.PORT;
             const profile = String(GM_getValue("Config.cdpProfileDir", "") || "%LOCALAPPDATA%\\Microsoft\\Edge\\CDPUser Data");
             /* --profile-directory 只在真的配置了、且不是 Default 时才加。
                以前这里默认写死 "Profile 2"，而 CDP 配置目录里通常只有 Default：
@@ -1722,36 +1698,23 @@ const __scBgKeepAlive = (function() {
             Utils.log("🔴", msg);
         },
 
-        /* 端口探测：按配置 + 常见端口逐个试，连上哪个就记住哪个。
-           以前 base() 固定 9222、提示文案固定 9224，同一份配置会一边能连一边说连不上。 */
+        /* 端口固定 9222，不再探测别的端口。 */
         async available() {
             if (typeof WebSocket === "undefined") return false;
             const now = Date.now();
-            /* 失败也缓存 60 秒：每轮会问很多次，端口全都不通时不该每次都串行试 3 个端口。 */
+            /* 成功和失败都缓存 60 秒：每轮会问很多次，不该每次都真去连一遍。 */
             if (now - this._portAt < 60 * 1000) {
-                if (!this._port) return false;
-                try {
-                    const r = await Utils.xhr({ url: "http://127.0.0.1:" + this._port + "/json/version", timeout: 1500 });
-                    if (r && String(r).indexOf("Browser") >= 0) return true;
-                } catch (_) {}
-                this._port = 0;
-                this._portAt = now;
-                return false;
+                /* 60 秒内已探测过：直接复用上次结果 */
+                return this._portOk === true;
             }
-            for (const p of this.ports()) {
-                try {
-                    const r = await Utils.xhr({ url: "http://127.0.0.1:" + p + "/json/version", timeout: 1500 });
-                    if (r && String(r).indexOf("Browser") >= 0) {
-                        if (this._port && this._port !== p) Utils.log("🖱️", `CDP 端口 ${this._port} 已断开，改用 ${p}`);
-                        this._port = p;
-                        this._portAt = Date.now();
-                        return true;
-                    }
-                } catch (_) {}
+            try {
+                const r = await Utils.xhr({ url: this.base() + "/json/version", timeout: 1500 });
+                this._portOk = !!(r && String(r).indexOf("Browser") >= 0);
+            } catch (_) {
+                this._portOk = false;
             }
-            this._port = 0;
             this._portAt = Date.now();
-            return false;
+            return this._portOk;
         },
 
         async targets() {
@@ -1916,7 +1879,6 @@ const __scBgKeepAlive = (function() {
                 return null;
             }
             if (!(await this.available())) return null;
-            if (!GM_getValue("Config.cdpAutoTab", true)) return null;
             const targetUrl = String(url || "https://rewards.bing.com/earn");
             let targetId = "";
             try {
@@ -1926,27 +1888,6 @@ const __scBgKeepAlive = (function() {
                 targetId = (r && r.targetId) || "";
             } catch (e) {
                 GM_log("🖱️ 静默开页失败（browser 通道）：" + e.message);
-            }
-            if (!targetId && GM_getValue("Config.cdpHardTab", false)) {
-                /* 兜底：HTTP /json/new 也能建页，但会激活它（可能抢焦点），默认不开，
-                   除非你显式把 Config.cdpHardTab 打开。 */
-                try {
-                    const res = await new Promise((resolve, reject) => {
-                        GM_xmlhttpRequest({
-                            method: "PUT",
-                            url: this.base() + "/json/new?" + encodeURIComponent(targetUrl),
-                            onload: r => resolve(r.responseText),
-                            onerror: e => reject(new Error((e && e.error) || "new tab failed")),
-                            ontimeout: () => reject(new Error("timeout")),
-                            timeout: 8000
-                        });
-                    });
-                    const j = JSON.parse(res);
-                    targetId = (j && (j.id || j.targetId)) || "";
-                    if (targetId) GM_log("🖱️ 静默开页不可用，已用 HTTP 方式建页（该方式会激活标签页）");
-                } catch (_) {
-                    targetId = "";
-                }
             }
             if (!targetId) {
                 GM_log("🖱️ 开不出标签页：browser 通道被拒绝。请确认启动参数含 --remote-allow-origins=*");
@@ -2133,7 +2074,6 @@ const __scBgKeepAlive = (function() {
             if (!create) return null;
             if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
-            if (!GM_getValue("Config.cdpAutoTab", true)) return null;
             if (this.todayDone()) return null;
             Utils.log("🖱️", "CDP 可用，静默打开一个后台标签页（不会切走你当前的页面）…");
             const page = await this.openSilent(want);
@@ -2153,7 +2093,7 @@ const __scBgKeepAlive = (function() {
            以前这一律报「拿不到可用的 rewards 页」，等于把最关键的配置问题藏起来了。 */
         async whyNoPage() {
             const info = await this.browserInfo();
-            if (!info) return "本地调试端口（" + this.ports().join("/") + "）上没有 CDP 服务";
+            if (!info) return "本地调试端口 " + this.PORT + " 上没有 CDP 服务";
             try {
                 const ws = await this.browserConnect();
                 if (!ws) return "能连上端口，但拿不到浏览器级 ws 通道";
@@ -2425,7 +2365,7 @@ const __scBgKeepAlive = (function() {
                 return { ok: true, handled: 0, done: 0, total: 0, skipped: true };
             }
             if (!(await this.available())) {
-                const reason = "本地调试端口（" + this.ports().join("/") + "）上都没有 CDP 服务";
+                const reason = "本地调试端口 " + this.PORT + " 上没有 CDP 服务";
                 this.warn(reason);
                 return { ok: false, reason: reason };
             }
@@ -3258,7 +3198,7 @@ const __scBgKeepAlive = (function() {
             if (!rawUrl) return false;
 
             if (!(await CDP.available())) {
-                CDP.warn("本地调试端口（" + CDP.ports().join("/") + "）上都没有 CDP 服务");
+                CDP.warn("本地调试端口 " + CDP.PORT + " 上没有 CDP 服务");
                 return false;
             }
             /* 这里以前只判断端口通不通就 return true —— 一次搜索都没发出去，
@@ -7130,8 +7070,7 @@ const __scBgKeepAlive = (function() {
             if (env.extOriginRisky) {
                 lines.push(`Edge ${env.major} 对扩展源 origin 的 server action 会回 500 —— 这不是脚本参数错了，是浏览器强制的头。`);
             }
-            const cdpPort = CDP.port();
-            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}）。`
+            lines.push(`① CDP 同源通道：用桌面「Rewards Edge」快捷方式启动（端口 ${CDP.PORT}）。`
                 + `连上后脚本会自己在后台开一个临时标签页（不抢焦点），用完自动关闭；`);
             lines.push(`② 页面代发通道：在 rewards.bing.com 页面里跑过一次脚本后自动可用（Config.usePageChannel 打开）；`);
             lines.push(`③ 后台直发：Chrome / 旧版 Edge 上通常能过，新版 Edge 上常被拒。`);
@@ -7604,13 +7543,12 @@ const __scBgKeepAlive = (function() {
     const diagClaim = async () => {
         const env = BrowserEnv.info();
         const saved = String(GM_getValue("Config.claimVariant", "") || "");
-        const cdpPort = CDP.port();
         let text = "🎁 待领积分 / 领取通道诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.claimPoints", true) ? "开启" : "关闭"}\n`;
         text += `当前浏览器：${BrowserEnv.summary()}${env.extOriginRisky ? "（新版本，后台直发大概率被拒）" : ""}\n`;
         text += `已记住通道：${saved || "未记录（会按 page → proxy → xhr 逐个试）"}\n`;
         const cdpOk = await CDP.available();
-        text += `CDP 调试端口（配置 ${cdpPort}，实际探测 ${CDP.ports().join("/")}）：${cdpOk ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
+        text += `CDP 调试端口 ${CDP.PORT}：${cdpOk ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
         text += `临时标签页：${CDP.todayDone() ? "今日已封盘（CDP 任务都做完了，不再开页）" : "按需静默打开，用完自动关闭"}\n`;
         text += `页面代发服务：${API._pageChannelAlive() ? "✅ 在线" : "❌ 不在线"}\n`;
         const table = ActionMap._readMap();
@@ -7632,7 +7570,7 @@ const __scBgKeepAlive = (function() {
             : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
         text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
         if (!pool.variant && !pool.empty) {
-            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${cdpPort}），`
+            text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${CDP.PORT}），`
                 + "脚本检测到 CDP 会自己在后台开一个临时标签页做同源请求，用完自动关闭"
                 + "（不抢焦点、不切走你正在看的页面）；Chrome 上后台直发通常也能过。";
         }
@@ -8264,55 +8202,6 @@ const __scBgKeepAlive = (function() {
         Sched.arm(true);
     };
 
-    /* CDP / 临时标签页诊断：把「能不能连、开不开页、还开着几个、今天封没封盘」一次说清，
-       避免又要靠翻日志猜。 */
-    const diagCdp = async () => {
-        let text = "🖱️ CDP 与临时标签页\n\n";
-        text += `任务开关（活动卡片）：${GM_getValue("Tasks.promos", true) ? "开启" : "关闭"}\n`;
-        text += `配置端口：${CDP.port()}（实际会按 ${CDP.ports().join(" / ")} 逐个探测）\n`;
-        const okCdp = await CDP.available();
-        text += `CDP：${okCdp ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
-        if (!okCdp) {
-            text += "\n【怎么让它可连】用下面这条命令启动浏览器，再重新打开脚本页面：\n";
-            text += CDP.launchCommand() + "\n\n";
-            text += "启动后脚本会自己探测端口，不需要你手动配置端口号。\n";
-        } else {
-            /* 端口通 ≠ 通道可用：缺 --remote-allow-origins=* 时 HTTP 全正常，
-               但脚本发起的 WebSocket 会被 DevTools 403 拒掉。这一步必须单独验。 */
-            let wsOk = false;
-            let wsErr = "";
-            try {
-                wsOk = !!(await CDP.browserConnect());
-            } catch (e) {
-                wsErr = String((e && e.message) || e);
-            }
-            text += `浏览器级 ws 通道：${wsOk
-                ? "✅ 可用"
-                : "❌ 被拒绝" + (wsErr ? `（${wsErr}）` : "")}\n`;
-            if (!wsOk) {
-                text += "\n【原因】启动参数里缺 --remote-allow-origins=*。"
-                    + "端口能连、/json/version 也正常，但扩展源发起的 WebSocket 会被 DevTools 直接 403 拒绝，\n"
-                    + "所以脚本永远开不出标签页，日志就会写「能连上端口，但拿不到可用的 rewards 页」。\n"
-                    + "【修复】关掉那个调试窗口，再用这条命令重新启动：\n"
-                    + CDP.launchCommand() + "\n";
-            }
-            text += `静默开页：${GM_getValue("Config.cdpAutoTab", true) ? "✅ 开启（后台创建，不抢焦点）" : "⏭️ 已关闭"}\n`;
-            text += "任务分工：每日活动 ⏭️ 走 DAPI 从不开页；只有日常任务里带锁 🔒 的卡片才用 CDP\n";
-            text += `今日封盘：${CDP.todayDone() ? "✅ 已封盘（今天的 CDP 任务都做完了，不再开新标签页）" : "⏳ 未封盘（需要时会静默开页）"}\n`;
-            const mine = CDP.ownedStored();
-            text += `当前登记的本脚本临时页：${mine.length ? mine.length + " 个" : "无"}\n`;
-            const list = await CDP.targets();
-            if (list) {
-                const pages = list.filter(t => t.type === "page");
-                const ownedIds = new Set([].concat(CDP._owned, mine.map(x => x.id)));
-                text += `浏览器里共有 ${pages.length} 个标签页，其中本脚本开的 ${pages.filter(t => ownedIds.has(t.id)).length} 个\n`;
-            }
-        }
-        text += "\n行为约定：只有检测到 CDP 可用才会开页；用的过程中你在别的软件/标签页里不会被弹窗抢走；"
-            + "本次用完自动关闭；当天 CDP 任务全部完成后再也不开，第二天自动恢复。";
-        return text;
-    };
-    try { GM_registerMenuCommand("🖱️ CDP / 临时标签页状态", () => diagCdp().then(t => Utils.uiAlert(t))); } catch (_) {}
 
     try {
         const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : globalThis;
@@ -8323,8 +8212,7 @@ const __scBgKeepAlive = (function() {
             schedule: diagSchedStatus,
             resetSchedule: diagResetSchedule,
             releaseLock: diagReleaseLock,
-            claim: diagClaim,
-            cdp: diagCdp
+            claim: diagClaim
         };
     } catch (_) {}
 
