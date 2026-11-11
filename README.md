@@ -35,14 +35,35 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 
 | 任务 | 在 Chrome | 在 Edge |
 | --- | --- | --- |
-| 带锁 🔒 卡片(已解锁) | ✅  | ✅ 需先配好 CDP（见第三节） |
+| 带锁 🔒 卡片(已解锁) | ✅  | ✅ 需先配好 CDP（见第四节） |
 | 桌面端任务 | ✅ | ❌ |
 | 首页待领取 | ✅ | ❌ |
 | 月度计划 | ✅ | ❌ |
 
-## 三、手动配置 Edge 的 CDP 通道（可选，只为带锁 🔒 卡片）
+## 三、两种通道的分工（先看这里）
+
+脚本里有**两套完全独立的通道**，用错对象就会出现「明明不需要却开了标签页」：
+
+| | 每日活动（页面顶部那一排 3 张） | 日常任务（下面网格里的卡片） |
+| --- | --- | --- |
+| 卡长什么样 | 无锁标：即将到来的喜剧活动、葡萄酒之旅、云形成类型… | 普通卡无锁；**带锁 🔒 的**才特殊 |
+| 记账通道 | **DAPI**（`dapi/me/activities` 一条 POST 就记账） | 普通卡走后台网页交卷；带锁卡走 **CDP** |
+| 要开标签页吗 | **❌ 从不开** | 只有带锁 🔒 的卡才开 |
+| 要配 CDP 吗 | **不需要** | 带锁卡需要 |
+
+判定逻辑写在 `API._isDailyActivity()` / `API._needsCdp()` 两个函数里：
+
+- `_isDailyActivity()`：`source === "dapi"`，或 `offerId` 含 `Gamification_DailySet_` → 判为每日活动；
+- `_needsCdp()`：每日活动一律 `false`；其余卡片里 `appOnly`（应用专属）、`levelGated`（等级门槛）、
+  应用内搜索签名卡才是 `true`。
+
+只有 `_needsCdp()` 为真的卡片才会触发静默开页，其余任务里 CDP 只**复用**你已经开着的
+rewards 页（`ensurePage(..., { create: false })`），没有现成页面就直接走 DAPI / 后台请求。
+
+## 四、手动配置 Edge 的 CDP 通道（可选，只为带锁 🔒 卡片）
 
 > 只解决带锁卡片。桌面端、首页待领取、月度计划仍需用 Chrome 跑。
+> **每日活动不需要这一节** —— 它走 DAPI，配不配 CDP 都不会开标签页。
 
 ### 1. 建 CDP 配置目录
 
@@ -110,3 +131,18 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 - **端口能连，但日志说「拿不到可用的 rewards 页」**：快捷方式参数漏了 `--remote-allow-origins=*`。右键属性补上，关掉窗口重开。
 - **别加 `--profile-directory="Profile 2"`**：调试目录里通常只有 `Default`，加上会开出一个空配置。
 - **别给日常配置目录加调试端口**：`--user-data-dir` 一定指向单独的 `CDPUser Data`。
+- **带锁 🔒 卡一直做不完**：已经修过三个坑（`v1.3.1`）——
+  1. 国内 `www.bing.com` 会 302 到 `cn.bing.com`，跨域上报被 CORS 拦掉，现在用页面真实落地域；
+  2. 后台标签页 `document.hidden=true`，Chromium 不做布局，卡片盒子是 `0×0`，
+     旧代码照着 `(0,0)` 点击等于点空白却报成功，现在改成 `element.click()`；
+  3. 真正记账的是 **Server Action 交卷**（返回 `1:true` 立即生效），
+     搜索上报只是陪跑，现在交卷提到第一步做。
+  另外入账是异步的，等待窗口从 25 秒放宽到 3 分钟，正常上报过的卡不再被误标成「需手动点击」。
+
+- **CDP 做任务时开出一堆搜索标签页 / 老是被抢焦点**（`v1.3.2` 已修）：
+  卡片的 `<a>` 全都带 `target="_blank"`（实测 7/7 张），`element.click()` 会为每张卡
+  **新开一个标签页**，而这类页不在脚本的登记名单里 —— 既不会被自动关闭，
+  打开时还会把焦点抢走，于是做几张卡就留几个搜索页。
+  现在点击前先 `removeAttribute('target')`，让导航发生在脚本自己管理的那个临时页里，
+  全程 `background:true`（`document.hidden=true`，不抢焦点）；
+  并且**每张卡处理完立刻关闭**该临时页，而不是等整轮结束才收（`Config.cdpDoneDate` 那套封盘逻辑不变）。

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.0
+// @version      1.3.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -2301,6 +2301,33 @@ const __scBgKeepAlive = (function() {
 
         async clickCard(href) {
             const h = JSON.stringify(href);
+            /* 背景标签页里 document.hidden=true，Chromium 完全不做布局，
+               所有卡片 getBoundingClientRect() 都是 0×0 @(0,0)，
+               坐标点击等于点空白；所以不依赖坐标，直接 element.click()。 */
+            const clickExpr = [
+                "(function(){",
+                "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
+                "  var nodes = document.querySelectorAll(sel);",
+                "  var target = null;",
+                "  for (var i = 0; i < nodes.length; i++) { if (nodes[i].href === " + h + ") { target = nodes[i]; break; } }",
+                "  if (!target) return 'nf';",
+                "  try {",
+                "    target.scrollIntoView({ block: 'center' });",
+                "    target.click();",
+                "    return 'clicked';",
+                "  } catch (e) { return 'err:' + (e && e.message || e); }",
+                "})()"
+            ].join("\n");
+            let clicked = null;
+            try { clicked = await this.evaluate(clickExpr); } catch (_) { clicked = null; }
+            if (clicked === "clicked") {
+                await Utils.delay(600);
+                return true;
+            }
+            if (clicked === "nf") return false;
+
+            /* 兜底：click() 被页面拦下时再试坐标点击，但必须先确认真实盒子非 0×0，
+               否则 (0,0) 的点击毫无意义 —— 宁可报失败，也不谎报成功。 */
             const posExpr = [
                 "(function(){",
                 "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
@@ -2310,14 +2337,15 @@ const __scBgKeepAlive = (function() {
                 "  if (!target) return 'nf';",
                 "  target.scrollIntoView({ block: 'center' });",
                 "  var r = target.getBoundingClientRect();",
+                "  if (!r || r.width <= 0 || r.height <= 0) return 'nobox';",
                 "  return JSON.stringify({ x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) });",
                 "})()"
             ].join("\n");
             let pos = await this.evaluate(posExpr);
-            if (pos === "nf") return false;
-            await Utils.delay(900);
-            pos = await this.evaluate(posExpr);
-            if (pos === "nf") return false;
+            if (pos === "nf" || pos === "nobox") {
+                /* 后台页没有布局，坐标点击没有意义 —— 明确失败，不再假成功。 */
+                return false;
+            }
             let pt = null;
             try { pt = JSON.parse(pos); } catch (_) { return false; }
             await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pt.x, y: pt.y, button: "none" });
@@ -2425,7 +2453,6 @@ const __scBgKeepAlive = (function() {
     };
 
     const BrowserEnv = {
-        _cache: null,
         info() {
             if (this._cache) return this._cache;
             let ua = "";
@@ -4016,7 +4043,11 @@ const __scBgKeepAlive = (function() {
 
                 const expr = `(async function(){
                     try {
-                        var origin = ${JSON.stringify(origin)};
+                        /* 关键：用页面真实落地的域，而不是 card.destination 里写的那个。
+                           www.bing.com 在国内会 302 跳到 cn.bing.com，此时若仍向
+                           www.bing.com 发 fetch，就是跨域请求，会被 CORS 直接拦掉
+                           （报 Failed to fetch），等于一次都没发出去。 */
+                        var origin = location.origin || ${JSON.stringify(origin)};
                         var params = ${JSON.stringify(params)};
                         var flat = (document.documentElement.outerHTML || "").replace(/\\s/g, "");
                         var m = flat.match(/,IG:"([^"]+)"/);
@@ -4053,6 +4084,19 @@ const __scBgKeepAlive = (function() {
                 try { res = JSON.parse(raw || "{}"); } catch (_) { res = null; }
                 if (!res || res.fatal) return false;
                 const ra = (res.steps || []).find(s => s.s === "reportActivity") || {};
+                /* 以前只判断 authed === "false"：fetch 被 CORS 拦掉时 ra 里连 authed
+                   字段都没有，于是「一次都没发出去」也被算成上报成功，卡片随即被记成
+                   「等手动点击」，当天彻底不再重试 —— 这正是带锁卡永远做不完的原因。
+                   现在要求真的拿到 2xx 才算发出。 */
+                if (ra.err || !ra.status) {
+                    Utils.log("🟠", `应用内搜索上报没有真正发出（${ra.err || "无响应"}），本轮不算完成；`
+                        + "下一轮会重试（常见原因：搜索页落到了别的域，跨域被拦）");
+                    return false;
+                }
+                if (ra.status < 200 || ra.status >= 300) {
+                    Utils.log("🟠", `应用内搜索上报返回 HTTP ${ra.status}，本轮不算完成`);
+                    return false;
+                }
                 if (ra.authed === "false") {
                     Utils.log("🟠", "应用内搜索上报未被识别为登录态（CDP 通道），这张卡可能不记账");
                     return false;
@@ -4146,6 +4190,34 @@ const __scBgKeepAlive = (function() {
                 diag.push("lev2search(无搜索href)");
                 return false;
             }
+
+            /* 关键顺序修正（实测 Edge 157 + 国内网络）：
+               · 只发 reportActivity 搜索上报 → IsAuthenticated=true、RewardsIncrement=1，
+                 但这张卡并不记账；
+               · 只发 Server Action 交卷（body 带 hash）→ 返回 `1:true`，卡片立即 isCompleted=true。
+               真正记账的是交卷，搜索上报只是陪跑。旧代码是「先上报再交卷」，
+               上报环节一出问题（例如跨域被拦、拿不到 IG）就直接 return false，
+               永远走不到真正能完成卡片的交卷那一步 —— 这就是带锁卡永远做不完的主因。 */
+
+            /* 第一步：Server Action 交卷（决定成败的那一步，提到最前面） */
+            let submitted = false;
+            if (card.hash) {
+                try {
+                    submitted = await this.claimCardWeb(card);
+                    diag.push(submitted ? "lev2(已交卷)" : "lev2(交卷未受理)");
+                } catch (e) {
+                    diag.push(`lev2(交卷 ${e.message})`);
+                }
+                /* 交卷命中时是同步生效的，立刻复核一次，省掉等待。 */
+                if (await this.isOfferCompleteAny(offerId, true) === true) {
+                    Utils.log("🟢", `等级门槛卡完成（交卷通道）：${label}`);
+                    return true;
+                }
+            } else {
+                diag.push("lev2(无hash跳过交卷)");
+            }
+
+            /* 第二步：交卷没拿下，再补一次应用内搜索上报（老路子，偶尔有用） */
             let searched = false;
             try {
                 searched = await this.reportAppSearchForCard(href);
@@ -4153,35 +4225,33 @@ const __scBgKeepAlive = (function() {
             } catch (e) {
                 diag.push(`lev2search(${e.message})`);
             }
-            if (!searched) return false;
-            Utils.log("🔎", `等级门槛卡已按应用内搜索签名上报：${label}`);
-
-            await Utils.randomDelay(2000, 4000);
-            if (card.hash) {
-                try {
-                    const accepted = await this.claimCardWeb(card);
-                    diag.push(accepted ? "lev2search(已交卷)" : "lev2search(交卷未受理)");
-                } catch (e) {
-                    diag.push(`lev2search(交卷 ${e.message})`);
+            if (searched) {
+                Utils.log("🔎", `等级门槛卡已按应用内搜索签名上报：${label}`);
+                await Utils.randomDelay(2000, 4000);
+                if (card.hash) {
+                    try {
+                        const again = await this.claimCardWeb(card);
+                        diag.push(again ? "lev2(二次交卷)" : "lev2(二次交卷未受理)");
+                    } catch (e) {
+                        diag.push(`lev2(二次交卷 ${e.message})`);
+                    }
                 }
-            } else {
-                diag.push("lev2search(无hash跳过交卷)");
             }
 
-            const deadline = Date.now() + 25 * 1000;
+            /* 第三步：给服务端时间复核。实测入账是异步的，25 秒必然误判，给足 3 分钟。 */
+            const deadline = Date.now() + 3 * 60 * 1000;
             while (Date.now() < deadline) {
                 const st = await this.isOfferCompleteAny(offerId, true);
                 if (st === true) {
                     Utils.log("🟢", `等级门槛卡完成（应用内搜索通道）：${label}`);
                     return true;
                 }
-                await Utils.delay(5000);
+                await Utils.delay(10000);
             }
-            diag.push("lev2search(未标记完成)");
-            Utils.log("🟡", `等级门槛卡：应用内搜索通道未记账，改走 CDP 通道：${label}`);
+            diag.push("lev2(未标记完成)");
+            Utils.log("🟡", `等级门槛卡本轮未完成，下一轮继续：${label}`);
             return false;
         },
-
         /* 每日活动（DailySet）就是那三张普通卡：Gamification_DailySet_*。
            它们的 offerId 直接调 DAPI 的 activities 接口就能记账，
            既不需要网页交卷，也不需要 CDP 真搜索 —— 以前只要 destination
@@ -4290,17 +4360,25 @@ const __scBgKeepAlive = (function() {
                 const searchOk = await this.reportDailyActivity(card.destination);
                 diag.push(searchOk ? "search(CDP已点击)" : "search(未处理)");
                 if (searchOk) {
-                    const deadline = Date.now() + 25 * 1000;
+                    /* 入账是异步的（实测几分钟），窗口给到 3 分钟再判。 */
+                    const deadline = Date.now() + 3 * 60 * 1000;
                     while (Date.now() < deadline) {
                         if (await this.isOfferCompleteAny(offerId, true) === true) {
                             Utils.log("🟢", "应用搜索领取成功：" + name);
                             return true;
                         }
-                        await Utils.delay(5000);
+                        await Utils.delay(10000);
                     }
-                    diag.push("search(已点击未标记完成)");
+                    diag.push("search(已上报待入账)");
+                    /* 上报确实发出去了，只是服务端还没记账 —— 这种卡不要封成
+                       「需手动点击」，否则当天再也不重试。下一轮开头会先用
+                       isOfferCompleteAny 复核，入账了就自动跳过。 */
+                    Utils.log("⏳", `搜索上报已发出，等待服务端入账（下一轮复核）：${name}`);
+                    return false;
                 }
-                this._markManualCard(offerId, name);
+                /* 连上报都没发出去：同样不封卡，交给下一轮重试。 */
+                Utils.log("🟡", `搜索上报未发出，下一轮重试：${name}`);
+                return false;
             } else if (!skipWeb && !card.hash) {
                 diag.push("web(无hash)");
             } else if (!skipWeb && card.appOnly) {
