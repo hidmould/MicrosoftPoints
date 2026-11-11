@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.1
+// @version      1.3.2
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -2302,8 +2302,13 @@ const __scBgKeepAlive = (function() {
         async clickCard(href) {
             const h = JSON.stringify(href);
             /* 背景标签页里 document.hidden=true，Chromium 完全不做布局，
-               所有卡片 getBoundingClientRect() 都是 0×0 @(0,0)，
-               坐标点击等于点空白；所以不依赖坐标，直接 element.click()。 */
+               所有卡片 getBoundingClientRect() 都是 0×0 @(0,0)，坐标点击等于点空白，
+               所以不依赖坐标，直接 element.click()。
+
+               但卡片的 <a> 全都带 target="_blank"（实测 7/7 张）：
+               直接 click() 会新开一个标签页，而这个页不在 _rememberOwned 名单里 ——
+               既不会被自动关掉，打开时还会把焦点抢走，于是每做一张卡就多留一个搜索页。
+               必须先摘掉 target，让导航发生在「本脚本自己开的那一个受管标签页」里。 */
             const clickExpr = [
                 "(function(){",
                 "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
@@ -2313,6 +2318,7 @@ const __scBgKeepAlive = (function() {
                 "  if (!target) return 'nf';",
                 "  try {",
                 "    target.scrollIntoView({ block: 'center' });",
+                "    target.removeAttribute('target');",
                 "    target.click();",
                 "    return 'clicked';",
                 "  } catch (e) { return 'err:' + (e && e.message || e); }",
@@ -2335,6 +2341,7 @@ const __scBgKeepAlive = (function() {
                 "  var target = null;",
                 "  for (var i = 0; i < nodes.length; i++) { if (nodes[i].href === " + h + ") { target = nodes[i]; break; } }",
                 "  if (!target) return 'nf';",
+                "  try { target.removeAttribute('target'); } catch (e) {}",
                 "  target.scrollIntoView({ block: 'center' });",
                 "  var r = target.getBoundingClientRect();",
                 "  if (!r || r.width <= 0 || r.height <= 0) return 'nobox';",
@@ -2355,7 +2362,6 @@ const __scBgKeepAlive = (function() {
             await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0, clickCount: 1 });
             return true;
         },
-
         async progress() {
             const expr = [
                 "(function(){",
@@ -2447,7 +2453,17 @@ const __scBgKeepAlive = (function() {
             } catch (e) {
                 return { ok: false, reason: e.message };
             } finally {
+                /* 用完就关：以前这里只断开 ws，标签页要等整轮结束才由
+                   runAll 里的 closeOwned() 收走 —— 一轮几十分钟，那个临时页就一直挂着。
+                   现在这张页一处理完立刻关掉，不留到轮末。 */
+                const owned = page && page.id ? [page.id] : [];
                 this.close();
+                if (owned.length) {
+                    try {
+                        const closed = await this.closeOwned(owned);
+                        if (closed > 0) Utils.log("🖱️", "  临时标签页已用完，立即关闭");
+                    } catch (_) {}
+                }
             }
         }
     };
