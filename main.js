@@ -1944,14 +1944,17 @@ const __scBgKeepAlive = (function() {
             return null;
         },
 
-        /* 只导航「自己开的那一个」标签页：你的 rewards 页/正在看的页面一律不动。 */
-        async _ownedPage(fallbackUrl) {
+        /* 只导航「自己开的那一个」标签页：你的 rewards 页/正在看的页面一律不动。
+           create:false —— 只复用已经存在的临时页，绝不新建。
+           「每日活动」这类一条 DAPI 请求就能记账的任务用它，才不会偷偷开标签页。 */
+        async _ownedPage(fallbackUrl, { create = true } = {}) {
             const list = await this.targets();
             const mine = (list || []).find(t => t.type === "page" && this.isOwned(t.id));
             if (mine) {
                 if (!this._owned.includes(mine.id)) this._owned.push(mine.id);
                 return mine;
             }
+            if (!create) return null;
             if (!(await this.available())) return null;
             if (this.todayDone()) return null;
             const page = await this.openSilent(fallbackUrl || "https://rewards.bing.com/earn");
@@ -2077,9 +2080,9 @@ const __scBgKeepAlive = (function() {
         /* 找一个能用的 rewards 页。
            nav:false（默认，只读借用）——页面里只发 fetch，不改地址，用你已开着的 rewards 页也无感；
            nav:true（需要导航/点击）——必须用本脚本自己开的页，绝不把你正在看的标签页导走。 */
-        async ensurePage(url, { nav = false } = {}) {
+        async ensurePage(url, { nav = false, create = true } = {}) {
             const want = String(url || "https://rewards.bing.com/earn");
-            if (nav) return await this._ownedPage(want);
+            if (nav) return await this._ownedPage(want, { create });
             const list = await this.targets();
             if (!list) return null;
             const pages = list.filter(t => t.type === "page" && t.url && /^https:\/\/rewards\.bing\.com\//i.test(t.url));
@@ -2089,6 +2092,7 @@ const __scBgKeepAlive = (function() {
                     || pages.find(t => /\/earn/i.test(t.url))
                     || pages[0];
             }
+            if (!create) return null;
             if (!(await this.available())) return null;
             if (!GM_getValue("Config.cdpAutoTab", true)) return null;
             if (this.todayDone()) return null;
@@ -2341,7 +2345,7 @@ const __scBgKeepAlive = (function() {
             try { return JSON.parse(raw || "{}"); } catch (_) { return { done: 0, total: 0 }; }
         },
 
-        async claimAll(maxCards) {
+        async claimAll(maxCards, { create = true } = {}) {
             const cap = Number(maxCards) || 6;
             if (this.todayDone()) {
                 Utils.log("🖱️", "今天需要 CDP 的任务都已处理完，本轮不再连接浏览器调试端口");
@@ -2354,8 +2358,13 @@ const __scBgKeepAlive = (function() {
             }
             /* 这里要整页导航（点卡会跳搜索页、之后还得回 earn），必须用自己开的标签页，
                否则会把你正在看的 rewards 页导走。 */
-            let page = await this.ensurePage("https://rewards.bing.com/earn", { nav: true });
+            let page = await this.ensurePage("https://rewards.bing.com/earn", { nav: true, create });
             if (!page) {
+                if (!create) {
+                    /* 只复用模式：没有现成临时页不算失败，交给 DAPI / 后台通道。 */
+                    Utils.log("🖱️", "无需 CDP 的卡片，跳过静默开页（只有现成页面才做真实点击）");
+                    return { ok: true, handled: 0, done: 0, total: 0, skipped: true };
+                }
                 /* 开不出页时把真正的原因查出来再报，不要笼统说「拿不到 rewards 页」。 */
                 const why = await this.whyNoPage();
                 this.warn(why);
@@ -2443,8 +2452,11 @@ const __scBgKeepAlive = (function() {
             return this._cache;
         },
 
+        /* 通道优先级：先试不碰浏览器的通道，最后才用 CDP 页面通道。
+           以前 "page" 排第一 —— 每张卡交卷前都先想办法拿一个 CDP 页面，
+           没有就静默开一个，于是「每日活动」也在开标签页。 */
         channelOrder() {
-            return ["page", "proxy", "xhr"];
+            return ["proxy", "xhr", "page"];
         },
         summary() {
             const i = this.info();
@@ -4170,6 +4182,26 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
+        /* 每日活动（DailySet）就是那三张普通卡：Gamification_DailySet_*。
+           它们的 offerId 直接调 DAPI 的 activities 接口就能记账，
+           既不需要网页交卷，也不需要 CDP 真搜索 —— 以前只要 destination
+           长得像搜索页就会走 CDP.realSearch，于是每日活动也在开标签页。 */
+        _isDailyActivity(card) {
+            if (!card) return false;
+            if (card.source === "dapi") return true;
+            return card.kind === "daily"
+                && /Gamification_DailySet_/i.test(String(card.offerId || ""));
+        },
+
+        /* 只有「日常任务」里带锁 🔒 的那类才真的需要 CDP：
+           应用专属（appOnly）、等级门槛（levelGated）、应用内搜索签名卡。 */
+        _needsCdp(card) {
+            if (!card) return false;
+            if (this._isDailyActivity(card)) return false;
+            if (card.appOnly === true || card.levelGated === true) return true;
+            return this._isAppSearchCard(card);
+        },
+
         async claimCard(card, opts = {}) {
             const offerId = card.offerId;
             const name = card.title || offerId;
@@ -4227,6 +4259,9 @@ const __scBgKeepAlive = (function() {
             const offerId = card.offerId;
             const name = card.title || offerId;
 
+            /* 每日活动先走 DAPI：跳过整条网页交卷链，也就不会去碰 CDP。 */
+            if (this._isDailyActivity(card) && !this._needsCdp(card)) skipWeb = true;
+
             if (await this.isOfferCompleteAny(offerId, false) === true) {
                 Utils.log("✅", `服务端已确认完成：${name}`);
                 return true;
@@ -4250,7 +4285,7 @@ const __scBgKeepAlive = (function() {
                 if (viaSearch) return true;
             }
 
-            if (!skipWeb && this._isAppSearchCard(card)) {
+            if (!skipWeb && this._isAppSearchCard(card) && this._needsCdp(card)) {
 
                 const searchOk = await this.reportDailyActivity(card.destination);
                 diag.push(searchOk ? "search(CDP已点击)" : "search(未处理)");
@@ -4320,6 +4355,27 @@ const __scBgKeepAlive = (function() {
             if (await this.isOfferCompleteAny(offerId, true) === true) {
                 Utils.log("🟢", `DAPI 上报已生效：${name}`);
                 return true;
+            }
+
+            /* 每日活动兜底：极少数日常卡 DAPI 不记账，再用后台网页通道补一次。
+               这条路照样不开标签页 —— page 通道只复用现成页面，
+               而且上面 _needsCdp 为 false 时不会走 CDP 真实搜索。 */
+            if (this._isDailyActivity(card) && card.hash) {
+                try {
+                    const webOk = await this.claimCardWeb(card);
+                    if (webOk) {
+                        diag.push("web(兜底已交卷)");
+                        await Utils.randomDelay(1500, 3000);
+                        if (await this.isOfferCompleteAny(offerId, true) === true) {
+                            Utils.log("🟢", `网页通道兜底成功：${name}`);
+                            return true;
+                        }
+                    } else {
+                        diag.push("web(兜底未受理)");
+                    }
+                } catch (e) {
+                    diag.push(`web(兜底 ${e.message})`);
+                }
             }
             return false;
         },
@@ -5532,7 +5588,8 @@ const __scBgKeepAlive = (function() {
 
         /* 只读借用：页面里只发 fetch，不改地址，所以用你自己开着的 rewards 页也完全无感。 */
         async _anyRewardsPage() {
-            return await CDP.ensurePage("https://rewards.bing.com/earn", { nav: false });
+            /* 只借用已经开着的 rewards 页，绝不会为了发一条请求去新建标签页。 */
+            return await CDP.ensurePage("https://rewards.bing.com/earn", { nav: false, create: false });
         },
 
         async claimCardWeb(card, { appChannel = false } = {}) {
@@ -5633,7 +5690,9 @@ const __scBgKeepAlive = (function() {
                 }
             }
 
-            if (card.destination && card.destination.startsWith("http")) {
+            /* 以前这里无条件调 reportDailyActivity —— 它内部会走 CDP.realSearch
+               整页导航，也就是会静默开一个标签页。每日活动只该走 DAPI 记账。 */
+            if (this._needsCdp(card) && card.destination && card.destination.startsWith("http")) {
                 try {
                     await this.reportDailyActivity(card.destination);
                     return true;
@@ -6555,7 +6614,11 @@ const __scBgKeepAlive = (function() {
             Utils.log("🧩", `发现 ${cards.length} 个卡片`);
 
             try {
-                const cdp = await CDP.claimAll(6);
+                /* 只有确实存在「带锁 🔒 / 应用内搜索」这类必须 CDP 的卡，才允许开标签页；
+                   其余情况 CDP 只复用你已经开着的 rewards 页，一张新页都不开。 */
+                const needsCdp = cards.some(c => API._needsCdp(c));
+                if (!needsCdp) Utils.log("🖱️", "本批卡片用 DAPI/后台通道就能完成，不打开 CDP 标签页");
+                const cdp = await CDP.claimAll(6, { create: needsCdp });
                 if (cdp.ok && cdp.handled > 0) {
                     Utils.log("🖱️", "CDP 真实点击完成 " + cdp.handled + " 张（当前 " + cdp.done + "/" + cdp.total + " 已完成）");
                 } else if (cdp.ok) {
@@ -6816,7 +6879,7 @@ const __scBgKeepAlive = (function() {
                     break;
                 }
                 await RegionGuard.guard("每日活动");
-                Utils.log("📅", `第 ${round}/${maxRounds} 轮每日活动（服务端已确认 ${doneIds.size} 张）...`);
+                Utils.log("📅", `第 ${round}/${maxRounds} 轮每日活动（服务端已确认 ${doneIds.size} 张，走 DAPI 不开标签页）...`);
                 await Utils.randomDelay(2000, 5000);
 
                 let cards = [];
@@ -8146,6 +8209,7 @@ const __scBgKeepAlive = (function() {
                     + CDP.launchCommand() + "\n";
             }
             text += `静默开页：${GM_getValue("Config.cdpAutoTab", true) ? "✅ 开启（后台创建，不抢焦点）" : "⏭️ 已关闭"}\n`;
+            text += "任务分工：每日活动 ⏭️ 走 DAPI 从不开页；只有日常任务里带锁 🔒 的卡片才用 CDP\n";
             text += `今日封盘：${CDP.todayDone() ? "✅ 已封盘（今天的 CDP 任务都做完了，不再开新标签页）" : "⏳ 未封盘（需要时会静默开页）"}\n`;
             const mine = CDP.ownedStored();
             text += `当前登记的本脚本临时页：${mine.length ? mine.length + " 个" : "无"}\n`;
