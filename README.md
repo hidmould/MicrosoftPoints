@@ -60,6 +60,37 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 只有 `_needsCdp()` 为真的卡片才会触发静默开页，其余任务里 CDP 只**复用**你已经开着的
 rewards 页（`ensurePage(..., { create: false })`），没有现成页面就直接走 DAPI / 后台请求。
 
+### 开标签页的硬闸门（`v1.4.0`）
+
+「不走 CDP 就不许开页」现在由代码强制保证，不是靠调用方自觉：
+
+- 整个脚本里**只有一处**真正创建标签页 —— `CDP.openSilent()` 里的 `Target.createTarget`；
+- 它进来的第一件事是**取令牌**，取不到就直接 `return null`，页根本不会建出来；
+- 令牌只能由 `grantOnce(reason)` 发放，而 reason 必须在白名单里：
+
+  | reason | 用途 |
+  | --- | --- |
+  | `card-cdp` | 带锁 🔒 / 应用内搜索签名卡（`form=ML2W4J` / `ML2Y2H`） |
+  | `desktop` | 桌面应用专属任务（必须切应用 UA） |
+
+- 令牌**一次性**：消费后立即失效，同一个授权开不出第二个页；
+- `_ownedPage` / `ensurePage` 的 `create` 默认值都是 **`false`**，要开页必须显式传
+  `create: true` 加合法 `reason`；
+- 「页面代发通道」（`GM_openInTab`）已停用 —— 它不属于 CDP，开出来的页还得你再手动跑一次脚本。
+
+实测真值表（跑的是文件里的真实函数）：
+
+| 卡片 | 开标签页 |
+| --- | --- |
+| 每日活动（Comedy / 葡萄酒 / 云形成） | ❌ |
+| Quiz 你是否知道答案 | ❌ |
+| 拼图 完成此拼图 | ❌ |
+| 即时赢奖 / 推荐奖励 | ❌ |
+| 带锁 探险火星 / 古代建筑 | ✅ |
+| App 专属卡 | ✅ |
+
+菜单里那几个 `GM_openInTab`（打开 dashboard、手动授权）是你**主动点击**才触发的，不属于自动任务。
+
 ## 四、手动配置 Edge 的 CDP 通道（可选，只为带锁 🔒 卡片）
 
 > 只解决带锁卡片。桌面端、首页待领取、月度计划仍需用 Chrome 跑。
@@ -139,10 +170,16 @@ rewards 页（`ensurePage(..., { create: false })`），没有现成页面就直
      搜索上报只是陪跑，现在交卷提到第一步做。
   另外入账是异步的，等待窗口从 25 秒放宽到 3 分钟，正常上报过的卡不再被误标成「需手动点击」。
 
-- **CDP 做任务时开出一堆搜索标签页 / 老是被抢焦点**（`v1.3.2` 已修）：
-  卡片的 `<a>` 全都带 `target="_blank"`（实测 7/7 张），`element.click()` 会为每张卡
-  **新开一个标签页**，而这类页不在脚本的登记名单里 —— 既不会被自动关闭，
-  打开时还会把焦点抢走，于是做几张卡就留几个搜索页。
-  现在点击前先 `removeAttribute('target')`，让导航发生在脚本自己管理的那个临时页里，
-  全程 `background:true`（`document.hidden=true`，不抢焦点）；
-  并且**每张卡处理完立刻关闭**该临时页，而不是等整轮结束才收（`Config.cdpDoneDate` 那套封盘逻辑不变）。
+- **普通的 Quiz / 拼图卡被当成带锁卡，硬要走 CDP 反而做不完**（`v1.3.3` 已修）：
+  「你是否知道答案？」这类卡的 `destination` 是 `bing.com/search?...&PUBL=RewardsDO`，
+  而旧判定把 `PUBL=RewardsDO` 也算成「应用内搜索签名」——它其实只是**通用跟踪参数**，
+  「完成此拼图」「即时赢奖」等卡都带它。于是 quiz 卡被拽去走 CDP 真搜索，本来后台网页交卷就能完成。
+  现在签名只认 `form=ML2W4J` / `form=ML2Y2H`，并且 `quiz` / `puzzle` / `image_creator`
+  这三类互动卡直接排除在 CDP 之外。
+
+  | 卡片 | form | 旧判定 | 现在 |
+  | --- | --- | --- | --- |
+  | 探险火星（真带锁） | `ML2W4J` | CDP | CDP ✅ |
+  | 古代建筑（真带锁） | `ML2W4J` | CDP | CDP ✅ |
+  | 你是否知道答案？（quiz） | `ML2BF1` | CDP ❌ | 后台网页交卷 ✅ |
+  | 完成此拼图（puzzle） | `ML2BF0` | 网页 | 网页 ✅ |

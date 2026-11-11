@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.2
+// @version      1.4.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -1778,6 +1778,33 @@ const __scBgKeepAlive = (function() {
         OWNED_KEY: "Config.cdpOwnedTabs",
         DONE_KEY: "Config.cdpDoneDate",
 
+        /* ---------------- 开页闸门 ----------------
+           只有「确实必须用 CDP」的任务才能拿到令牌，其余一律开不出页。
+           令牌是一次性的：openSilent() 消费掉它，用完即失效，
+           避免某个任务拿到令牌后，后续无关的开页请求也搭车通过。 */
+        ALLOW_REASONS: {
+            "card-cdp": "带锁卡片 / 应用内搜索卡（必须 CDP 真搜索）",
+            "desktop": "桌面应用专属任务（必须切应用 UA）"
+        },
+        _allowOnce: "",
+
+        /* 由需要 CDP 的任务在开页前显式声明理由；理由不在白名单里就什么也不发生。 */
+        grantOnce(reason) {
+            const key = String(reason || "");
+            if (!Object.prototype.hasOwnProperty.call(this.ALLOW_REASONS, key)) return false;
+            this._allowOnce = key;
+            return true;
+        },
+
+        revokeAllow() { this._allowOnce = ""; },
+
+        /* 这次开页是不是被允许的。消费令牌 → 一次性。 */
+        _takeAllow() {
+            const key = this._allowOnce;
+            this._allowOnce = "";
+            return Object.prototype.hasOwnProperty.call(this.ALLOW_REASONS, key) ? key : "";
+        },
+
         todayDone() {
             const d = Number(GM_getValue(this.DONE_KEY, 0)) || 0;
             return !!d && d === Utils.getTodayNum();
@@ -1881,6 +1908,13 @@ const __scBgKeepAlive = (function() {
         },
 
         async openSilent(url) {
+            /* 最后一道闸：没拿到令牌，任何调用都开不出页。
+               这样即使上层逻辑判断出错，也不会凭空多出一个标签页。 */
+            const allow = this._takeAllow();
+            if (!allow) {
+                GM_log("🖱️ 拒绝开页：本次任务不需要 CDP（只有带锁卡/桌面专属任务才允许开标签页）");
+                return null;
+            }
             if (!(await this.available())) return null;
             if (!GM_getValue("Config.cdpAutoTab", true)) return null;
             const targetUrl = String(url || "https://rewards.bing.com/earn");
@@ -1947,7 +1981,9 @@ const __scBgKeepAlive = (function() {
         /* 只导航「自己开的那一个」标签页：你的 rewards 页/正在看的页面一律不动。
            create:false —— 只复用已经存在的临时页，绝不新建。
            「每日活动」这类一条 DAPI 请求就能记账的任务用它，才不会偷偷开标签页。 */
-        async _ownedPage(fallbackUrl, { create = true } = {}) {
+        /* create 现在必须配一个 reason：只有带锁卡/桌面任务会传，
+           其余调用（例如每日活动）一律 create:false —— 只复用现成页。 */
+        async _ownedPage(fallbackUrl, { create = false, reason = "" } = {}) {
             const list = await this.targets();
             const mine = (list || []).find(t => t.type === "page" && this.isOwned(t.id));
             if (mine) {
@@ -1955,6 +1991,7 @@ const __scBgKeepAlive = (function() {
                 return mine;
             }
             if (!create) return null;
+            if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
             if (this.todayDone()) return null;
             const page = await this.openSilent(fallbackUrl || "https://rewards.bing.com/earn");
@@ -1987,7 +2024,8 @@ const __scBgKeepAlive = (function() {
             const url = String(href || "").trim();
             if (!/^https?:\/\//i.test(url)) return { ok: false, reason: "没有搜索地址" };
             if (!(await this.available())) return { ok: false, reason: "CDP 不可连" };
-            const page = await this._ownedPage("https://rewards.bing.com/earn");
+            const page = await this._ownedPage("https://rewards.bing.com/earn",
+                { create: true, reason: "card-cdp" });
             if (!page) return { ok: false, reason: "开不出静默标签页" };
             if (!(await this.goto(page, url))) return { ok: false, reason: "搜索页没加载完" };
             let clicked = false;
@@ -2080,9 +2118,9 @@ const __scBgKeepAlive = (function() {
         /* 找一个能用的 rewards 页。
            nav:false（默认，只读借用）——页面里只发 fetch，不改地址，用你已开着的 rewards 页也无感；
            nav:true（需要导航/点击）——必须用本脚本自己开的页，绝不把你正在看的标签页导走。 */
-        async ensurePage(url, { nav = false, create = true } = {}) {
+        async ensurePage(url, { nav = false, create = false, reason = "" } = {}) {
             const want = String(url || "https://rewards.bing.com/earn");
-            if (nav) return await this._ownedPage(want, { create });
+            if (nav) return await this._ownedPage(want, { create, reason });
             const list = await this.targets();
             if (!list) return null;
             const pages = list.filter(t => t.type === "page" && t.url && /^https:\/\/rewards\.bing\.com\//i.test(t.url));
@@ -2093,6 +2131,7 @@ const __scBgKeepAlive = (function() {
                     || pages[0];
             }
             if (!create) return null;
+            if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
             if (!GM_getValue("Config.cdpAutoTab", true)) return null;
             if (this.todayDone()) return null;
@@ -2392,7 +2431,8 @@ const __scBgKeepAlive = (function() {
             }
             /* 这里要整页导航（点卡会跳搜索页、之后还得回 earn），必须用自己开的标签页，
                否则会把你正在看的 rewards 页导走。 */
-            let page = await this.ensurePage("https://rewards.bing.com/earn", { nav: true, create });
+            let page = await this.ensurePage("https://rewards.bing.com/earn",
+                { nav: true, create, reason: "card-cdp" });
             if (!page) {
                 if (!create) {
                     /* 只复用模式：没有现成临时页不算失败，交给 DAPI / 后台通道。 */
@@ -3993,13 +4033,22 @@ const __scBgKeepAlive = (function() {
             return cached;
         },
 
+        /* 只有真正带「奖励应用搜索」签名的卡才需要走 CDP 真搜索。
+           判定一度把 PUBL=RewardsDO 也算成签名，可它只是通用跟踪参数 ——
+           「完成此拼图」「即时赢奖」等普通卡都带它，于是像
+           「你是否知道答案？」（form=ML2BF1）这种本该后台网页交卷就完成的 quiz 卡，
+           也被拽去走 CDP，反而做不完。
+           真正的应用搜索签名只有 form=ML2W4J / form=ML2Y2H。 */
         _isAppSearchCard(card) {
-            const dest = String((card && card.destination) || "");
+            if (!card) return false;
+            /* 互动类卡片（quiz/puzzle 等）不是「应用内搜索」，一律不走 CDP 真搜索。 */
+            if (/^(quiz|puzzle|image_creator)$/i.test(String(card.kind || ""))) return false;
+            const dest = String(card.destination || "");
             if (!dest) return false;
             const q = dest.includes("?") ? dest.slice(dest.indexOf("?") + 1) : "";
             if (!q) return false;
             const isBingSearch = /bing\.com\/search/i.test(dest);
-            const hasSign = /(^|&)(form=ML2W4J|form=ML2Y2H|PUBL=RewardsDO)/i.test(q);
+            const hasSign = /(^|&)form=(ML2W4J|ML2Y2H)(&|$)/i.test(q);
             return isBingSearch && hasSign;
         },
 
@@ -4045,7 +4094,7 @@ const __scBgKeepAlive = (function() {
             try {
                 if (!(await CDP.available())) return null;
                 /* 用带查询串的入口页：需要先拿到 IG */
-                page = await CDP._ownedPage(query);
+                page = await CDP._ownedPage(query, { create: true, reason: "card-cdp" });
                 if (!page || !page.webSocketDebuggerUrl) return null;
                 if (!CDP._ws || CDP._ws.readyState !== 1) {
                     await CDP.connect(page.webSocketDebuggerUrl);
@@ -4530,70 +4579,14 @@ const __scBgKeepAlive = (function() {
         },
 
         async _ensurePageChannel() {
-
+            /* 全局约定：只有走 CDP 的任务才允许打开标签页。
+               这条「页面代发通道」不属于 CDP —— 它开出来的页还得你在里面
+               再跑一次脚本才能用，收益低、还多留一个标签页，所以直接停用。
+               方法本身保留（别处仍会调用），现在恒定返回 null。
+               如需恢复旧行为，见 git 历史里的 v1.3.3 之前版本。 */
             if (!GM_getValue("Config.allowOpenTab", false)) return null;
-            /* 这条路和 CDP 是两条独立通道：只要能用 CDP 静默开页，就不再用会抢焦点的 GM_openInTab。 */
-            if (await CDP.available()) {
-                Utils.log("🖥️", "CDP 可用，改用静默后台标签页代发（不抢焦点），跳过 GM_openInTab");
-                return null;
-            }
-            if (CDP.todayDone()) return null;
-            const openedAt = Number(GM_getValue("Config.pageOpenedAt", 0)) || 0;
-            const reallyAlive = this._pageChannelAlive();
-            if (!reallyAlive && openedAt && (Date.now() - openedAt) < 10 * 60 * 1000) {
-                for (let i = 0; i < 12; i++) {
-                    await Utils.delay(500);
-                    if (this._pageChannelAlive()) return null;
-                }
-                return null;
-            }
-            if (this._openingPage) {
-                for (let i = 0; i < 40; i++) {
-                    await Utils.delay(500);
-                    if (this._pageChannelAlive()) return null;
-                }
-                return null;
-            }
-            this._openingPage = true;
-            GM_setValue("Config.pageOpenedAt", Date.now());
-            try {
-                Utils.log("🖥️", "需要借 rewards 页面代发请求，正在打开一个临时页面…");
-
-                let opened = false;
-                const url = "https://rewards.bing.com/earn?mpq=" + Date.now();
-                for (const opts of [
-                    { active: false, insert: true, setParent: true },
-                    { active: false },
-                    undefined
-                ]) {
-                    try {
-                        if (opts) GM_openInTab(url, opts);
-                        else GM_openInTab(url);
-                        opened = true;
-                        break;
-                    } catch (e) {
-                    }
-                }
-                if (!opened) {
-                    Utils.log("🔴", "打开代发页面失败（浏览器拒绝编辑标签页），只能退回后台直发");
-                    return null;
-                }
-                for (let i = 0; i < 90; i++) {
-                    await Utils.delay(500);
-                    if (this._pageChannelAlive()) {
-                        Utils.log("✅", "代发页面已就绪");
-                        return null;
-                    }
-                    if (i === 19) Utils.log("🖥️", "代发页面还在加载（已等 10 秒）…");
-                    if (i === 49) Utils.log("🖥️", "代发页面还在加载（已等 25 秒）…");
-                }
-                Utils.log("🟡", "代发页面 45 秒内没有就绪。可能原因："
-                    + "① 脚本未注入该页（@background 会让页面永不注入，需用 @crontab）；"
-                    + "② 打开的标签页被浏览器冻结/未获得执行机会。本轮改用后台直发。");
-                return null;
-            } finally {
-                this._openingPage = false;
-            }
+            Utils.log("🖥️", "已跳过「打开页面代发通道」：只有 CDP 任务才允许开标签页");
+            return null;
         },
 
         async viaPageChannel(url, headers, body, timeoutMs = 15000) {
@@ -5349,7 +5342,8 @@ const __scBgKeepAlive = (function() {
             if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
                 try {
                     if (await CDP.available()) {
-                        const page = await CDP.earnPage();
+                        const page = await CDP.ensurePage("https://rewards.bing.com/earn",
+                            { nav: false, create: true, reason: "desktop" });
                         if (page && page.webSocketDebuggerUrl) {
                             if (!CDP._ws || CDP._ws.readyState !== 1) {
                                 await CDP.connect(page.webSocketDebuggerUrl);
