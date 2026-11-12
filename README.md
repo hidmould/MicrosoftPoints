@@ -43,6 +43,7 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 | 桌面端任务 | ✅ | ✅ 需先配好 CDP（见第三节） |
 | 首页待领取 | ✅ | ✅ 需先配好 CDP（见第三节） |
 | 月度计划 | ✅ | ✅ 需先配好 CDP（见第三节） |
+
 (使用CDP会打开新标签页，完成任务后会自动关闭)
 
 &nbsp;
