@@ -730,10 +730,20 @@ const __scBgKeepAlive = (function() {
                 GM_xmlhttpRequest({
                     ...options,
                     timeout: Number(options && options.timeout) || 15000,
+                    /* 只有显式要了 manual 才接管重定向；默认仍由 GM 跟随，保持旧行为。 */
+                    ...(options && options.redirect === "manual" ? { redirect: "manual" } : {}),
                     onload: (res) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
-                        if (res.status >= 200 && res.status < 300) {
-                            finish(resolve, { text: res.responseText, finalUrl: res.finalUrl || "", status: res.status });
+                        /* 3xx 也当「有响应」返回：调用方需要 Location 才能判断是不是被跳去登录页。
+                           以前这里直接 reject，302 的原因就被丢掉了。 */
+                        if (res.status >= 200 && res.status < 400) {
+                            const loc = String(res.responseHeaders || "").match(/location:\s*(\S+)/i);
+                            finish(resolve, {
+                                text: res.responseText,
+                                finalUrl: res.finalUrl || "",
+                                status: res.status,
+                                location: loc ? loc[1] : ""
+                            });
                         } else {
                             finish(reject, new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
                         }
@@ -4498,7 +4508,7 @@ const __scBgKeepAlive = (function() {
             const out = { id: req.id, at: Date.now(), status: 0, text: "", error: "" };
             try {
                 const r = await fetch(req.url, {
-                    method: "POST",
+                    method: req.method || "POST",
                     headers: req.headers || {},
                     body: req.body,
                     credentials: "include",
@@ -4551,10 +4561,10 @@ const __scBgKeepAlive = (function() {
             return null;
         },
 
-        async viaPageChannel(url, headers, body, timeoutMs = 15000) {
+        async viaPageChannel(url, headers, body, timeoutMs = 15000, method = "POST") {
             const id = Date.now() + "-" + Math.floor(Math.random() * 1e6);
             GM_setValue(this.PAGE_BOX.res, null);
-            GM_setValue(this.PAGE_BOX.req, { id, url, headers, body, at: Date.now() });
+            GM_setValue(this.PAGE_BOX.req, { id, url, method, headers, body, at: Date.now() });
 
             const pack = (res) => ({
                 ok: res.status >= 200 && res.status < 300,
@@ -6169,11 +6179,34 @@ const __scBgKeepAlive = (function() {
                 if (Array.isArray(v)) v.forEach(push);
                 else if (v && typeof v === "object") Object.values(v).forEach(x => Array.isArray(x) ? x.forEach(push) : push(x));
             }
-            const identity = {
-                channel: data.channel || "BingFlyout",
-                partnerId: data.partnerId || "BingRewards",
-                userId: data.userId || ""
+            /* 身份字段三件套：Channel / PartnerId / UserId。
+               实测缺任何一个（或值不对）服务端都会回「游客」响应
+               （IsRewardsUser=false、Balance=0、OfferComplete=false）——
+               那在旧代码里会被误读成「响应不是 JSON / 卡片没完成」。
+               所以这里除了取值，还要在取不到时换字段名再找一遍。 */
+            const pickStr = (...vals) => {
+                for (const v of vals) {
+                    const t = String(v == null ? "" : v).trim();
+                    if (t && t !== "undefined" && t !== "null") return t;
+                }
+                return "";
             };
+            const identity = {
+                channel: pickStr(data.channel, flyout.channel, "BingFlyout"),
+                partnerId: pickStr(data.partnerId, flyout.partnerId, "BingRewards"),
+                userId: pickStr(
+                    data.userId,
+                    data.UserId,
+                    data.userInfo && data.userInfo.userId,
+                    data.userInfo && data.userInfo.UserId,
+                    data.flyoutResult && data.flyoutResult.profile && data.flyoutResult.profile.userId,
+                    data.loggingContext && data.loggingContext.userId
+                )
+            };
+            if (!identity.userId) {
+                Utils.log("🟡", "国际版面板缺少 UserId：交卷会被服务端当成游客（IsRewardsUser=false），本轮跳过");
+                return null;
+            }
             /* userInfo.promotions 里同一批卡的 attributes.complete 是「已完成」的直接判据 */
             const completeById = new Map();
             const rawPromos = (data.userInfo && data.userInfo.promotions) || [];
@@ -6223,7 +6256,45 @@ const __scBgKeepAlive = (function() {
             return [...seen.values()];
         },
 
-        /* 交卷：带 hash 调面板接口。返回 {ok, points, balance, reason} */
+        /* 从任意响应里尽力读出「余额 / 是否有错」。
+           面板接口在不同通道下会回三种东西：
+             · {IsRewardsUser:…, Balance:{Available:…}, ErrorCode:0}   正常记账
+             · {OfferComplete:…, EarnedCredits:…, ErrorDetail:{…}}     这次没算上
+             · HTML（登录/校验页）                                     通道被拒
+           「响应不是 JSON」不是失败判据 —— 早期就是只看 JSON，于是
+           后台通道回了 HTML 就整张卡判死，其实服务端可能已经记账了。 */
+        _readReport(text) {
+            const data = Utils.parseJSON(text);
+            if (!data) return { json: false, text: String(text || "").slice(0, 200) };
+            const bal = (() => {
+                const b = data.Balance;
+                if (typeof b === "number") return b;
+                if (b && typeof b === "object") return Number(b.Available) || 0;
+                return 0;
+            })();
+            const detail = data.ErrorDetail || {};
+            const code = Number(detail.ErrorCode ?? data.ErrorCode ?? 0) || 0;
+            const message = String(detail.Message || data.ErrorMessage || "").trim();
+            return {
+                json: true,
+                balance: bal,
+                earned: Number(data.EarnedCredits ?? data.PointsEarned ?? 0) || 0,
+                errorCode: code,
+                message,
+                retryable: detail.Retryable === true,
+                offerComplete: data.OfferComplete === true || data.ActivityComplete === true,
+                isRewardsUser: data.IsRewardsUser !== false
+            };
+        },
+
+        /* 交卷：带 hash 调面板接口。返回 {ok, points, balance, reason}
+           通道顺序（都被真实网络验证过，谁先通用谁在前）：
+             ① GM_xhr + text/plain：面板自己的 XHR 也没设 content-type，
+                默认就是 text/plain；带 application/json 反而容易被网关挡成 HTML。
+             ② GM_xhr + JSON 头：保留原行为兜底。
+             ③ 页面代发通道：在 bing 页面上跑脚本时由页面同源 fetch 发出，
+                这是唯一能保证 Origin/Referer 与面板完全一致的通道。
+           三通道都失败时由调用方用「面板回读」定胜负，不在这里硬判死。 */
         async report(panel, card) {
             const body = {
                 ActivityType: card.activityType,
@@ -6235,39 +6306,104 @@ const __scBgKeepAlive = (function() {
                 AuthKey: card.hash,
                 ActivityCount: 1
             };
-            let text = "";
-            try {
-                text = await Utils.xhr({
-                    method: "POST",
-                    url: `https://${panel.host}${this.REPORT_PATH}`,
-                    headers: {
-                        "accept": "application/json, text/plain, */*",
-                        "content-type": "application/json",
-                        "user-agent": RewardsAuto.ua.pc,
-                        "referer": `https://${panel.host}/`,
-                        "origin": `https://${panel.host}`
-                    },
-                    data: JSON.stringify(body),
-                    timeout: 20000
-                });
-            } catch (e) {
-                return { ok: false, reason: `HTTP 失败：${e.message}` };
+            const payload = JSON.stringify(body);
+            const url = `https://${panel.host}${this.REPORT_PATH}`;
+            const base = {
+                "accept": "application/json, text/plain, */*",
+                "user-agent": RewardsAuto.ua.pc,
+                "referer": `https://${panel.host}/`
+            };
+            /* 面板自己用的是 XHR，且没显式设 content-type（默认 text/plain）。
+               扩展后台发出的请求和页面同源请求特征不一样，这里把「带不带 Origin」
+               也作为一维来试 —— 有些网关看到扩展源的 Origin 就直接 302 到登录页。 */
+            const variants = [
+                { name: "plain", headers: { ...base, "content-type": "text/plain;charset=UTF-8" } },
+                { name: "plain+origin", headers: { ...base, "content-type": "text/plain;charset=UTF-8", "origin": `https://${panel.host}` } },
+                { name: "json", headers: { ...base, "content-type": "application/json" } },
+                { name: "json+origin", headers: { ...base, "content-type": "application/json", "origin": `https://${panel.host}` } },
+                { name: "form", headers: { ...base, "content-type": "application/x-www-form-urlencoded" }, data: new URLSearchParams(body).toString() }
+            ];
+
+            const reasons = [];
+            /* 三种结局，必须分清楚：
+                 accepted  服务端明确回了 ErrorCode=0 且没被跳走 —— 可以去复核
+                 rejected  服务端明确报错（ErrorCode≠0）
+                 unknown   通道层失败（HTML/302/网络）—— 只有它能解释之前
+                           「响应不是 JSON」的现象，也说明该换通道而不是放弃 */
+            let outcome = "unknown";
+            for (const v of variants) {
+                let res = null;
+                try {
+                    /* redirect:"manual"：不跟随 302。被跳走时 status=3xx 且带 Location，
+                       这样日志能直接说出「被带去登录页」，而不是只报一句
+                       「响应不是 JSON」——那正是这次要修的可观测性问题。 */
+                    res = await Utils.xhrFull({
+                        method: "POST",
+                        url,
+                        headers: v.headers,
+                        data: v.data || payload,
+                        timeout: 20000,
+                        redirect: "manual"
+                    });
+                } catch (e) {
+                    reasons.push(`${v.name}: ${e.message}`);
+                    continue;
+                }
+                const status = Number(res && res.status) || 0;
+                const text = String((res && res.text) || "");
+                const location = String((res && res.location) || "");
+                if (status >= 300 && status < 400) {
+                    reasons.push(`${v.name}: HTTP ${status} 被重定向${location ? `→${location.slice(0, 70)}` : ""}`);
+                    continue;
+                }
+                const r = this._readReport(text);
+                if (!r.json) {
+                    reasons.push(`${v.name}: HTTP ${status} 非 JSON（${text.slice(0, 60).replace(/\s+/g, " ")}）`);
+                    continue;
+                }
+                if (r.errorCode) {
+                    reasons.push(`${v.name}: ErrorCode=${r.errorCode} ${r.message}`);
+                    outcome = "rejected";
+                    continue;
+                }
+                /* ErrorCode=0 但 IsRewardsUser=false：服务端压根没认出登录态，
+                   回的是「游客」那份模板（Balance 全 0）。这不是「已做过」，
+                   而是「这次没带上登录态」—— 必须判失败并换通道重试。 */
+                if (r.isRewardsUser === false) {
+                    reasons.push(`${v.name}: 服务端未识别登录态（游客响应）`);
+                    continue;
+                }
+                /* ErrorCode=0 + OfferComplete=false + 已识别登录：服务端说
+                   「收到但这次没算上」，多半是这张卡今天已经做过了。
+                   不能据此判成功，交给面板回读定夺。 */
+                if (r.offerComplete === false) {
+                    reasons.push(`${v.name}: 已受理但未标记完成（${r.message || "no message"}）`);
+                    outcome = "accepted";
+                    continue;
+                }
+                return { ok: true, via: v.name, points: r.earned, balance: r.balance };
             }
-            const data = Utils.parseJSON(text);
-            if (!data) return { ok: false, reason: "响应不是 JSON" };
-            /* 成功与否以「服务端有没有报错」为准：PointsEarned 在这一版响应里恒为 0，
-               Balance 有时是数字、有时是 {Available:…} 对象，两种都读。 */
-            const bal = (() => {
-                const b = data.Balance;
-                if (typeof b === "number") return b;
-                if (b && typeof b === "object") return Number(b.Available) || 0;
-                return 0;
-            })();
-            const pts = Number(data.PointsEarned) || 0;
-            if (data.ErrorCode) {
-                return { ok: false, balance: bal, reason: `ErrorCode=${data.ErrorCode} ${data.ErrorMessage || ""}`.trim() };
+
+            /* 兜底：页面代发通道（仅在 bing 页面上跑脚本时可用）。
+               同源发出的请求 Origin/Referer 与面板完全一致，是最可靠的一条。 */
+            if (typeof API !== "undefined" && API._pageChannelAlive && API._pageChannelAlive()) {
+                try {
+                    const out = await API.viaPageChannel(url, { ...base, "content-type": "text/plain;charset=UTF-8" }, payload, 20000, "POST");
+                    const r = this._readReport((out && out.text) || "");
+                    if (r.json && !r.errorCode && r.isRewardsUser !== false && r.offerComplete !== false) {
+                        return { ok: true, via: "page", points: r.earned, balance: r.balance };
+                    }
+                    if (r.json && !r.errorCode && r.isRewardsUser !== false) {
+                        outcome = "accepted";
+                        reasons.push("page: 已受理但未标记完成");
+                    } else {
+                        reasons.push(`page: HTTP ${(out && out.status) || 0} ${r.json ? `ErrorCode=${r.errorCode}` : "返回非 JSON"}`);
+                    }
+                } catch (e) {
+                    reasons.push(`page: ${e.message}`);
+                }
             }
-            return { ok: true, points: pts, balance: bal, isRewardsUser: data.IsRewardsUser !== false };
+            return { ok: false, outcome, reason: reasons.join("；") || "全部通道失败" };
         },
 
         /* 主流程：取面板 → 挑卡 → 逐张交卷 → 复核。
@@ -6300,35 +6436,55 @@ const __scBgKeepAlive = (function() {
 
             const balanceBefore = panel.balance;
             let ok = 0;
+            let lastReason = "";
             for (const card of todo) {
                 const name = card.title || card.offerId;
                 let last = null;
                 for (let attempt = 1; attempt <= this.MAX_ATTEMPTS; attempt++) {
                     last = await this.report(panel, card);
                     if (last.ok) break;
-                    Utils.log("🟡", `国际版卡片交卷未受理（第 ${attempt} 次）：${name} → ${last.reason || "未知原因"}`);
+                    lastReason = last.reason || "未知原因";
+                    Utils.log("🟡", `国际版卡片交卷未受理（第 ${attempt} 次）：${name} → ${lastReason}`);
                     if (attempt < this.MAX_ATTEMPTS) await Utils.randomDelay(2500, 5000);
                 }
                 if (last && last.ok) {
                     ok++;
                     doneIds.add(card.offerId);
-                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p`);
+                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p` + (last.via ? `（${last.via} 通道）` : ""));
+                } else if (last && last.outcome === "accepted") {
+                    /* 服务端明确收了但说「这次没算上」：多半是这张卡今天已经做过了。
+                       这种不该报错，也不该反复重试。 */
+                    Utils.log("  ", `国际版卡片服务端已受理，未新增记账：${name}`);
                 } else {
-                    Utils.log("🟠", `国际版卡片未完成：${name}（下一轮继续）`);
+                    Utils.log("🟠", `国际版卡片交卷未被受理：${name}（原因：${lastReason}）`);
                 }
                 /* 每张之间留一点间隔：面板接口连续打容易被判异常 */
                 if (todo.length > 1) await Utils.randomDelay(1500, 3000);
             }
 
-            /* 复核：重新读一次面板，确认服务端真的标了 complete，并读余额变化 */
+            /* 最终判据：面板回读。
+               交卷响应「不是 JSON」时服务端也可能已经记账（尤其是被网关改写成
+               HTML 的情况下），所以这里以面板的 complete 标记为准，而不是响应体。 */
+            let gained = 0;
+            let confirmed = 0;
             try {
-                await Utils.delay(2000);
-                const after = await this.fetchPanel(panel.host);
+                await Utils.delay(2500);
+                let after = await this.fetchPanel(panel.host);
+                if (!after) {
+                    await Utils.delay(4000);
+                    after = await this.fetchPanel(panel.host);
+                }
                 if (after) {
-                    const confirmed = this.pickCards(after).filter(c => c.complete).length;
-                    const gained = after.balance - balanceBefore;
-                    if (gained !== 0) {
-                        Utils.log("🌍", `国际版每日活动复核：${confirmed}/${cards.length} 张已记账（余额 ${balanceBefore} → ${after.balance}）`);
+                    const nowCards = this.pickCards(after);
+                    confirmed = nowCards.filter(c => c.complete).length;
+                    for (const c of nowCards) if (c.complete) doneIds.add(c.offerId);
+                    gained = after.balance - balanceBefore;
+                    const newlyAcked = nowCards.filter(c => c.complete && todo.some(t => t.offerId === c.offerId)).length;
+                    if (newlyAcked > 0) {
+                        ok = Math.max(ok, newlyAcked);
+                    }
+                    if (gained > 0) {
+                        Utils.log("🌍", `国际版每日活动复核：${confirmed}/${cards.length} 张已记账（余额 ${balanceBefore} → ${after.balance}，+${gained}）`);
                     } else if (confirmed > 0) {
                         Utils.log("  ", `国际版每日活动复核：${confirmed}/${cards.length} 张已完成`);
                     }
@@ -6336,12 +6492,16 @@ const __scBgKeepAlive = (function() {
             } catch (_) {}
 
             const pending = cards.filter(c => !doneIds.has(c.offerId)).length;
-            if (pending === 0) Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`);
+            if (pending === 0) {
+                Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`);
+            } else if (!gained && ok === 0) {
+                Utils.log("🟡", `国际版每日活动本轮未完成：${lastReason || "交卷未被受理"}（下一轮继续）`);
+            }
             return {
                 found: cards.length,
                 done: cards.length - pending,
                 pending,
-                points: ok * (cards[0].points || 5)
+                points: (gained > 0 ? gained : ok * (cards[0].points || 5))
             };
         }
     };
@@ -6694,8 +6854,12 @@ const __scBgKeepAlive = (function() {
     };
 
     try {
+        /* 代发服务在两个域上都启动：
+             · rewards.bing.com —— 老用途（待领积分 / Server Action 交卷）
+             · bing.com         —— 国际版每日活动面板接口就在这个域下，
+                                   只有同源页面 fetch 才能带对 Origin/Referer */
         if (Utils.hasDOM() && typeof location !== "undefined"
-            && /(^|\.)rewards\.bing\.com$/i.test(String(location.hostname || ""))) {
+            && /(^|\.)(rewards\.)?bing\.com$/i.test(String(location.hostname || ""))) {
             API.startPageServer();
             Utils.log("🖥️", `代发服务已启动（页面上下文：${location.hostname}）`);
         }
@@ -8128,6 +8292,24 @@ const __scBgKeepAlive = (function() {
             text += "\n" + cards.map(c => `  · ${c.complete ? "✅" : "⏳"} ${c.title} +${c.points}p（${c.day}）`).join("\n");
         }
         const pending = cards.filter(c => !c.complete);
+
+        /* 通道自检：报告每条交卷通道的真实状态。
+           「响应不是 JSON」这类现象没有这一段就永远查不清 —— 是 302、是游客响应、
+           还是页面代发服务不在线，必须分开说。 */
+        text += "\n\n交卷通道：";
+        const pageAlive = typeof API !== "undefined" && API._pageChannelAlive && API._pageChannelAlive();
+        text += `\n  · 扩展后台 xhr：可用（GM_xmlhttpRequest）`;
+        text += `\n  · 页面代发：${pageAlive ? "✅ 在线" : "❌ 不在线（在 bing.com 页面上跑一次脚本后可用）"}`;
+        if (pending.length > 0) {
+            const probe = await IntlDaily.report(panel, pending[0]);
+            if (probe && probe.ok) {
+                text += `\n\n自检结果：✅ 交卷成功（${probe.via || "?"} 通道，余额 ${probe.balance}）`;
+            } else {
+                text += `\n\n自检结果：⚠️ 交卷未直接受理\n  原因：${(probe && probe.reason) || "未知"}`;
+                text += `\n  （若服务端其实已记账，上面列表会显示 ✅；以列表为准）`;
+            }
+        }
+
         text += `\n\n待完成：${pending.length} 张` + (pending.length ? "，现在开始逐张交卷…" : "（今日已全部完成）");
         Utils.uiAlert(text);
         if (pending.length === 0) return text;
