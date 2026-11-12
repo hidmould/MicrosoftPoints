@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.0
+// @version      1.7.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -9171,6 +9171,8 @@ const __scBgKeepAlive = (function() {
                 /* 先回收死掉的轮次，再算计划和补跑：
                    顺序反了的话 watchdog / fire 会对着一条死记录反复跳过。 */
                 this.reapDeadRound(now);
+                /* 冷却一到点就先重置运行状态并立即恢复（详见 autoRecoverFromCooldown） */
+                this.autoRecoverFromCooldown(now);
                 const next = this.plan(now);
                 this.watchdog(now);
                 EdgePacer.maybeReport().catch(() => {});
@@ -9197,6 +9199,68 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔴", `常驻调度异常：${e && e.message ? e.message : e}`);
             }
             this.arm(false);
+        },
+
+        /* ══ 冷却到期自动恢复 ══════════════════════════════════════════
+           诉求：进入「搜索冷却」之后，一到点就把运行状态重置成刚装脚本
+           的样子（释放运行锁、清认领、清今日进度与冷却计数），然后立刻
+           重新开跑 —— 而不是干等下一轮。
+
+           为什么必须是「重置」而不只是清冷却：
+             被冷却打断的那一轮往往留下了半截状态（claim/runState/心跳），
+             光清 cooldownUntil 的话，下一轮可能还卡在旧锁或旧认领上，
+             用户看到的现象就是「到点了却什么都没发生」。
+
+           安全性：直接复用 doSoftReset()，它的白名单
+           （SOFT_RESET_KEYS）从来不含授权键和配置项，
+           所以授权码、Token、span、winTime、任务开关、通知设置全都不动。
+
+           只在这里触发，不在别处：本函数由 tick() 每 20 秒调用一次，
+           靠一个持久化的标记位保证「同一次冷却只自动重置一次」。 */
+        autoRecoverFromCooldown(now) {
+            let guard;
+            try { guard = API.searchGuard(); } catch (_) { return false; }
+            if (!guard || !guard.cooldownUntil) return false;
+            /* 还没到期就什么都不做 */
+            if (now < guard.cooldownUntil) return false;
+
+            /* 同一次冷却只处理一次：把 cooldownUntil 的值当作这次冷却的身份，
+               处理过就记下来，避免心跳反复重跑重置。 */
+            const stampKey = "Config.searchAutoReset";
+            const done = Number(GM_getValue(stampKey, 0)) || 0;
+            if (done === guard.cooldownUntil) return false;
+            GM_setValue(stampKey, guard.cooldownUntil);
+
+            const span = Math.round((now - guard.cooldownUntil) / 60000);
+            Utils.log("🔄", `搜索冷却已到期（${guard.reason || "连续多轮未记账"}${span > 0 ? `，迟到 ${span} 分钟` : ""}），`
+                + "开始自动重置运行状态并立即恢复任务");
+
+            /* 重置成「刚装脚本」的运行状态，但保留授权与配置 */
+            let result = null;
+            try {
+                result = doSoftReset({ rearm: false });
+            } catch (e) {
+                Utils.log("🟡", `自动重置异常：${e && e.message ? e.message : e}，改为只解除冷却`);
+                try { API.clearSearchGuard(true); } catch (_) {}
+            }
+            if (result) {
+                Utils.log("✅", `自动重置完成：清理 ${Array.isArray(result.cleared) ? result.cleared.length : (Number(result.cleared) || 0)} 项运行状态，`
+                    + `授权${result.authIntact ? "完整保留" : "状态异常，请检查"}`);
+            }
+
+            /* 重置已把 Config.cronNextRun 清空，这里显式排一个「马上」的下次触发。
+               注意还要绕开运行时段：若此刻在时段外，就顺延到下一个窗口起点。 */
+            const fireAt = this.alignToWindow(now);
+            this.saveNext(fireAt);
+            this.clearClaim();
+            GM_setValue("Config.runState", null);
+            if (fireAt > now + 1000) {
+                Utils.log("🌙", `当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），`
+                    + `重置已就绪，${this.fmt(fireAt)} 到点开跑`);
+            } else {
+                Utils.log("🚀", "重置已就绪，下一轮立即开始");
+            }
+            return true;
         },
 
         /* 关键修复：一轮要是被挂死了（请求卡住 / 上下文被冻结），
