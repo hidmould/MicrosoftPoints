@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.3.1
+// @version      1.4.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -65,6 +65,13 @@ Config:
         min: 30
         max: 180
         unit: 秒
+    jitter:
+        title: 调度随机延长（分钟，每轮在基准之上再随机加这么久，避免整点固定节奏）
+        type: number
+        default: 10
+        min: 0
+        max: 60
+        unit: 分钟
     api:
         title: 搜索词接口（offline为随机搜索词）
         type: select
@@ -2850,6 +2857,17 @@ const __scBgKeepAlive = (function() {
             }
             return out;
         }
+    };
+
+    /* 搜索受限保护（v2）。旧版把「两轮进入时的进度快照没变」直接当成限流证据，
+       一旦命中就整天 return：不搜索 → 进度永远不变 → 永远命中，当天彻底锁死；
+       而本轮一次都没搜（预算被前面的任务吃掉）也会被算成「没记账」。
+       新版只认「本轮真的搜了却没记账」，命中后改为限时冷却 + 到期自动重试。 */
+    const SEARCH_GUARD = {
+        STREAK_LIMIT: 3,                        // 连续几轮真实搜索全未记账才算限流
+        MIN_ATTEMPTS: 3,                        // 少于这么多次搜索的轮次不构成证据
+        COOLDOWN_MS: 30 * 60 * 1000,            // 首次冷却 30 分钟
+        COOLDOWN_MAX_MS: 4 * 60 * 60 * 1000,    // 连续命中时翻倍递增，上限 4 小时
     };
 
     const API = {
@@ -5925,26 +5943,132 @@ const __scBgKeepAlive = (function() {
             return sentence;
         },
 
-        async checkSearchRestricted() {
-            const info = await this.getRewardsInfo();
-            const currentTotal = info ? info.pc.progress : RewardsAuto.state.pcProgress;
-            const lastTotal = RewardsAuto.state.lastSearchProgress;
-            if (lastTotal !== -1) {
-                if (currentTotal === lastTotal && currentTotal < RewardsAuto.state.pcMax) {
-                    RewardsAuto.state.restrictedTimes++;
-                } else {
-                    RewardsAuto.state.restrictedTimes = 0;
-                }
+        /* ── 搜索受限保护（v2）──────────────────────────────────────────
+           旧版三处硬伤，都真实踩到过：
+             ① 判据只有「两轮进入时的进度快照是否相同」。可 doSearch 排在
+                签到/阅读/活动卡片之后、共用 20 分钟预算，经常轮到搜索时预算
+                已经用完、一次搜索都没发 —— 这同样被记成「没记账」，三轮空转
+                就被判成限流。
+             ② 命中后直接 return 不搜索 → 进度不可能变 → 下一轮继续命中，
+                计数只增不减，当天彻底锁死，等多少轮都出不来。
+             ③ 计数只活在内存 RewardsAuto.state 里，页面上下文和后台上下文
+                各判各的：一个被锁死、另一个照常记账，日志看起来自相矛盾。
+           新版：
+             · 开场只判断「是否在冷却期」，一次网络请求都不发（冷却中整轮跳过）；
+             · 证据移到 doSearch 收尾，用本轮真实战果（搜了几次 / 记账几次）累计；
+             · 连续 STREAK_LIMIT 轮真实搜索零记账 → 冷却后自动重试，并清零计数；
+             · 状态写进 Config.searchGuard，跨上下文、跨脚本重载共享。 */
+        searchGuard() {
+            const raw = GM_getValue("Config.searchGuard", null);
+            const today = Utils.getTodayNum();
+            const st = (raw && typeof raw === "object") ? raw : {};
+            if (st.date !== today) {
+                return { date: today, streak: 0, cycles: 0, cooldownUntil: 0, reason: "", lastProgress: -1 };
             }
-            RewardsAuto.state.lastSearchProgress = currentTotal;
-            GM_setValue("Config.lastSearchProgress", currentTotal);
-            GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
-            if (RewardsAuto.state.restrictedTimes >= 3) {
-                Utils.logOnce("🔴", "搜索受限或账号异常，已中断今日搜索！", "searchRestricted", 6 * 60 * 60 * 1000);
+            return {
+                date: today,
+                streak: Math.max(0, Number(st.streak) || 0),
+                cycles: Math.max(0, Number(st.cycles) || 0),
+                cooldownUntil: Math.max(0, Number(st.cooldownUntil) || 0),
+                reason: String(st.reason || ""),
+                lastProgress: Number.isFinite(Number(st.lastProgress)) ? Number(st.lastProgress) : -1,
+            };
+        },
+
+        saveSearchGuard(st) {
+            const src = (st && typeof st === "object") ? st : {};
+            const next = {
+                date: Utils.getTodayNum(),
+                streak: Math.max(0, Number(src.streak) || 0),
+                cycles: Math.max(0, Number(src.cycles) || 0),
+                cooldownUntil: Math.max(0, Number(src.cooldownUntil) || 0),
+                reason: String(src.reason || ""),
+                lastProgress: Number.isFinite(Number(src.lastProgress)) ? Number(src.lastProgress) : -1,
+            };
+            GM_setValue("Config.searchGuard", next);
+            /* 同步旧键：诊断面板和老逻辑还在读这两个值，别让它们显示过期数字 */
+            RewardsAuto.state.restrictedTimes = next.streak;
+            RewardsAuto.state.lastSearchProgress = next.lastProgress;
+            GM_setValue("Config.restrictedTimes", next.streak);
+            GM_setValue("Config.lastSearchProgress", next.lastProgress);
+            return next;
+        },
+
+        /* 冷却剩余毫秒；没有冷却返回 0 */
+        searchCooldownLeft() {
+            const st = this.searchGuard();
+            return Math.max(0, st.cooldownUntil - Date.now());
+        },
+
+        clearSearchGuard(keepProgress = false) {
+            const st = this.searchGuard();
+            return this.saveSearchGuard({
+                streak: 0,
+                cycles: 0,
+                cooldownUntil: 0,
+                reason: "",
+                lastProgress: keepProgress ? st.lastProgress : -1,
+            });
+        },
+
+        /* doSearch 开场调用：只剩「是不是在冷却期」这一个判断，零网络请求 */
+        async checkSearchRestricted() {
+            const left = this.searchCooldownLeft();
+            const st = this.searchGuard();
+            if (left > 0) {
+                Utils.log("🟡", `搜索冷却中（${st.reason || "连续多轮未记账"}），约 ${Math.ceil(left / 60000)} 分钟后自动重试`);
                 return true;
             }
+            if (st.cooldownUntil) {
+                this.saveSearchGuard(Object.assign({}, st, { cooldownUntil: 0, reason: "" }));
+                Utils.log("🔍", "搜索冷却结束，恢复搜索");
+            }
             return false;
-        }
+        },
+
+        /* doSearch 收尾调用：用本轮真实战果累计证据（搜了几次 / 记账几次） */
+        recordSearchRound(attempts, credits, progress, max) {
+            const st = this.searchGuard();
+            const tried = Math.max(0, Number(attempts) || 0);
+            const got = Math.max(0, Number(credits) || 0);
+            const cur = Math.max(0, Number(progress) || 0);
+            const cap = Math.max(0, Number(max) || 0);
+            if (cap > 0 && cur >= cap) {
+                this.clearSearchGuard(false);
+                return this.searchGuard();
+            }
+            if (tried >= SEARCH_GUARD.MIN_ATTEMPTS && got === 0) {
+                const streak = st.streak + 1;
+                if (streak < SEARCH_GUARD.STREAK_LIMIT) {
+                    Utils.log("🟡", `本轮 ${tried} 次搜索均未记账（限流计数 ${streak}/${SEARCH_GUARD.STREAK_LIMIT}）`);
+                    this.saveSearchGuard({ ...st, streak, cooldownUntil: 0, reason: "", lastProgress: cur });
+                    return this.searchGuard();
+                }
+                /* 冷却时长递增：30 分钟 → 1 小时 → 2 小时 … 上限 4 小时，
+                   避免真的被拉黑时每半小时就去撞一次门。 */
+                const cycles = st.cycles + 1;
+                const span = Math.min(SEARCH_GUARD.COOLDOWN_MS * Math.pow(2, cycles - 1), SEARCH_GUARD.COOLDOWN_MAX_MS);
+                const until = Date.now() + span;
+                const reason = `连续 ${streak} 轮真实搜索（本轮 ${tried} 次）零记账，PC ${cur}/${cap}`;
+                this.saveSearchGuard({ streak: 0, cycles, cooldownUntil: until, reason, lastProgress: cur });
+                Utils.logOnce("🟡",
+                    `搜索连续 ${streak} 轮没有记账，第 ${cycles} 次冷却 ${Math.round(span / 60000)} 分钟后自动重试（不是今天不搜了）`,
+                    "searchRestricted", 6 * 60 * 60 * 1000);
+                Utils.log("🔍", `PC 搜索进入冷却：${new Date(until).toLocaleString("zh-CN")} 后自动重试`);
+                return this.searchGuard();
+            }
+            if (got > 0) {
+                if (st.streak > 0 || st.cooldownUntil > 0 || st.cycles > 0) {
+                    Utils.log("✅", "本轮有记账，搜索通道正常，限流计数与冷却档位清零");
+                }
+                this.saveSearchGuard({ streak: 0, cycles: 0, cooldownUntil: 0, reason: "", lastProgress: cur });
+                return this.searchGuard();
+            }
+            /* 本轮搜索次数太少（预算被前面的任务吃掉）：样本不足，不做判定，只更新基线 */
+            if (tried > 0) Utils.log("🟡", `本轮只发了 ${tried} 次搜索，样本不足，不计入限流判定`);
+            this.saveSearchGuard({ ...st, lastProgress: cur });
+            return this.searchGuard();
+        },
     };
 
     const EdgeStreak = {
@@ -6735,9 +6859,7 @@ const __scBgKeepAlive = (function() {
                 this.searchDate = RewardsAuto.state.dateNowNum;
                 this.save();
                 SEARCH_PACER.setPending(false);
-                RewardsAuto.state.restrictedTimes = 0;
-                GM_setValue("Config.restrictedTimes", 0);
-                GM_setValue("Config.lastSearchProgress", -1);
+                API.clearSearchGuard(false);
             };
 
             if (progress >= max) {
@@ -6749,10 +6871,10 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟡", "搜索配额未满，继续执行搜索任务");
                 this.searchDate = 0;
             }
+            /* 冷却中直接跳过：连配额请求都不发，到期由调度自动重试。
+               这里不能写 searchDate —— 那等于把「今天还要搜的」标记成已完成。 */
             if (await API.checkSearchRestricted()) {
-                this.searchDate = RewardsAuto.state.dateNowNum;
-                this.save();
-                SEARCH_PACER.setPending(false);
+                SEARCH_PACER.setPending(true);
                 return;
             }
 
@@ -6881,6 +7003,7 @@ const __scBgKeepAlive = (function() {
                     `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s）`, true);
             } else {
                 SEARCH_PACER.setPending(true);
+                API.recordSearchRound(attempts, credits, progress, max);
                 Utils.log("🟡",
                     `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s，已安排提前续做`);
                 this.save();
@@ -7601,7 +7724,8 @@ const __scBgKeepAlive = (function() {
 
     const diagPcSearch = async () => {
         const pacer = SEARCH_PACER.summary();
-        const restricted = Number(GM_getValue("Config.restrictedTimes", 0)) || 0;
+        const guard = API.searchGuard();
+        const coolLeft = API.searchCooldownLeft();
         let text = "🔍 PC 搜索诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
         text += `固定间隔：${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒（Config.span，搜索/阅读/卡片共用）\n`;
@@ -7617,7 +7741,8 @@ const __scBgKeepAlive = (function() {
         text += `单轮搜索上限：20 分钟（到点交班，未满的配额 5 分钟后提前续做）\n`;
         text += `整轮墙钟预算：20 分钟（到点不再开新阶段，剩余任务交给下一轮）\n`;
         text += `提前续做：${pacer.pending ? "已排程（本轮没搜满）" : "无"}\n`;
-        text += `限流计数：${restricted}/3\n`;
+        text += `限流计数：${guard.streak}/${SEARCH_GUARD.STREAK_LIMIT}`
+            + (coolLeft > 0 ? `（冷却中，约 ${Math.ceil(coolLeft / 60000)} 分钟后自动重试）` : "") + "\n";
         text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
         const info = await API.getRewardsInfo();
         if (info) text += `服务端配额：PC ${info.pc.progress}/${info.pc.max}\n`;
@@ -7627,6 +7752,9 @@ const __scBgKeepAlive = (function() {
             Utils.log("🟡", "已有一轮任务在跑，搜索诊断跳过");
             return;
         }
+        /* 手动诊断要能强制跑一次：拿到锁之后才清冷却与计数，否则冷却期内点了没反应。
+           拿不到锁就不清，避免白白放掉一个还生效的冷却。 */
+        API.clearSearchGuard(true);
         Promise.resolve()
             .then(() => TaskManager.doSearch())
             .catch(e => Utils.log("🔴", `搜索异常：${e && e.message ? e.message : e}`))
@@ -7667,6 +7795,112 @@ const __scBgKeepAlive = (function() {
         TaskManager.abortRound = false;
         Utils.log("🔓", "已强制释放运行锁并清理运行状态，下一轮可正常触发");
     };
+
+
+    const SOFT_RESET_KEYS = [
+        /* ── 运行状态 / 锁 / 调度 ── */
+        "Config.runState", "Config.runLock", "Config.cronClaim",
+        "Config.cronLastRun", "Config.cronNextRun", "Config.heartbeatAt",
+        /* ── 今日任务进度（tasks 里含 signDate/readDate/promosDate/searchDate） ── */
+        "Config.tasks", "Config.signPoint",
+        "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
+        "Config.edge", "Config.monthlyState",
+        /* ── 搜索相关的运行痕迹（配置项的 span 不动） ── */
+        "Config.searchGap", "Config.searchLast", "Config.searchPending",
+        "Config.searchGuard", "Config.restrictedTimes", "Config.lastSearchProgress",
+        /* ── 探测/协商缓存：下次自动重新协商，不影响授权 ── */
+        "Config.dpl", "Config.actionDpl", "Config.nextAction", "Config.nextActionScanAt",
+        "Config.claimVariant", "Config.questVariant", "Config.uaEdge",
+        "Config.cookieProbed", "Config.cookieDenied",
+        "Config.rewardSearchSeenAt", "Config.apiIndex",
+        "Config.tokenLock", "Config.edgeLock",
+    ];
+
+    /* 授权键：只读出来核对，永不写入。软重置后用于自检是否真的没动授权。 */
+    const AUTH_KEYS = [
+        "Config.code", "Config.codeUsed", "Config.codeFingerprint", "Config.codeTime",
+        "Config.token", "Config.tokenTime", "Config.accessToken", "Config.accessTokenTime",
+    ];
+
+    /* 只读快照：用来对比软重置前后，确认授权/配置真的没变 */
+    const snapshotKeys = (keys) => {
+        const out = {};
+        keys.forEach(k => { out[k] = GM_getValue(k, null); });
+        return out;
+    };
+
+    const authFingerprint = () => {
+        const st = snapshotKeys(AUTH_KEYS);
+        /* 只看「有没有授权、token 是否还在」，不输出 token 本身 */
+        return {
+            hasCode: !!st["Config.code"],
+            hasToken: !!st["Config.token"],
+            tokenTime: Number(st["Config.tokenTime"] || 0) || 0,
+            codeUsed: !!st["Config.codeUsed"],
+        };
+    };
+
+    const doSoftReset = (opts = {}) => {
+        const before = authFingerprint();
+        /* 先把要清的键里「本来就存在的」记下来，报告时能说清清了什么 */
+        const cleared = SOFT_RESET_KEYS.filter(k => GM_getValue(k, null) !== null);
+        SOFT_RESET_KEYS.forEach(k => {
+            try { GM_setValue(k, null); } catch (_) {}
+        });
+
+        /* 内存态也要一起回到初值，否则不刷新页面时仍按旧状态跑 */
+        try {
+            TaskManager.init();                    // 任务标记全部归零
+            TaskManager.running = false;
+            TaskManager.runningSince = 0;
+            TaskManager.abortRound = false;
+            TaskManager.lastRunStarted = false;
+            TaskManager.stopHeartbeat();
+        } catch (_) {}
+        try {
+            RewardsAuto.state.restrictedTimes = 0;
+            RewardsAuto.state.lastSearchProgress = -1;
+            RewardsAuto.state.sendMSG = "";
+            RewardsAuto.state.pcProgress = 0;
+        } catch (_) {}
+        try { Sched.clearClaim(); } catch (_) {}
+
+        const after = authFingerprint();
+        const authIntact = before.hasCode === after.hasCode
+            && before.hasToken === after.hasToken
+            && before.tokenTime === after.tokenTime
+            && before.codeUsed === after.codeUsed;
+
+        Utils.log("🧹", `软重置完成：清理 ${cleared.length} 项运行状态，授权${authIntact ? "完整保留 ✅" : "状态异常 ⚠️"}`);
+        if (!authIntact) {
+            Utils.log("🔴", "软重置后发现授权状态有变化，请用「📊 Token状态」确认；如已失效请重新「🔑 手动授权」");
+        }
+
+        /* 重置后立刻重新排一轮（带随机延长），不必等旧计划（旧计划已被清掉） */
+        if (opts.rearm !== false) {
+            try {
+                if (typeof Sched !== "undefined" && Sched.started) Sched.arm(true);
+            } catch (_) {}
+        }
+        return { cleared, authIntact, before, after };
+    };
+
+    GM_registerMenuCommand("🧹 软重置运行状态", () => {
+        const au = authFingerprint();
+        const msg = "将把「运行状态 / 今日进度 / 节流记录」清成刚装脚本的样子。\n\n"
+            + "✅ 会保留：授权码与 Token（不用重新授权）、所有配置项、任务开关、通知设置\n"
+            + "⚠️ 会清除：今日已完成标记、搜索冷却与限流计数、运行锁、调度计划、各类变体缓存\n\n"
+            + `当前授权：${au.hasToken ? "Token 有效" : "无 Token"}${au.hasCode ? " / 已存授权码" : ""}\n\n`
+            + "继续吗？";
+        if (!Utils.uiConfirm(msg)) {
+            Utils.log("🧹", "软重置已取消");
+            return;
+        }
+        const r = doSoftReset();
+        Utils.uiAlert(`🧹 软重置完成\n\n清理了 ${r.cleared.length} 项运行状态\n`
+            + `授权：${r.authIntact ? "✅ 完整保留，无需重新授权" : "⚠️ 有变化，请检查 Token状态"}\n\n`
+            + "下一轮会自动开始（已按新的随机间隔排程）。");
+    });
 
     GM_registerMenuCommand("🔔 配置通知接口", async () => {
         const configNames = [
@@ -7767,6 +8001,12 @@ const __scBgKeepAlive = (function() {
     };
 
     const CRON_PERIOD = 20 * 60 * 1000;
+    /* 调度随机延长：固定每 20 分钟整点起跑太像程序，长期看也容易被风控盯上。
+       现在每轮在基准之上再随机加 [0, jitter) 分钟（Config.jitter，默认 10）。
+       关键：随机值必须在「排下一轮」时摇一次并写进 Config.cronNextRun，
+       不能放在 plan() 里现算 —— plan() 每 20 秒被心跳调用一次，
+       现算的话下次触发时间会一直抖动，永远到不了。 */
+    const CRON_JITTER_MAX = 60 * 60 * 1000;
     const CRON_HEARTBEAT = 20 * 1000;
     const CRON_FIRST_DELAY = 5 * 1000;
     const CRON_HEARTBEAT_LOG = 10 * 60 * 1000;
@@ -7815,6 +8055,30 @@ const __scBgKeepAlive = (function() {
             if (next) return next;
             const last = this.lastRun();
             return last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
+        },
+
+        /* 用户配置的随机延长时间（毫秒）。0 = 关闭随机，回到固定 20 分钟。 */
+        jitterMs() {
+            const min = Number(GM_getValue("Config.jitter", 10));
+            const val = Number.isFinite(min) ? Math.max(0, min) : 10;
+            return Math.min(CRON_JITTER_MAX, Math.round(val * 60 * 1000));
+        },
+
+        /* 摇一次本轮的随机延长量，只在下单时调用（不能放进 plan） */
+        rollJitter() {
+            const span = this.jitterMs();
+            if (span <= 0) return 0;
+            /* 取整到秒，日志里的时间点更好读 */
+            return Math.round((Math.random() * span) / 1000) * 1000;
+        },
+
+        /* 排下一轮：基准 20 分钟 + 本次随机延长，写死到 Config.cronNextRun */
+        scheduleNext(fromMs, extraMs = 0) {
+            const base = Number(fromMs) || Date.now();
+            const jitter = this.rollJitter();
+            const ts = base + CRON_PERIOD + jitter + (Number(extraMs) || 0);
+            this.saveNext(ts);
+            return { ts, jitter };
         },
 
         saveNext(ts) { GM_setValue("Config.cronNextRun", ts); },
@@ -7884,15 +8148,30 @@ const __scBgKeepAlive = (function() {
             this.clearClaim();
             GM_setValue("Config.cronLastRun", now);
             const next = base + CRON_PERIOD;
+            /* 只有「整轮正常跑完、没有走补跑/冷却分支」才叠加随机延长 */
+            let addJitter = ran;
             let plan = next > now + 60 * 1000 ? next : now + 60 * 1000;
             if (!ran) {
                 plan = Math.min(plan, now + 2 * 60 * 1000);
+                addJitter = false;
             } else if (GM_getValue("Tasks.search", true) && SEARCH_PACER.isPending()) {
-                const sooner = now + SEARCH_PACER.RETRY_GAP;
+                /* 冷却期内别按 5 分钟排下一轮（排了也是空跑），直接排到冷却结束那一刻 */
+                const coolLeft = API.searchCooldownLeft();
+                const sooner = now + Math.max(SEARCH_PACER.RETRY_GAP, coolLeft);
                 if (sooner < plan) {
                     plan = sooner;
-                    Utils.log("🔍", `PC 搜索未满，${Math.round(SEARCH_PACER.RETRY_GAP / 60000)} 分钟后提前续做`);
+                    addJitter = false;
+                    Utils.log("🔍", coolLeft > 0
+                        ? `PC 搜索冷却中，约 ${Math.ceil(coolLeft / 60000)} 分钟后自动续做`
+                        : `PC 搜索未满，${Math.round(SEARCH_PACER.RETRY_GAP / 60000)} 分钟后提前续做`);
                 }
+            }
+            /* 正常走完整轮（ran 且没有提前续做）时补上本次随机延长；
+               补跑/冷却这类「已经算好具体时刻」的分支不再叠加，免得计划越推越远。 */
+            if (addJitter) {
+                const jitter = this.rollJitter();
+                plan += jitter;
+                if (jitter > 0) Utils.log("🕒", `本轮随机延长 ${Math.round(jitter / 60000)} 分钟后进入下一轮`);
             }
             this.saveNext(plan);
             this.state(ok ? "done" : "idle");
@@ -7946,7 +8225,7 @@ const __scBgKeepAlive = (function() {
 
             const next = this.plan(this.startedAt);
             if (next > this.startedAt) this.saveNext(next);
-            Utils.log("🕒", `常驻调度已启动（${this.ctxName()}上下文）：v${(GM_info.script && GM_info.script.version) || "?"}，每 ${CRON_PERIOD / 60000} 分钟一轮，下一轮 ${this.fmt(next)}`);
+            Utils.log("🕒", `常驻调度已启动（${this.ctxName()}上下文）：v${(GM_info.script && GM_info.script.version) || "?"}，每 ${CRON_PERIOD / 60000} 分钟 + 随机 ${this.jitterMs() / 60000} 分钟一轮，下一轮 ${this.fmt(next)}`);
             this.arm(true);
         },
 
@@ -8033,13 +8312,13 @@ const __scBgKeepAlive = (function() {
                     started.catch(e => {
                         Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
                         this.clearClaim();
-                        this.saveNext(Date.now() + CRON_PERIOD);
+                        this.scheduleNext(Date.now());
                     });
                 }
             } catch (e) {
                 Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
                 this.clearClaim();
-                this.saveNext(now + CRON_PERIOD);
+                this.scheduleNext(now);
             }
         }
     };
@@ -8173,7 +8452,7 @@ const __scBgKeepAlive = (function() {
         const phaseText = { claimed: "已触发，等待执行", waiting: "等待延时结束", running: "正在执行", done: "上一轮已完成", idle: "空闲" };
         const lastAct = st ? Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0) : 0;
         let text = "🕒 常驻调度状态\n\n";
-        text += `调度间隔：${CRON_PERIOD / 60000} 分钟\n`;
+        text += `调度间隔：${CRON_PERIOD / 60000} 分钟 + 随机 ${Math.round(Sched.jitterMs() / 60000)} 分钟（范围 ${CRON_PERIOD / 60000}~${(CRON_PERIOD + Sched.jitterMs()) / 60000} 分钟）\n`;
         text += `最近结束：${Sched.fmt(last)}\n`;
         text += `下次触发：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
         text += `运行阶段：${st ? (phaseText[st.phase] || st.phase) : "未知"}${st && st.ctx ? `（${st.ctx}）` : ""}\n`;
