@@ -2,7 +2,7 @@
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
 // @version      1.4.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动（面板 5 张卡·纯接口）、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -117,6 +117,10 @@ Tasks:
         default: true
     claimPoints:
         title: 自动领取待领积分（搜索打卡/每日活动的奖励需点一次才入账）
+        type: checkbox
+        default: true
+    intlDaily:
+        title: 国际版每日活动（必应面板里的拼图/问答/每日一句 5 张 × 5 分）
         type: checkbox
         default: true
 Notice:
@@ -339,6 +343,9 @@ const __scBgKeepAlive = (function() {
             monthlyPending: 0,
             monthlyComplete: false,
             monthlyUnlocked: 0,
+            intlFound: 0,
+            intlDone: 0,
+            intlPending: 0,
             webNoAuth: false,
             webFailStreak: 0,
         }
@@ -6068,6 +6075,277 @@ const __scBgKeepAlive = (function() {
         },
     };
 
+    /* ══════════════════════════════════════════════════════════════════
+       IntlDaily：必应「奖励面板」里的国际版每日活动
+
+       红框里那 5 张卡（拼图 ×2 / 问答 ×2 / 每日一句）不属于 DailySet，
+       也不走 rewards.bing.com 的 Server Action —— 它们是 bing.com 面板的
+       「urlreward」型 offer，offerId 形如
+           ENstar_Rewards_DailyGlobalOffer_Evergreen_<星期>
+
+       注意：offerId 里的星期名**不是**「今天只做这一张」的排期，而是这组
+       常青活动的固定编号。实测同一天把 5 张全部交卷，5 张全部记账
+       （余额 55874 → 55899，+25），所以这里不做星期过滤，5 张都做。
+
+       唯一记账通道是面板自己的接口：
+
+           POST {bing主机}/msrewards/api/v1/reportactivity
+           {"ActivityType":"bingredirect","OfferId":…,"Channel":"BingFlyout",
+            "PartnerId":"BingRewards","UserId":…,"AuthKey":<hash>,"ActivityCount":1}
+
+       hash / UserId / Channel 都从同一个面板的数据里取：
+           GET {bing主机}/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards
+         · flyoutResult.morePromotions[]        → 卡片本体（带 hash）
+         · userInfo.promotions[]                → 同一批卡的 attributes.complete（不带 hash）
+         · 顶层 channel / userId / partnerId    → 请求体字段
+
+       实测（2026-11 国内 cn.bing.com）：这 5 张卡连落地页都不用真刷，
+       直接带 hash 调一次 reportactivity 就记账，所以整条链路都是后台请求，
+       既不开标签页、也不碰 CDP —— 这正是它和「每日活动」最大的区别。
+       ══════════════════════════════════════════════════════════════════ */
+    const IntlDaily = {
+        PATH: "/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards",
+        REPORT_PATH: "/msrewards/api/v1/reportactivity",
+        OFFER_PREFIX: "ENstar_Rewards_DailyGlobalOffer_",
+        WEEKDAYS: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        /* 面板接口的 Referer 必须是 bing 主页；缺了会被判成外站请求 */
+        MAX_ATTEMPTS: 2,
+
+        /* 面板挂在 bing 搜索域下：优先用脚本自己的搜索主机，再退回 cn / www
+           （两个域的接口都在，实测都能记账）。 */
+        hosts() {
+            let configured = "";
+            try { configured = String(RewardsAuto.state.host || "").trim(); } catch (_) {}
+            const out = [];
+            for (const h of [configured, "cn.bing.com", "www.bing.com"]) {
+                if (h && /^[a-z0-9.-]+$/i.test(h) && !out.includes(h)) out.push(h);
+            }
+            return out;
+        },
+
+        weekdayName(date = new Date()) {
+            return this.WEEKDAYS[date.getDay()] || "";
+        },
+
+        /* 面板数据一次性取回：拿到卡片列表 + 请求体要用的身份字段。
+           返回 null 表示「国际版面板不可用 / 没登录」，调用方要当无事发生。 */
+        async fetchPanel(host) {
+            const url = `https://${host}${this.PATH}`;
+            let text = "";
+            try {
+                text = await Utils.xhr({
+                    url,
+                    headers: {
+                        "accept": "application/json, text/plain, */*",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": `https://${host}/`,
+                        "x-requested-with": "XMLHttpRequest"
+                    },
+                    timeout: 20000
+                });
+            } catch (e) {
+                Utils.log("🟡", `国际版面板读取失败（${host}）：${e.message}`);
+                return null;
+            }
+            const data = Utils.parseJSON(text);
+            if (!data) {
+                Utils.log("🟡", `国际版面板返回的不是 JSON（${host}），本轮跳过`);
+                return null;
+            }
+            if (data.isError === true || data.isRewardsUser === false) {
+                Utils.log("🟡", `国际版面板不可用：isError=${data.isError}，isRewardsUser=${data.isRewardsUser}`);
+                return null;
+            }
+            const flyout = data.flyoutResult || {};
+            const promos = [];
+            const push = (item) => {
+                if (!item || typeof item !== "object") return;
+                const name = String(item.name || item.offerId || "");
+                if (!name) return;
+                promos.push(item);
+            };
+            for (const key of ["morePromotions", "highValueActionPromotions", "dailySetPromotions", "pointClaimCardPromotion"]) {
+                const v = flyout[key];
+                if (Array.isArray(v)) v.forEach(push);
+                else if (v && typeof v === "object") Object.values(v).forEach(x => Array.isArray(x) ? x.forEach(push) : push(x));
+            }
+            const identity = {
+                channel: data.channel || "BingFlyout",
+                partnerId: data.partnerId || "BingRewards",
+                userId: data.userId || ""
+            };
+            /* userInfo.promotions 里同一批卡的 attributes.complete 是「已完成」的直接判据 */
+            const completeById = new Map();
+            const rawPromos = (data.userInfo && data.userInfo.promotions) || [];
+            for (const p of rawPromos) {
+                const a = (p && p.attributes) || {};
+                const id = String(a.offerid || a.offerId || p.name || "");
+                if (!id) continue;
+                const cur = parseInt(a.progress ?? 0, 10) || 0;
+                const max = parseInt(a.max ?? 0, 10) || 0;
+                completeById.set(id, String(a.complete).toLowerCase() === "true" || (max > 0 && cur >= max));
+            }
+            return { host, identity, promos, completeById, balance: Number((data.userInfo || {}).balance) || 0 };
+        },
+
+        /* 从面板数据里挑出国际版每日活动的卡片。
+           只认 offerId 前缀 —— 面板里还有 Instant Win、Star bonus、兑换广告……
+           它们不是每日活动，误报只会白打接口。
+           5 张卡每天都能做（offerId 里的星期名只是编号），所以默认不过滤星期。 */
+        pickCards(panel, { weekdays = null } = {}) {
+            const want = Array.isArray(weekdays) && weekdays.length ? new Set(weekdays) : null;
+            const seen = new Map();
+            for (const p of panel.promos) {
+                const name = String(p.name || p.offerId || "");
+                if (!name.startsWith(this.OFFER_PREFIX)) continue;
+                const attr = p.attributes || {};
+                const offerId = String(p.offerId || attr.offerid || name);
+                const day = name.slice(this.OFFER_PREFIX.length).replace(/^Evergreen_/, "");
+                if (!this.WEEKDAYS.includes(day)) continue;
+                if (want && !want.has(day)) continue;
+                if (!p.hash) continue;              /* 没有 hash 就交不了卷，别占位 */
+                if (seen.has(offerId)) continue;
+                const done = p.complete === true
+                    || String(attr.complete).toLowerCase() === "true"
+                    || panel.completeById.get(offerId) === true;
+                seen.set(offerId, {
+                    offerId,
+                    name,
+                    day,
+                    title: attr.title || p.title || day,
+                    activityType: p.activityType || "bingredirect",
+                    hash: p.hash,
+                    points: Number(p.pointProgressMax || attr.max || 5) || 5,
+                    complete: done,
+                    destination: attr.destination || ""
+                });
+            }
+            return [...seen.values()];
+        },
+
+        /* 交卷：带 hash 调面板接口。返回 {ok, points, balance, reason} */
+        async report(panel, card) {
+            const body = {
+                ActivityType: card.activityType,
+                ActivitySubType: "",
+                OfferId: card.offerId,
+                Channel: panel.identity.channel,
+                PartnerId: panel.identity.partnerId,
+                UserId: panel.identity.userId,
+                AuthKey: card.hash,
+                ActivityCount: 1
+            };
+            let text = "";
+            try {
+                text = await Utils.xhr({
+                    method: "POST",
+                    url: `https://${panel.host}${this.REPORT_PATH}`,
+                    headers: {
+                        "accept": "application/json, text/plain, */*",
+                        "content-type": "application/json",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": `https://${panel.host}/`,
+                        "origin": `https://${panel.host}`
+                    },
+                    data: JSON.stringify(body),
+                    timeout: 20000
+                });
+            } catch (e) {
+                return { ok: false, reason: `HTTP 失败：${e.message}` };
+            }
+            const data = Utils.parseJSON(text);
+            if (!data) return { ok: false, reason: "响应不是 JSON" };
+            /* 成功与否以「服务端有没有报错」为准：PointsEarned 在这一版响应里恒为 0，
+               Balance 有时是数字、有时是 {Available:…} 对象，两种都读。 */
+            const bal = (() => {
+                const b = data.Balance;
+                if (typeof b === "number") return b;
+                if (b && typeof b === "object") return Number(b.Available) || 0;
+                return 0;
+            })();
+            const pts = Number(data.PointsEarned) || 0;
+            if (data.ErrorCode) {
+                return { ok: false, balance: bal, reason: `ErrorCode=${data.ErrorCode} ${data.ErrorMessage || ""}`.trim() };
+            }
+            return { ok: true, points: pts, balance: bal, isRewardsUser: data.IsRewardsUser !== false };
+        },
+
+        /* 主流程：取面板 → 挑卡 → 逐张交卷 → 复核。
+           返回 {found, done, pending, points}；面板里没有这组活动时 found=0。 */
+        async run({ reason = "国际版每日活动" } = {}) {
+            if (!GM_getValue("Tasks.intlDaily", true)) return null;
+            /* 这里不校验 Token：面板走的是 bing.com 的登录 Cookie，
+               而不是 prod.rewardsplatform 的 OAuth Token，没有 Token 也能做。 */
+
+            let panel = null;
+            for (const host of this.hosts()) {
+                panel = await this.fetchPanel(host);
+                if (panel) break;
+            }
+            if (!panel) return null;
+
+            const cards = this.pickCards(panel);
+            if (cards.length === 0) {
+                Utils.log("🟡", "国际版面板里没有找到每日活动卡片（该账号可能没有这组活动）");
+                return { found: 0, done: 0, pending: 0, points: 0 };
+            }
+
+            const doneIds = new Set(cards.filter(c => c.complete).map(c => c.offerId));
+            const todo = cards.filter(c => !c.complete);
+            if (todo.length === 0) {
+                Utils.log("✅", `国际版每日活动已完成（${cards.length} 张）`);
+                return { found: cards.length, done: cards.length, pending: 0, points: 0 };
+            }
+            Utils.log("🌍", `${reason}：发现 ${todo.length} 张待完成（共 ${cards.length} 张）`);
+
+            const balanceBefore = panel.balance;
+            let ok = 0;
+            for (const card of todo) {
+                const name = card.title || card.offerId;
+                let last = null;
+                for (let attempt = 1; attempt <= this.MAX_ATTEMPTS; attempt++) {
+                    last = await this.report(panel, card);
+                    if (last.ok) break;
+                    Utils.log("🟡", `国际版卡片交卷未受理（第 ${attempt} 次）：${name} → ${last.reason || "未知原因"}`);
+                    if (attempt < this.MAX_ATTEMPTS) await Utils.randomDelay(2500, 5000);
+                }
+                if (last && last.ok) {
+                    ok++;
+                    doneIds.add(card.offerId);
+                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p`);
+                } else {
+                    Utils.log("🟠", `国际版卡片未完成：${name}（下一轮继续）`);
+                }
+                /* 每张之间留一点间隔：面板接口连续打容易被判异常 */
+                if (todo.length > 1) await Utils.randomDelay(1500, 3000);
+            }
+
+            /* 复核：重新读一次面板，确认服务端真的标了 complete，并读余额变化 */
+            try {
+                await Utils.delay(2000);
+                const after = await this.fetchPanel(panel.host);
+                if (after) {
+                    const confirmed = this.pickCards(after).filter(c => c.complete).length;
+                    const gained = after.balance - balanceBefore;
+                    if (gained !== 0) {
+                        Utils.log("🌍", `国际版每日活动复核：${confirmed}/${cards.length} 张已记账（余额 ${balanceBefore} → ${after.balance}）`);
+                    } else if (confirmed > 0) {
+                        Utils.log("  ", `国际版每日活动复核：${confirmed}/${cards.length} 张已完成`);
+                    }
+                }
+            } catch (_) {}
+
+            const pending = cards.filter(c => !doneIds.has(c.offerId)).length;
+            if (pending === 0) Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`);
+            return {
+                found: cards.length,
+                done: cards.length - pending,
+                pending,
+                points: ok * (cards[0].points || 5)
+            };
+        }
+    };
+
     const EdgeStreak = {
         _running: false,
 
@@ -7201,6 +7479,44 @@ const __scBgKeepAlive = (function() {
             Utils.log("🟡", lines.join("\n"));
         },
 
+        /* 国际版每日活动（必应面板里那 5 张拼图/问答/每日一句）。
+           和 DailySet 完全两条链路：这里不发 rewards.bing.com 的交卷，
+           也不开标签页，只调 bing 面板的 reportactivity。
+           它是「锦上添花」的 5×5 分，任何异常都不该影响主流程。 */
+        async doIntlDaily(roundDeadline) {
+            /* 这里用 allow() 不用 guard()：国际版只是额外 25 分，
+               出口探测抖动不该把整轮任务打断（guard 会抛 RegionBlockedError）。 */
+            if (!(await RegionGuard.allow())) {
+                Utils.log("🟡", "出口探测未通过，国际版每日活动本轮跳过");
+                return false;
+            }
+            const today = Utils.getTodayNum();
+            const key = "Config.intlDailyDate";
+            const st = GM_getValue(key, null);
+            /* 服务端已确认做完就当天封盘，省掉这轮的面板请求 */
+            if (st && Number(st.date) === today && Number(st.pending) === 0) {
+                Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
+                return true;
+            }
+            let res = null;
+            try {
+                res = await IntlDaily.run({ reason: "国际版每日活动" });
+            } catch (e) {
+                Utils.log("🟡", `国际版每日活动异常：${e.message}（不影响其它任务）`);
+                return false;
+            }
+            if (!res) return false;
+            if (res.found === 0) {
+                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0 });
+                return true;
+            }
+            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending });
+            RewardsAuto.state.intlFound = res.found;
+            RewardsAuto.state.intlDone = res.done;
+            RewardsAuto.state.intlPending = res.pending;
+            return res.pending === 0;
+        },
+
         async doStreak() {
             await RegionGuard.guard("连签检测");
             Utils.log("📅", "开始检测连签任务...");
@@ -7407,6 +7723,16 @@ const __scBgKeepAlive = (function() {
                     await Utils.randomDelay();
                     dailySetRes = await withRetry(() => this.doDailySet(roundDeadline), "每日活动");
                 }
+                /* 国际版每日活动：必应面板里那 5 张卡，纯接口完成，不占 CDP 也不开标签页 */
+                let intlDailyRes = null;
+                if (!GM_getValue("Tasks.intlDaily", true)) {
+                    Utils.log("  ", "国际版每日活动已关闭（任务开关）");
+                } else if (roundExpired()) {
+                    skipByDeadline("国际版每日活动");
+                } else {
+                    await Utils.randomDelay();
+                    intlDailyRes = await this.doIntlDaily(roundDeadline);
+                }
                 try {
                     await this.doClaimPoints();
                 } catch (e) {
@@ -7478,6 +7804,9 @@ const __scBgKeepAlive = (function() {
                     const searchOk = info.pc.progress >= info.pc.max;
                     const promosOk = this.promosDate === today;
                     const dailyOk = !!dailySetRes;
+                    /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
+                       intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
+                    const intlOk = !GM_getValue("Tasks.intlDaily", true) || intlDailyRes !== false;
                     const edge = EdgeStreak.summary();
                     const edgeOk = !edge || edge.done || edge.skipped;
                     const mob = info.mobile || {};
@@ -7542,6 +7871,13 @@ const __scBgKeepAlive = (function() {
                         : "⏭️ 已关闭"));
                     row("🧩 活动卡片", promosOn, promosOk, "");
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
+                    /* 国际版 5 张卡是「额外加分」，没这组活动的账号（found=0）不显示这一行 */
+                    const intlOn = GM_getValue("Tasks.intlDaily", true);
+                    const intlFound = Number(RewardsAuto.state.intlFound) || 0;
+                    if (intlOn && intlFound > 0) {
+                        const intlDone = Number(RewardsAuto.state.intlDone) || 0;
+                        row("🌍 国际版每日活动", intlOn, intlOk && intlDone >= intlFound, intlDone + "/" + intlFound);
+                    }
                     row("🖥️ 桌面专属任务", desktopOn, desktopPending === 0 && desktopFailed === 0,
                         desktopPending > 0 ? `${desktopPending} 张未记账`
                             : (desktopFailed > 0 ? `${desktopFailed} 个入口读取失败` : ""));
@@ -7763,6 +8099,53 @@ const __scBgKeepAlive = (function() {
         return text;
     };
 
+    /* 手动诊断/补做国际版每日活动：不走主循环、不抢运行锁，
+       跑完只写日志（有人只想补这 25 分，不想整轮重跑）。 */
+    const diagIntlDaily = async () => {
+        const enabled = GM_getValue("Tasks.intlDaily", true);
+        let text = "🌍 国际版每日活动（必应面板 5 张卡）\n\n";
+        text += `任务开关：${enabled ? "开启" : "关闭"}\n`;
+        if (!enabled) {
+            Utils.uiAlert(text + "\n请先在脚本设置里勾选「国际版每日活动」。");
+            return text;
+        }
+        let panel = null;
+        let usedHost = "";
+        for (const host of IntlDaily.hosts()) {
+            panel = await IntlDaily.fetchPanel(host);
+            if (panel) { usedHost = host; break; }
+        }
+        if (!panel) {
+            Utils.uiAlert(text + "\n❌ 读不到面板数据：确认浏览器已登录 bing.com，且出口是大陆直连。");
+            return text;
+        }
+        const cards = IntlDaily.pickCards(panel);
+        text += `接口主机：${usedHost}\n`;
+        text += `面板余额：${panel.balance}\n`;
+        text += `身份字段：channel=${panel.identity.channel} partnerId=${panel.identity.partnerId}\n`;
+        text += `国际版每日活动卡片：${cards.length} 张`;
+        if (cards.length) {
+            text += "\n" + cards.map(c => `  · ${c.complete ? "✅" : "⏳"} ${c.title} +${c.points}p（${c.day}）`).join("\n");
+        }
+        const pending = cards.filter(c => !c.complete);
+        text += `\n\n待完成：${pending.length} 张` + (pending.length ? "，现在开始逐张交卷…" : "（今日已全部完成）");
+        Utils.uiAlert(text);
+        if (pending.length === 0) return text;
+        if (!Utils.acquireLock("Config.runLock", 10 * 60 * 1000)) {
+            Utils.log("🟡", "已有一轮任务在跑，国际版诊断跳过（避免并发重复上报）");
+            return text;
+        }
+        Promise.resolve()
+            .then(() => IntlDaily.run({ reason: "手动补做国际版每日活动" }))
+            .catch(e => Utils.log("🔴", `国际版每日活动异常：${e.message}`))
+            .finally(() => Utils.releaseLock("Config.runLock"));
+        return text;
+    };
+
+    GM_registerMenuCommand("🌍 国际版每日活动（诊断/补做）", () => {
+        diagIntlDaily().catch(e => Utils.log("🔴", `国际版诊断失败：${e.message}`));
+    });
+
     GM_registerMenuCommand("🚀 立即运行", () => {
         Utils.log("🚀", "手动触发：立即运行一轮");
         /* 手动触发前先把卡死的记录收掉：否则用户点一次还是只会看到
@@ -7805,7 +8188,7 @@ const __scBgKeepAlive = (function() {
         /* ── 今日任务进度（tasks 里含 signDate/readDate/promosDate/searchDate） ── */
         "Config.tasks", "Config.signPoint",
         "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
-        "Config.edge", "Config.monthlyState",
+        "Config.edge", "Config.monthlyState", "Config.intlDailyDate",
         /* ── 搜索相关的运行痕迹（配置项的 span 不动） ── */
         "Config.searchGap", "Config.searchLast", "Config.searchPending",
         "Config.searchGuard", "Config.restrictedTimes", "Config.lastSearchProgress",

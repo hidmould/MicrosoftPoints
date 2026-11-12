@@ -79,6 +79,30 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 
 ---
 
+## 四、国际版每日活动（不需要 CDP）
+
+必应搜索页右上角「积分面板」里的那 5 张卡 —— 拼图 ×2、问答 ×2、每日一句，每张 5 分，一天共 25 分：
+
+| 卡片 | 分值 |
+| --- | --- |
+| Mid-week puzzle / Complete this puzzle（拼图） | 5 + 5 |
+| Do you know the answer?（问答） | 5 + 5 |
+| Quote of the day（每日一句） | 5 |
+
+**这组任务不需要 Chrome、也不需要 CDP**：脚本直接调用面板自己的接口交卷，
+全程后台请求，不开标签页、不抢焦点。
+
+- offerId 形如 `ENstar_Rewards_DailyGlobalOffer_Evergreen_<星期>`，
+  里面的星期只是活动编号，**5 张每天都能做**，脚本会一次全部交卷。
+- 开关：脚本设置 → `国际版每日活动`（默认开启）。
+- 手动补做/诊断：脚本菜单 → **🌍 国际版每日活动（诊断/补做）**，
+  会显示接口主机、面板余额、5 张卡的完成状态，并可立即补做。
+- 前置条件：浏览器已登录 bing.com（走的是 bing 的登录 Cookie，与 OAuth Token 无关）。
+
+&nbsp;
+
+---
+
 ## 说明
 - 代码主要改自微软积分（全能任务版），主要自己留存备份使用。
 - 感谢ScriptCat001 DuskLight 潘矩森 大大 ，以及其他更多的大大。
