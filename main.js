@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.2
+// @version      1.6.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -65,13 +65,10 @@ Config:
         min: 60
         max: 180
         unit: 秒
-    jitter:
-        title: 调度随机延长（分钟，每轮在基准之上再随机加这么久，避免整点固定节奏）
-        type: number
-        default: 10
-        min: 0
-        max: 60
-        unit: 分钟
+    winTime:
+        title: 每日运行时段（格式 开始-结束，如 09:00-23:00；前后相同则全天不限，支持跨零点如 22:30-06:00）
+        type: text
+        default: 09:00-23:00
     api:
         title: 搜索词接口（offline为随机搜索词）
         type: select
@@ -8006,11 +8003,11 @@ const __scBgKeepAlive = (function() {
 
     const CRON_PERIOD = 20 * 60 * 1000;
     /* 调度随机延长：固定每 20 分钟整点起跑太像程序，长期看也容易被风控盯上。
-       现在每轮在基准之上再随机加 [0, jitter) 分钟（Config.jitter，默认 10）。
+       现在每轮在基准之上再随机加 [0, CRON_JITTER) 分钟（脚本内部固定 10 分钟），
        关键：随机值必须在「排下一轮」时摇一次并写进 Config.cronNextRun，
        不能放在 plan() 里现算 —— plan() 每 20 秒被心跳调用一次，
        现算的话下次触发时间会一直抖动，永远到不了。 */
-    const CRON_JITTER_MAX = 60 * 60 * 1000;
+    const CRON_JITTER = 10 * 60 * 1000;
     const CRON_HEARTBEAT = 20 * 1000;
     const CRON_FIRST_DELAY = 5 * 1000;
     const CRON_HEARTBEAT_LOG = 10 * 60 * 1000;
@@ -8038,6 +8035,21 @@ const __scBgKeepAlive = (function() {
        留 20 分钟余量，到点无论卡在哪都由心跳强制收尾。 */
     const ROUND_HARD_LIMIT = ROUND_BUDGET_MS + 20 * 60 * 1000;
 
+    /* ══ 每日运行窗口 ═══════════════════════════════════════════════
+       为什么要窗口：0 点刚过就开跑、或者整夜每隔 20 分钟跑一轮，在风控看来
+       就是脚本 —— 真人不会凌晨三点准时做任务。所以把运行时段收在
+       Config.winStart ~ Config.winEnd（默认 09:00~23:00），窗口之外只保留
+       心跳，不再开新的一轮。
+
+       开始时刻就是配置的整点（如 9 点），不做随机推后：要「同一天恒等」
+       才不会让计划漂移，而那种确定性随机反而让用户无法预期到底几点开始。
+       想避免「整点太像脚本」，交给每轮的随机延长（脚本内部固定 10 分钟）即可。 */
+    const WINDOW = {
+        TIME_DEFAULT: "09:00-23:00",
+        START_DEFAULT: 9,     // 仅用于兼容旧版 Config.winStart
+        END_DEFAULT: 23,      // 仅用于兼容旧版 Config.winEnd
+    };
+
     const Sched = {
         timer: null,
         started: false,
@@ -8056,17 +8068,123 @@ const __scBgKeepAlive = (function() {
 
         plan(now = Date.now()) {
             const next = Number(GM_getValue("Config.cronNextRun", 0)) || 0;
-            if (next) return next;
-            const last = this.lastRun();
-            return last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
+            let ts;
+            if (next) ts = next;
+            else {
+                const last = this.lastRun();
+                ts = last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
+            }
+            /* 落在运行时段之外就顺延到下一个窗口起点：窗口外绝不开新的一轮。
+               alignToWindow 只依赖日期和配置，同一天算出来的值恒定，所以
+               每 20 秒调用一次也不会漂移。 */
+            return this.alignToWindow(ts);
         },
 
-        /* 用户配置的随机延长时间（毫秒）。0 = 关闭随机，回到固定 20 分钟。 */
-        jitterMs() {
-            const min = Number(GM_getValue("Config.jitter", 10));
-            const val = Number.isFinite(min) ? Math.max(0, min) : 10;
-            return Math.min(CRON_JITTER_MAX, Math.round(val * 60 * 1000));
+        /* ── 每日运行窗口 ── */
+        midnightOf(ts) {
+            const d = new Date(ts);
+            d.setHours(0, 0, 0, 0);
+            return d.getTime();
         },
+
+        /* 解析 "开始-结束" 形式的时段文本，返回 { startMin, endMin }（分钟数），
+           解析不了返回 null。宽容一点，用户常见的写法都要认：
+             "09:00-23:00"  "9:00-23:00"  "9-23"  "09:00~23:00"
+             "09:00至23:00"  "09：00－23：00"（全角冒号/破折号）
+           24:00 允许作为结束时刻（表示当天末尾）。 */
+        parseWinTime(raw) {
+            const s = String(raw == null ? "" : raw)
+                .replace(/[：]/g, ":")            // 全角冒号
+                .replace(/[—–－~～至到]/g, "-")   // 各种连接符
+                .replace(/\s+/g, "");
+            if (!s) return null;
+            const m = s.match(/^(\d{1,2})(?::(\d{1,2}))?-(\d{1,2})(?::(\d{1,2}))?$/);
+            if (!m) return null;
+            const sh = Number(m[1]), sm = m[2] == null ? 0 : Number(m[2]);
+            const eh = Number(m[3]), em = m[4] == null ? 0 : Number(m[4]);
+            if (![sh, sm, eh, em].every(Number.isFinite)) return null;
+            if (sm > 59 || em > 59) return null;
+            if (sh > 24 || eh > 24) return null;
+            if (sh === 24 && sm > 0) return null;   // 24:30 不存在
+            if (eh === 24 && em > 0) return null;
+            /* 24:00 作为开始等于次日 0 点，统一按 0 点处理 */
+            const startMin = sh === 24 ? 0 : sh * 60 + sm;
+            return { startMin, endMin: eh * 60 + em };
+        },
+
+        /* 分钟数 → "HH:MM"，用于日志和诊断面板 */
+        fmtHM(min) {
+            const m = Math.max(0, Math.round(Number(min) || 0));
+            return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+        },
+
+        /* 旧版的 Config.winStart / winEnd（只有小时）是否还在用：
+           只有当用户此前改动过它们（不等于出厂 9/23）时才算数，
+           否则按新配置的默认值走，避免老默认值盖掉新设置的 winTime。 */
+        legacyWin() {
+            const s = GM_getValue("Config.winStart", null);
+            const e = GM_getValue("Config.winEnd", null);
+            if (s == null && e == null) return null;
+            const sH = Number(s), eH = Number(e);
+            if (!Number.isFinite(sH) || !Number.isFinite(eH)) return null;
+            if (sH === WINDOW.START_DEFAULT && eH === WINDOW.END_DEFAULT) return null;
+            return {
+                startMin: Math.min(23, Math.max(0, Math.round(sH))) * 60,
+                endMin: Math.min(24, Math.max(0, Math.round(eH))) * 60
+            };
+        },
+
+        winCfg() {
+            /* 优先用 Config.winTime；没填或解析不了时，
+               依次回退到旧版的小时配置、最后回退出厂默认。 */
+            let parsed = this.parseWinTime(GM_getValue("Config.winTime", null));
+            if (!parsed) parsed = this.legacyWin();
+            if (!parsed) parsed = this.parseWinTime(WINDOW.TIME_DEFAULT);
+            if (!parsed) parsed = { startMin: 9 * 60, endMin: 23 * 60 };
+            const { startMin, endMin } = parsed;
+            /* 前后相同 = 全天不限；00:00-24:00 也是整整一天，同按不限处理 */
+            const full = (endMin - startMin + 1440) % 1440 === 0;
+            return { startMin, endMin, allDay: startMin === endMin || full };
+        },
+
+        /* 某个「日历日」的运行窗口 [start, end)，精确到分钟。
+           返回 null 表示不限时段。end <= start 时按跨零点处理（如 22:30~次日 6:00）。 */
+        windowOfDay(dayTs) {
+            const cfg = this.winCfg();
+            if (cfg.allDay) return null;
+            const midnight = this.midnightOf(dayTs);
+            const lenMin = cfg.endMin > cfg.startMin
+                ? cfg.endMin - cfg.startMin
+                : cfg.endMin + 1440 - cfg.startMin;
+            if (lenMin <= 0) return null;
+            return { start: midnight + cfg.startMin * 60000, end: midnight + cfg.startMin * 60000 + lenMin * 60000 };
+        },
+
+        inWindow(ts) {
+            const t = Number(ts) || Date.now();
+            if (this.winCfg().allDay) return true;
+            /* 看昨天/今天/明天三个窗口，跨零点的时段也能正确判断 */
+            for (const d of [-1, 0, 1]) {
+                const w = this.windowOfDay(t + d * 86400000);
+                if (w && t >= w.start && t < w.end) return true;
+            }
+            return false;
+        },
+
+        /* 把时刻对齐进运行窗口：窗口内原样返回，窗口外推到下一段窗口的起点 */
+        alignToWindow(ts) {
+            const t = Number(ts) || Date.now();
+            if (this.winCfg().allDay) return t;
+            if (this.inWindow(t)) return t;
+            for (let d = 0; d <= 2; d++) {
+                const w = this.windowOfDay(t + d * 86400000);
+                if (w && w.start > t) return w.start;
+            }
+            return t;
+        },
+        /* 随机延长上限（毫秒）。固定在脚本内部，不再暴露成用户配置 ——
+           这个值调大调小对结果没什么意义，让用户填反而增加困惑。 */
+        jitterMs() { return CRON_JITTER; },
 
         /* 摇一次本轮的随机延长量，只在下单时调用（不能放进 plan） */
         rollJitter() {
@@ -8268,7 +8386,7 @@ const __scBgKeepAlive = (function() {
                     && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
                 if (!stopped && now >= next && !this.getClaim()) {
                     this.fire(now);
-                } else if (now - this.lastHbLog >= (stopped ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
+                } else if (now - this.lastHbLog >= ((stopped || !this.inWindow(now)) ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
                     this.lastHbLog = now;
                     GM_setValue("Config.heartbeatAt", now);
                     const st = this.getState() || {};
@@ -8277,7 +8395,10 @@ const __scBgKeepAlive = (function() {
                         ? "，今日任务已全部完成、检测已停止，明天自动恢复"
                         : this.isBusy(now)
                             ? `，本轮正在执行中（最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前）`
-                            : this.getClaim() ? "，本轮已触发，正在等它跑起来" : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`;
+                            : this.getClaim() ? "，本轮已触发，正在等它跑起来"
+                            : (!this.inWindow(now)
+                                ? `，当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），${this.fmt(next)} 开始`
+                                : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`);
                     Utils.log("💓", `常驻调度心跳：后台实例已存活 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
                 }
             } catch (e) {
@@ -8387,6 +8508,19 @@ const __scBgKeepAlive = (function() {
             Sched.finish(false);
             return;
         }
+
+        /* 打开页面/重启浏览器时不要立刻就跑：先看是否在运行时段内。
+           窗口外只登记一个「等待窗口开启」的状态，到点由常驻调度拉起来，
+           这样半夜开电脑也不会因为「刚打开页面」而触发一轮任务。 */
+        if (!Sched.inWindow(Date.now())) {
+            const next = Sched.plan(Date.now());
+            const cfg = Sched.winCfg();
+            const span = cfg.allDay ? "全天不限" : `${Sched.fmtHM(cfg.startMin)}~${Sched.fmtHM(cfg.endMin)}`;
+            Utils.log("🌙", `当前不在运行时段（${span}），已排到 ${Sched.fmt(next)} 开始，窗口外不会跑任务`);
+            Sched.state("waiting", { runAt: next, inWindow: false });
+            return;
+        }
+
         const delay = Utils.randomRange(3000, 12000);
         Utils.log("⏳", `${(delay / 1000).toFixed(1)} 秒后启动...`);
         Sched.state("waiting", { runAt: Date.now() + delay });
@@ -8456,6 +8590,11 @@ const __scBgKeepAlive = (function() {
         const phaseText = { claimed: "已触发，等待执行", waiting: "等待延时结束", running: "正在执行", done: "上一轮已完成", idle: "空闲" };
         const lastAct = st ? Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0) : 0;
         let text = "🕒 常驻调度状态\n\n";
+        const wcfg = Sched.winCfg();
+        text += `运行时段：${wcfg.allDay
+            ? "全天不限（开始=结束，已关闭时段限制）"
+            : `${Sched.fmtHM(wcfg.startMin)}~${Sched.fmtHM(wcfg.endMin)}，每天 ${Sched.fmtHM(wcfg.startMin)} 开始`}\n`;
+        text += `当前状态：${Sched.inWindow(now) ? "✅ 在运行时段内" : "🌙 时段外，窗口内不会开新的一轮"}\n`;
         text += `调度间隔：${CRON_PERIOD / 60000} 分钟 + 随机 ${Math.round(Sched.jitterMs() / 60000)} 分钟（范围 ${CRON_PERIOD / 60000}~${(CRON_PERIOD + Sched.jitterMs()) / 60000} 分钟）\n`;
         text += `最近结束：${Sched.fmt(last)}\n`;
         text += `下次触发：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
