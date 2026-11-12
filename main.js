@@ -6515,38 +6515,83 @@ const __scBgKeepAlive = (function() {
 
             /* 最终判据：面板回读。
                交卷响应「不是 JSON」时服务端也可能已经记账（尤其是被网关改写成
-               HTML 的情况下），所以这里以面板的 complete 标记为准，而不是响应体。 */
+               HTML 的情况下），所以这里以面板的 complete 标记为准，而不是响应体。
+
+               重要：服务端对 reportactivity 的入账是**异步**的，而且连打会被
+               短暂降速 —— 现象就是回了 ErrorCode=0 但 OfferComplete 还是 false，
+               过一会儿再看却是完成的。所以复核一次不够，要「复核 → 补做 → 再复核」。 */
             let gained = 0;
             let confirmed = 0;
-            try {
-                await Utils.delay(2500);
+            const readBack = async () => {
                 let after = await this.fetchPanel(panel.host);
                 if (!after) {
                     await Utils.delay(4000);
                     after = await this.fetchPanel(panel.host);
                 }
-                if (after) {
-                    const nowCards = this.pickCards(after);
-                    confirmed = nowCards.filter(c => c.complete).length;
-                    for (const c of nowCards) if (c.complete) doneIds.add(c.offerId);
-                    gained = after.balance - balanceBefore;
-                    const newlyAcked = nowCards.filter(c => c.complete && todo.some(t => t.offerId === c.offerId)).length;
-                    if (newlyAcked > 0) {
-                        ok = Math.max(ok, newlyAcked);
+                if (!after) return null;
+                const nowCards = this.pickCards(after);
+                for (const c of nowCards) if (c.complete) doneIds.add(c.offerId);
+                gained = Math.max(gained, after.balance - balanceBefore);
+                return { cards: nowCards, confirmed: nowCards.filter(c => c.complete).length, balance: after.balance };
+            };
+
+            try {
+                await Utils.delay(2500);
+                const first = await readBack();
+                if (first) {
+                    confirmed = first.confirmed;
+                    const newlyAcked = first.cards.filter(c => c.complete
+                        && todo.some(t => t.offerId === c.offerId)).length;
+                    if (newlyAcked > 0) ok = Math.max(ok, newlyAcked);
+                }
+
+                /* 补做轮：还有没记账的，隔一个节拍再来一次。
+                   最多再补 2 轮，且必须在一轮的截止时间之内 —— 不硬挤、不无限重试。 */
+                const MAX_EXTRA_PASSES = 2;
+                for (let pass = 1; pass <= MAX_EXTRA_PASSES; pass++) {
+                    let still = cards.filter(c => !doneIds.has(c.offerId));
+                    if (still.length === 0) break;
+                    if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) {
+                        Utils.log("🟡", `国际版每日活动到点：还剩 ${still.length} 张，交给下一轮`);
+                        break;
                     }
-                    if (gained > 0) {
-                        Utils.log("🌍", `国际版每日活动复核：${confirmed}/${cards.length} 张已记账（余额 ${balanceBefore} → ${after.balance}，+${gained}）`);
-                    } else if (confirmed > 0) {
-                        Utils.log("  ", `国际版每日活动复核：${confirmed}/${cards.length} 张已完成`);
+                    Utils.log("  ", `国际版补做第 ${pass} 轮：${still.length} 张未记账，${Math.round(pacer ? pacer.minMs() / 1000 : 60)} 秒后重试`);
+                    if (pacer) await pacer.beat(beatGap);
+                    else await Utils.randomDelay(30000, 45000);
+                    /* 补做轮自己的预算：最多再花 3 分钟 / 5 次交卷，
+                       免得把本轮的「领取积分 / 二次扫描」挤掉。 */
+                    const passDeadline = Date.now() + 3 * 60 * 1000;
+                    let sent = 0;
+                    for (const card of still) {
+                        if (Date.now() > passDeadline || sent >= 5) {
+                            Utils.log("  ", "国际版补做轮预算用完，剩余交给下一轮");
+                            break;
+                        }
+                        if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) break;
+                        const name = card.title || card.offerId;
+                        sent++;
+                        const last = await this.report(panel, card);
+                        if (last && last.ok) {
+                            ok++;
+                            doneIds.add(card.offerId);
+                            Utils.log("🟢", `国际版卡片补做成功：${name} +${card.points}p`);
+                        }
+                        if (pacer) await pacer.beat(beatGap);
                     }
+                    await Utils.delay(2500);
+                    const again = await readBack();
+                    if (again) confirmed = again.confirmed;
                 }
             } catch (_) {}
 
             const pending = cards.filter(c => !doneIds.has(c.offerId)).length;
             if (pending === 0) {
-                Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`);
-            } else if (!gained && ok === 0) {
-                Utils.log("🟡", `国际版每日活动本轮未完成：${lastReason || "交卷未被受理"}（下一轮继续）`);
+                Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`
+                    + (gained > 0 ? `（余额 +${gained}）` : ""));
+            } else {
+                const names = cards.filter(c => !doneIds.has(c.offerId)).map(c => c.title || c.day).join("、");
+                Utils.log("🟡", `国际版每日活动还差 ${pending} 张：${names}`
+                    + `（${lastReason || "服务端本次未记账"}，下一轮继续）`);
             }
             return {
                 found: cards.length,
