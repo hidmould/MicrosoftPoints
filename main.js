@@ -712,6 +712,8 @@ const __scBgKeepAlive = (function() {
         },
 
         xhrFull(options) {
+            /* options.cookie === false 在本函数里是「别自己拼 cookie 头」的语义：
+               GM_xmlhttpRequest 原生就会带浏览器 cookie，这里只需不额外设置。 */
             return new Promise((resolve, reject) => {
                 const start = Date.now();
                 /* 同 xhr()：后台被冻结时回调不会来，用计时器保证一定会 settle */
@@ -728,7 +730,7 @@ const __scBgKeepAlive = (function() {
                     finish(reject, new Error(`请求无响应（${Math.round(softMs / 1000)} 秒未回调），已放弃`));
                 }, softMs);
                 GM_xmlhttpRequest({
-                    ...options,
+                    ...(({ cookie, ...rest }) => rest)(options || {}),
                     timeout: Number(options && options.timeout) || 15000,
                     /* 只有显式要了 manual 才接管重定向；默认仍由 GM 跟随，保持旧行为。 */
                     ...(options && options.redirect === "manual" ? { redirect: "manual" } : {}),
@@ -768,7 +770,10 @@ const __scBgKeepAlive = (function() {
                 const hdr = Object.assign({}, (options && options.headers) || {});
                 const needCookie = /(^|\.)(bing\.com|live\.com|microsoft\.com|microsoftonline\.com)\//i.test(url);
                 const hasCookie = Object.keys(hdr).some(k => k.toLowerCase() === "cookie");
-                if (needCookie && !hasCookie && this._ckReady) {
+                /* options.cookie === false：不要手工拼 cookie 头，交给 GM 自己带浏览器 cookie。
+                   GM_xmlhttpRequest 默认就带 cookie，而手工拼的那份是「部分 cookie」，
+                   一旦显式设置就会整体覆盖真实登录态（服务端因此 301 要求重放）。 */
+                if (needCookie && !hasCookie && options.cookie !== false && this._ckReady) {
                     const ck = this._ckReady();
                     if (ck) hdr["cookie"] = ck;
                 }
@@ -6316,21 +6321,35 @@ const __scBgKeepAlive = (function() {
             /* 面板自己用的是 XHR，且没显式设 content-type（默认 text/plain）。
                扩展后台发出的请求和页面同源请求特征不一样，这里把「带不带 Origin」
                也作为一维来试 —— 有些网关看到扩展源的 Origin 就直接 302 到登录页。 */
+            /* 通道排序按「实测成功率」：
+               ① native：不手工拼 cookie，用浏览器自己的 cookie jar —— 登录态最完整
+               ② plain+origin：实测能过（Origin/Referer 与面板一致）
+               余下几条是兜底。 */
+            const origin = `https://${panel.host}`;
             const variants = [
-                { name: "plain", headers: { ...base, "content-type": "text/plain;charset=UTF-8" } },
-                { name: "plain+origin", headers: { ...base, "content-type": "text/plain;charset=UTF-8", "origin": `https://${panel.host}` } },
-                { name: "json", headers: { ...base, "content-type": "application/json" } },
-                { name: "json+origin", headers: { ...base, "content-type": "application/json", "origin": `https://${panel.host}` } },
-                { name: "form", headers: { ...base, "content-type": "application/x-www-form-urlencoded" }, data: new URLSearchParams(body).toString() }
+                { name: "native", cookie: false, headers: { ...base, "content-type": "text/plain;charset=UTF-8", "origin": origin } },
+                { name: "plain+origin", headers: { ...base, "content-type": "text/plain;charset=UTF-8", "origin": origin } },
+                { name: "native+json", cookie: false, headers: { ...base, "content-type": "application/json", "origin": origin } },
+                { name: "json+origin", headers: { ...base, "content-type": "application/json", "origin": origin } },
+                { name: "form", headers: { ...base, "content-type": "application/x-www-form-urlencoded", "origin": origin }, data: new URLSearchParams(body).toString() }
             ];
 
             const reasons = [];
             /* 三种结局，必须分清楚：
                  accepted  服务端明确回了 ErrorCode=0 且没被跳走 —— 可以去复核
                  rejected  服务端明确报错（ErrorCode≠0）
-                 unknown   通道层失败（HTML/302/网络）—— 只有它能解释之前
-                           「响应不是 JSON」的现象，也说明该换通道而不是放弃 */
+                 unknown   通道层失败（HTML/301/网络），该换通道 */
             let outcome = "unknown";
+            /* 同一 URL 的 301 是服务端在下发 Cookie 后让你重放一次（面板自己也会这样
+               被浏览器自动跟随）。GM 层跟随不了，就手动重放一次，别把它当失败换形态。 */
+            const isSelfRedirect = (loc) => {
+                if (!loc) return false;
+                try {
+                    const a = new URL(loc);
+                    const b = new URL(url);
+                    return a.host === b.host && a.pathname === b.pathname;
+                } catch (_) { return false; }
+            };
             for (const v of variants) {
                 let res = null;
                 try {
@@ -6343,15 +6362,36 @@ const __scBgKeepAlive = (function() {
                         headers: v.headers,
                         data: v.data || payload,
                         timeout: 20000,
-                        redirect: "manual"
+                        redirect: "manual",
+                        ...(v.cookie === false ? { cookie: false } : {})
                     });
                 } catch (e) {
                     reasons.push(`${v.name}: ${e.message}`);
                     continue;
                 }
-                const status = Number(res && res.status) || 0;
-                const text = String((res && res.text) || "");
-                const location = String((res && res.location) || "");
+                let status = Number(res && res.status) || 0;
+                let text = String((res && res.text) || "");
+                let location = String((res && res.location) || "");
+                /* 同址 301：重放一次（这次 Cookie 已经在了） */
+                if (status >= 300 && status < 400 && isSelfRedirect(location)) {
+                    try {
+                        const again = await Utils.xhrFull({
+                            method: "POST",
+                            url,
+                            headers: v.headers,
+                            data: v.data || payload,
+                            timeout: 20000,
+                            redirect: "manual",
+                            ...(v.cookie === false ? { cookie: false } : {})
+                        });
+                        status = Number(again && again.status) || 0;
+                        text = String((again && again.text) || "");
+                        location = String((again && again.location) || "");
+                    } catch (e) {
+                        reasons.push(`${v.name}: 重放失败 ${e.message}`);
+                        continue;
+                    }
+                }
                 if (status >= 300 && status < 400) {
                     reasons.push(`${v.name}: HTTP ${status} 被重定向${location ? `→${location.slice(0, 70)}` : ""}`);
                     continue;
@@ -6437,6 +6477,10 @@ const __scBgKeepAlive = (function() {
             const balanceBefore = panel.balance;
             let ok = 0;
             let lastReason = "";
+            /* 日志口径：一张卡只打最终结论一行。
+               中间的重试原因全部攒起来，只在「最终真的没成」时合并成一行 ——
+               之前一张卡失败能刷 6 行（每种形态各一行），完全没法看。 */
+            const failed = [];
             for (const card of todo) {
                 const name = card.title || card.offerId;
                 let last = null;
@@ -6444,22 +6488,24 @@ const __scBgKeepAlive = (function() {
                     last = await this.report(panel, card);
                     if (last.ok) break;
                     lastReason = last.reason || "未知原因";
-                    Utils.log("🟡", `国际版卡片交卷未受理（第 ${attempt} 次）：${name} → ${lastReason}`);
                     if (attempt < this.MAX_ATTEMPTS) await Utils.randomDelay(2500, 5000);
                 }
                 if (last && last.ok) {
                     ok++;
                     doneIds.add(card.offerId);
-                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p` + (last.via ? `（${last.via} 通道）` : ""));
+                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p`);
                 } else if (last && last.outcome === "accepted") {
-                    /* 服务端明确收了但说「这次没算上」：多半是这张卡今天已经做过了。
-                       这种不该报错，也不该反复重试。 */
-                    Utils.log("  ", `国际版卡片服务端已受理，未新增记账：${name}`);
+                    /* 服务端收了但没新增记账：通常这张卡今天已经做过，不吵 */
+                    Utils.log("  ", `国际版卡片已受理（未新增记账）：${name}`);
                 } else {
-                    Utils.log("🟠", `国际版卡片交卷未被受理：${name}（原因：${lastReason}）`);
+                    failed.push({ name, reason: lastReason });
                 }
-                /* 每张之间留一点间隔：面板接口连续打容易被判异常 */
                 if (todo.length > 1) await Utils.randomDelay(1500, 3000);
+            }
+            if (failed.length > 0) {
+                Utils.log("🟠", `国际版卡片交卷未受理 ${failed.length} 张：`
+                    + failed.map(f => f.name).join("、")
+                    + `（${String(failed[0].reason).split("；")[0]}）`);
             }
 
             /* 最终判据：面板回读。
@@ -6501,7 +6547,9 @@ const __scBgKeepAlive = (function() {
                 found: cards.length,
                 done: cards.length - pending,
                 pending,
-                points: (gained > 0 ? gained : ok * (cards[0].points || 5))
+                points: (gained > 0 ? gained : ok * (cards[0].points || 5)),
+                /* 汇总里要能说清「为什么还差」：只取第一句原因，别把 5 条通道全塞进去 */
+                reason: pending === 0 ? "" : String(lastReason || "").split("；")[0].slice(0, 60)
             };
         }
     };
@@ -7678,6 +7726,7 @@ const __scBgKeepAlive = (function() {
             RewardsAuto.state.intlFound = res.found;
             RewardsAuto.state.intlDone = res.done;
             RewardsAuto.state.intlPending = res.pending;
+            RewardsAuto.state.intlReason = res.reason || "";
             return res.pending === 0;
         },
 
@@ -8069,17 +8118,31 @@ const __scBgKeepAlive = (function() {
 
                     /* 标题不带图标：推送图标由 Utils.log 第一参数统一加，
                        否则会拼成「🎉 🎉 今日任务已全部完成！」 */
+                    /* 国际版每日活动是「额外加分」项，不进 goals 分母，
+                       但它没做完时标题就不该说「已完成」，否则表格自相矛盾
+                       （曾出现「达标 6/6 + 今日任务已完成 + 🌍 3/5 ⏳」）。 */
+                    const intlShort = intlOn && intlFound > 0
+                        && (Number(RewardsAuto.state.intlDone) || 0) < intlFound;
+                    if (intlShort) {
+                        const why = String(RewardsAuto.state.intlReason || "").trim();
+                        blocked.push(`🌍 国际版每日活动 ${Number(RewardsAuto.state.intlDone) || 0}/${intlFound} 张`
+                            + (why ? `（${why}）` : "（下一轮继续）"));
+                    }
                     const head = allDone
                         ? (blocked.length > 0
-                            ? "今日任务已完成"
+                            ? (intlShort ? "今日主要任务已完成（国际版还差一点）" : "今日任务已完成")
                             : "今日任务已全部完成！")
                         : "本轮结果 · 还差 " + (goals.length - doneCount) + " 项";
                     let logMsg = head + "\n\n" + rows.join("\n")
                         + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
                     if (blocked.length > 0) {
                         logMsg += "\n\n⏳ 受限制未完成：\n"
-                            + blocked.map(s => "· " + s).join("\n")
-                            + "\n💡 上面三项要自动完成，需用 Chrome 浏览器运行脚本";
+                            + blocked.map(s => "· " + s).join("\n");
+                        /* 只有「需要 Chrome / CDP」的那几条才提浏览器；国际版不在此列 */
+                        const needChrome = (desktopOn && (desktopPending > 0 || desktopFailed > 0)) || claimPending;
+                        if (needChrome) {
+                            logMsg += "\n💡 「桌面专属任务 / 首页待领取」需要 Chrome，或按第三节配好 CDP";
+                        }
                     }
 
                     /* 通知策略：常规任务全达标才推一条汇总；中间轮次只写日志。
@@ -8296,21 +8359,12 @@ const __scBgKeepAlive = (function() {
         /* 通道自检：报告每条交卷通道的真实状态。
            「响应不是 JSON」这类现象没有这一段就永远查不清 —— 是 302、是游客响应、
            还是页面代发服务不在线，必须分开说。 */
-        text += "\n\n交卷通道：";
         const pageAlive = typeof API !== "undefined" && API._pageChannelAlive && API._pageChannelAlive();
+        text += `\n\n交卷通道：`;
         text += `\n  · 扩展后台 xhr：可用（GM_xmlhttpRequest）`;
         text += `\n  · 页面代发：${pageAlive ? "✅ 在线" : "❌ 不在线（在 bing.com 页面上跑一次脚本后可用）"}`;
-        if (pending.length > 0) {
-            const probe = await IntlDaily.report(panel, pending[0]);
-            if (probe && probe.ok) {
-                text += `\n\n自检结果：✅ 交卷成功（${probe.via || "?"} 通道，余额 ${probe.balance}）`;
-            } else {
-                text += `\n\n自检结果：⚠️ 交卷未直接受理\n  原因：${(probe && probe.reason) || "未知"}`;
-                text += `\n  （若服务端其实已记账，上面列表会显示 ✅；以列表为准）`;
-            }
-        }
 
-        text += `\n\n待完成：${pending.length} 张` + (pending.length ? "，现在开始逐张交卷…" : "（今日已全部完成）");
+        text += `\n\n待完成：${pending.length} 张` + (pending.length ? "，点确定后开始逐张交卷" : "（今日已全部完成）");
         Utils.uiAlert(text);
         if (pending.length === 0) return text;
         if (!Utils.acquireLock("Config.runLock", 10 * 60 * 1000)) {
