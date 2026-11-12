@@ -6214,6 +6214,13 @@ const __scBgKeepAlive = (function() {
                 const done = p.complete === true
                     || String(attr.complete).toLowerCase() === "true"
                     || panel.completeById.get(offerId) === true;
+                const destination = String(attr.destination || "");
+                /* 「Do you know the answer?」这类是**交互式 Quiz**，不是普通 redirect：
+                   落地页里有个真题目，必须点掉答案，页面才会带着
+                   WQOskey/WQId/WQQI 这些参数去打 rewardsapp/reportActivity 记账。
+                   实测：只调面板的 msrewards/reportactivity 对它是无效的。 */
+                const isQuiz = /Homepage%20quiz|BingQA_Quiz|form=ML2BF1/i.test(destination)
+                    || /do you know the answer/i.test(String(attr.title || p.title || ""));
                 seen.set(offerId, {
                     offerId,
                     name,
@@ -6223,10 +6230,162 @@ const __scBgKeepAlive = (function() {
                     hash: p.hash,
                     points: Number(p.pointProgressMax || attr.max || 5) || 5,
                     complete: done,
-                    destination: attr.destination || ""
+                    destination,
+                    isQuiz
                 });
             }
             return [...seen.values()];
+        },
+
+        /* ── 交互式 Quiz（「Do you know the answer?」）专用通道 ──────────────
+           这类卡和拼图/每日一句不是一回事：
+             · 拼图 / 每日一句：面板 reportactivity 一发就记账
+             · Quiz：必须真的打开落地页、点掉那道题，页面才会带着
+               WQOskey / WQId / WQQI 去打 rewardsapp/reportActivity
+           实测（2026-11 cn.bing.com）：
+             只调 msrewards/reportactivity  → 卡永远不完成
+             打开落地页 + 点正确选项        → 页面自己发 reportActivity，记账
+           所以这里按「取题 → 作答 → 用同样的参数上报」复刻整条链路。 */
+
+        /* 把落地页 URL 里的 filters 参数解析成键值（面板下发的是转义过的串） */
+        _parseQuizFilters(destination) {
+            const out = {};
+            try {
+                const u = new URL(destination);
+                const raw = u.searchParams.get("filters") || "";
+                const decoded = decodeURIComponent(raw.replace(/\+/g, " "));
+                for (const m of decoded.matchAll(/([A-Za-z_]+)\s*:\s*"([^"]*)"/g)) out[m[1]] = m[2];
+                if (out.WQOskey) out.__q = u.searchParams.get("q") || "";
+            } catch (_) {}
+            return out;
+        },
+
+        /* 打开落地页，取出题目与正确选项（页面内联 JS 里直接带 isCorrect） */
+        async _fetchQuizPuzzle(host, destination) {
+            const url = String(destination || "").replace(/^https?:\/\/www\.bing\.com/i, `https://${host}`);
+            let html = "";
+            try {
+                html = await Utils.xhr({
+                    url,
+                    headers: {
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": `https://${host}/`
+                    },
+                    timeout: 20000
+                });
+            } catch (e) {
+                return { ok: false, reason: `落地页打开失败：${e.message}` };
+            }
+            const text = String(html || "");
+            /* QuizQuestionPane.init( answerId, questionId, 题干, choices, recordUrl )
+               注意：选项数组是**变量**（var choices = [...]），写在 init 之前，
+               所以要取 init 之前的一段来找 isCorrect。 */
+            const initIdx = text.indexOf("QuizQuestionPane.init(");
+            if (initIdx < 0) return { ok: false, reason: "落地页里没有找到 Quiz 题组" };
+            const seg = text.slice(Math.max(0, initIdx - 3000), initIdx + 1200);
+            /* 正确选项：isCorrect: "true" 那一项的 id */
+            const choices = [...seg.matchAll(/\{\s*id:\s*"([^"]*)",\s*isCorrect:\s*"([^"]*)",\s*text:\s*"([^"]*)"\s*\}/g)]
+                .map(m => ({ id: m[1], correct: m[2] === "true", text: m[3] }));
+            const correct = choices.find(c => c.correct);
+            /* 前两个 init 参数分别是答案 id 与题目 id */
+            const initSeg = text.slice(initIdx, initIdx + 1200);
+            const ids = initSeg.match(/init\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,/);
+            const recordUrl = (initSeg.match(/"(https:[^"]*funapi\/api\/quiz\/record[^"]*)"/) || [])[1] || "";
+            const questionText = (initSeg.match(/init\(\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"/) || [])[1] || "";
+            if (!correct) return { ok: false, reason: "没有找到正确选项" };
+            /* quizId：卡片自身的 destination 里没有 filters，得从落地页 HTML 里抽
+               （形如 HPQuiz_20261112_NorthWindow）。取第一个即可 —— 那正是本页的题组。 */
+            const quizId = (text.match(/HPQuiz_\d+_[A-Za-z0-9]+/) || [])[0] || "";
+            return {
+                ok: true,
+                url,
+                answerId: correct.id,
+                questionId: ids ? ids[2] : "0",
+                questionText,
+                recordUrl,
+                quizId,
+                choiceCount: choices.length
+            };
+        },
+
+        /* 作答：先调 quiz/record 记录，再带 quiz 参数打 rewardsapp/reportActivity */
+        async _solveQuiz(host, destination) {
+            const puzzle = await this._fetchQuizPuzzle(host, destination);
+            if (!puzzle.ok) return { ok: false, reason: puzzle.reason };
+
+            /* destination 本身不带 filters，所以这里自己拼一份「点击选项后」的 filters：
+               面板/页面点击时发的就是这个结构，WQOskey 是题组 ID。 */
+            const own = this._parseQuizFilters(puzzle.url);
+            const quizId = puzzle.quizId || own.WQOskey || "";
+            const q = own.__q || "";
+            const filtersDecoded = [
+                'mgzv3configlist:"BingQA_Quiz_layout"',
+                'dw_answerstobesuppressed:"ConversationalSearch"',
+                'IsConversation:"True"',
+                quizId ? `WQOskey:"${quizId}"` : "",
+                'WQId:"1"',
+                'WQQI:"0"',
+                'WQCI:"0"',
+                'ShowTimesTaskPaneTrigger:"false"',
+                'WQSCORE:"1"'
+            ].filter(Boolean).join(" ");
+
+            /* ① 记录这次作答（页面点击选项时发的就是它） */
+            if (puzzle.recordUrl) {
+                try {
+                    await Utils.xhr({
+                        method: "POST",
+                        url: puzzle.recordUrl,
+                        headers: {
+                            "content-type": "application/json; charset=utf-8",
+                            "accept": "*/*",
+                            "user-agent": RewardsAuto.ua.pc,
+                            "referer": puzzle.url
+                        },
+                        data: JSON.stringify({
+                            q,
+                            filters: filtersDecoded,
+                            answerId: puzzle.answerId,
+                            questionId: puzzle.questionId,
+                            quizId,
+                            correctAnswer: puzzle.answerId
+                        }),
+                        timeout: 20000
+                    });
+                } catch (_) { /* 记录失败不致命，下面还有 reportActivity */ }
+            }
+
+            /* ② 带 quiz 参数打 reportActivity —— 这才是记账那一步 */
+            const params = new URLSearchParams();
+            params.set("q", q);
+            params.set("filters", filtersDecoded);
+            const reportUrl = `https://${host}/rewardsapp/reportActivity?${params.toString()}`;
+            let text = "";
+            try {
+                text = await Utils.xhr({
+                    method: "POST",
+                    url: reportUrl,
+                    headers: {
+                        "content-type": "application/x-www-form-urlencoded",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": puzzle.url
+                    },
+                    data: `url=${encodeURIComponent(puzzle.url)}&V=web`,
+                    timeout: 20000
+                });
+            } catch (e) {
+                return { ok: false, reason: `reportActivity 失败：${e.message}` };
+            }
+            const authed = /"IsAuthenticated":true/.test(String(text || ""));
+            const increment = (String(text || "").match(/"RewardsIncrement":(\d+)/) || [])[1];
+            return {
+                ok: authed && Number(increment) > 0,
+                isAuthenticated: authed,
+                increment: Number(increment) || 0,
+                reason: authed ? "" : "reportActivity 未识别登录态"
+            };
         },
 
         /* 从任意响应里尽力读出「余额 / 是否有错」。
@@ -6269,6 +6428,17 @@ const __scBgKeepAlive = (function() {
                 这是唯一能保证 Origin/Referer 与面板完全一致的通道。
            三通道都失败时由调用方用「面板回读」定胜负，不在这里硬判死。 */
         async report(panel, card) {
+            /* Quiz 卡走专用通道：面板 reportactivity 对它无效（实测），
+               必须真打开落地页作答 + 带 quiz 参数打 rewardsapp/reportActivity。 */
+            if (card.isQuiz && card.destination) {
+                const r = await this._solveQuiz(panel.host, card.destination);
+                if (r.ok) {
+                    return { ok: true, via: "quiz", points: card.points, balance: 0 };
+                }
+                /* Quiz 失败就不要再退回面板通道了：那条路对它本来就不通，
+                   继续试只会多打几次请求。直接把原因交给上层。 */
+                return { ok: false, outcome: "unknown", reason: `quiz: ${r.reason}` };
+            }
             const body = {
                 ActivityType: card.activityType,
                 ActivitySubType: "",
