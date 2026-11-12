@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动（面板 5 张卡·纯接口）、✅出口检测（非大陆 IP 直接停手）
+// @version      1.5.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -104,23 +104,23 @@ Tasks:
         type: checkbox
         default: true
     edge:
-        title: Edge 浏览连签（后台分次上报，累计 30 分钟）
+        title: Edge 浏览连签
         type: checkbox
         default: true
     desktopWeekly:
-        title: 桌面应用每周专属任务（每轮检测，按星期逐日解锁）
+        title: 桌面应用每周专属任务
         type: checkbox
         default: true
     monthly:
-        title: 月度计划（月度 punchcard，子项解锁后自动完成）
+        title: 月度计划
         type: checkbox
         default: true
     claimPoints:
-        title: 自动领取待领积分（搜索打卡/每日活动的奖励需点一次才入账）
+        title: 自动领取待领积分
         type: checkbox
         default: true
     intlDaily:
-        title: 国际版每日活动（面板 5 张卡 × 5 分，不勾选则完全不做）
+        title: 国际版每日活动
         type: checkbox
         default: true
 Notice:
@@ -6090,34 +6090,6 @@ const __scBgKeepAlive = (function() {
         },
     };
 
-    /* ══════════════════════════════════════════════════════════════════
-       IntlDaily：必应「奖励面板」里的国际版每日活动
-
-       红框里那 5 张卡（拼图 ×2 / 问答 ×2 / 每日一句）不属于 DailySet，
-       也不走 rewards.bing.com 的 Server Action —— 它们是 bing.com 面板的
-       「urlreward」型 offer，offerId 形如
-           ENstar_Rewards_DailyGlobalOffer_Evergreen_<星期>
-
-       注意：offerId 里的星期名**不是**「今天只做这一张」的排期，而是这组
-       常青活动的固定编号。实测同一天把 5 张全部交卷，5 张全部记账
-       （余额 55874 → 55899，+25），所以这里不做星期过滤，5 张都做。
-
-       唯一记账通道是面板自己的接口：
-
-           POST {bing主机}/msrewards/api/v1/reportactivity
-           {"ActivityType":"bingredirect","OfferId":…,"Channel":"BingFlyout",
-            "PartnerId":"BingRewards","UserId":…,"AuthKey":<hash>,"ActivityCount":1}
-
-       hash / UserId / Channel 都从同一个面板的数据里取：
-           GET {bing主机}/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards
-         · flyoutResult.morePromotions[]        → 卡片本体（带 hash）
-         · userInfo.promotions[]                → 同一批卡的 attributes.complete（不带 hash）
-         · 顶层 channel / userId / partnerId    → 请求体字段
-
-       实测（2026-11 国内 cn.bing.com）：这 5 张卡连落地页都不用真刷，
-       直接带 hash 调一次 reportactivity 就记账，所以整条链路都是后台请求，
-       既不开标签页、也不碰 CDP —— 这正是它和「每日活动」最大的区别。
-       ══════════════════════════════════════════════════════════════════ */
     const IntlDaily = {
         PATH: "/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards",
         REPORT_PATH: "/msrewards/api/v1/reportactivity",
@@ -6184,11 +6156,7 @@ const __scBgKeepAlive = (function() {
                 if (Array.isArray(v)) v.forEach(push);
                 else if (v && typeof v === "object") Object.values(v).forEach(x => Array.isArray(x) ? x.forEach(push) : push(x));
             }
-            /* 身份字段三件套：Channel / PartnerId / UserId。
-               实测缺任何一个（或值不对）服务端都会回「游客」响应
-               （IsRewardsUser=false、Balance=0、OfferComplete=false）——
-               那在旧代码里会被误读成「响应不是 JSON / 卡片没完成」。
-               所以这里除了取值，还要在取不到时换字段名再找一遍。 */
+
             const pickStr = (...vals) => {
                 for (const v of vals) {
                     const t = String(v == null ? "" : v).trim();
