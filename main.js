@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.0
+// @version      1.4.2
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -59,10 +59,10 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 动作最小间隔（秒，搜索/阅读/卡片共用，脚本只会更慢不会更快）
+        title: 搜索间隔（秒，最低 60，搜索/阅读/卡片共用；实际会在 ±15 秒内浮动）
         type: number
-        default: 30
-        min: 30
+        default: 60
+        min: 60
         max: 180
         unit: 秒
     jitter:
@@ -6319,19 +6319,18 @@ const __scBgKeepAlive = (function() {
     const ROUND_BUDGET_MS = 20 * 60 * 1000;
 
     const SEARCH_PACER = {
-        /* 节拍口径：以 Config.span（默认 30 秒）为基准，每次在 ±JITTER_MS 范围内
+        /* 节拍口径：以 Config.span（默认 60 秒）为基准，每次在 ±JITTER_MS 范围内
            随机取一个值，做完一次搜索后按「本次已用掉多少」补齐差额，
-           使「搜索→搜索」的间隔稳定落在 span±10 秒。
+           使「搜索→搜索」的间隔稳定落在 span±15 秒。
 
-           早期版本是「没记账就退让」：×1.5 一路涨到 180 秒，再叠 35% 抖动和
-           每 5 次 20~60 秒惩罚，单次最坏 303 秒；后来压到 ×1.2 / 100 秒封顶，
-           但行为没变 —— 一次比一次大。这跟「我配了 30 秒就该是 30 秒」的预期
-           相悖，所以退让机制整个去掉：间隔恒等于配置值，只保留随机抖动。
-           限流保护不再靠拖慢，而是靠下面两条刹车：
+           30 秒已经被实测证明偏快（记账跟不上、也更容易被盯），所以下限抬到
+           1 分钟：MIN_MS 是硬下限，任何配置值都不会低于它；±15 秒的浮动同样
+           以 MIN_MS 为地板，所以最快也就是 60 秒，不会出现 50 秒的间隔。
+           限流保护不靠拖慢，而是靠下面两条刹车：
              NO_CREDIT_LIMIT（连续 10 分钟没记账就本轮收手）
              MAX_ATTEMPTS（单轮最多尝试次数） */
-        MIN_MS: 30 * 1000,
-        JITTER_MS: 10 * 1000,
+        MIN_MS: 60 * 1000,
+        JITTER_MS: 15 * 1000,
         OBSERVE_MIN: 5 * 1000,
         OBSERVE_MAX: 10 * 1000,
         VERIFY_MIN: 5 * 1000,
@@ -6342,10 +6341,12 @@ const __scBgKeepAlive = (function() {
         RETRY_GAP: 5 * 60 * 1000,
 
         /* 用户配置的间隔基准。上限留 180 秒（与 Config.span 的 max 一致），
-           下限 MIN_MS（30 秒）—— 再快会明显增加被限流的概率。 */
+           下限 MIN_MS（60 秒）—— 再快会明显增加被限流的概率，实测 30 秒确实偏快。
+           存量的 Config.span=30 也会被这里夹到 60，不需要用户手动改设置。 */
         spanMs() {
-            const span = Number(GM_getValue("Config.span", 30)) || 30;
-            return Math.min(180 * 1000, Math.max(this.MIN_MS, Math.max(30, span) * 1000));
+            const span = Number(GM_getValue("Config.span", 60)) || 60;
+            const minSec = this.MIN_MS / 1000;
+            return Math.min(180 * 1000, Math.max(this.MIN_MS, Math.max(minSec, span) * 1000));
         },
 
         minMs() { return this.spanMs(); },
@@ -6355,11 +6356,14 @@ const __scBgKeepAlive = (function() {
         /* 兼容旧调用点：现在没有退让，上限就等于基准值。 */
         maxMs() { return this.spanMs(); },
 
-        /* 对称抖动：span ± JITTER_MS，两侧都不是单向放大。 */
+        /* 对称抖动：span ± JITTER_MS，两侧都不是单向放大。
+           地板用 MIN_MS（60 秒）而不是 5 秒：span=60 时向下浮动到 45 秒
+           会被夹回 60 秒，所以实际落在 60~75 秒之间，绝不会快于 1 分钟。 */
         jitter(ms) {
             const base = Number(ms) || this.minMs();
             const delta = (Math.random() * 2 - 1) * this.JITTER_MS;
-            return Math.max(5 * 1000, Math.round((base + delta) / 1000) * 1000);
+            const jittered = Math.round((base + delta) / 1000) * 1000;
+            return Math.max(this.MIN_MS, jittered);
         },
 
         /* 不再退让：无论上一轮是否记账，下一次都用同一个基准间隔。
@@ -6980,7 +6984,7 @@ const __scBgKeepAlive = (function() {
                 const wait = Math.max(3000, cycle - spent);
                 /* 搜完 + 观察 + 复核已经花掉 spent，补到 cycle 就是下一次搜索的间隔。
                    网络慢到 spent 本身超过 cycle 时，下限 3 秒兜底，此时间隔 = spent + 3，
-                   日志里如实报出来，不假装还在 ±10 秒内。 */
+                   日志里如实报出来，不假装还在 ±15 秒内。 */
                 const actual = Math.round((spent + wait) / 1000);
                 Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（两次搜索相隔约 ${actual} 秒）`);
                 await Utils.delay(wait);
@@ -7728,8 +7732,8 @@ const __scBgKeepAlive = (function() {
         const coolLeft = API.searchCooldownLeft();
         let text = "🔍 PC 搜索诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
-        text += `固定间隔：${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒（Config.span，搜索/阅读/卡片共用）\n`;
-        text += `节拍策略：固定间隔，不随成功/失败放大（旧版会一路涨到 100 秒）\n`;
+        text += `搜索间隔：${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒` + `（实际 ${pacer.min}~${pacer.min + SEARCH_PACER.JITTER_MS / 1000} 秒，最快不低于 ${SEARCH_PACER.MIN_MS / 1000} 秒）\n`;
+        text += `间隔来源：Config.span（可自调，最低 ${SEARCH_PACER.MIN_MS / 1000} 秒，配更小也会被夹到 ${SEARCH_PACER.MIN_MS / 1000} 秒）\n`;
         text += `间隔自证：日志里的「两次搜索相隔约 N 秒」就是实际补到的间隔\n`;
         text += `限流刹车：连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手（间隔本身不再拖慢）\n`;
         text += `阅读/卡片节拍：复用同一套，间隔同为 ${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒\n`;
