@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.6.0
+// @version      1.4.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -59,14 +59,14 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 搜索间隔（秒，最低 60，搜索/阅读/卡片共用；实际会在 ±15 秒内浮动）
+        title: 搜索间隔(最低 60，搜索/阅读/卡片共用；实际会在 60±15 秒内浮动)
         type: number
         default: 60
         min: 60
         max: 180
         unit: 秒
     winTime:
-        title: 每日运行时段（格式 开始-结束，如 09:00-23:00；前后相同则全天不限，支持跨零点如 22:30-06:00）
+        title: 运行时段(格式 开始-结束，如 09:00-23:00；前后时间相同则全天不限)
         type: text
         default: 09:00-23:00
     api:
@@ -6897,7 +6897,7 @@ const __scBgKeepAlive = (function() {
             const usedQueries = new Set();
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
-            Utils.log("🔍", `单轮搜索最多 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），固定间隔 ${Math.round(gap / 1000)}±${SEARCH_PACER.JITTER_MS / 1000} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
+            Utils.log("🔍", `单轮搜索 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），间隔 ${Math.round(gap / 1000)}±${SEARCH_PACER.JITTER_MS / 1000} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
 
             while (attempts < attemptCap && Date.now() < hardDeadline) {
                 /* 每轮搜索前确认这一轮还活着（超时就抛错退出，锁被接管也退出） */
@@ -7817,13 +7817,13 @@ const __scBgKeepAlive = (function() {
         "Config.tokenLock", "Config.edgeLock",
     ];
 
-    /* 授权键：只读出来核对，永不写入。软重置后用于自检是否真的没动授权。 */
+    /* 授权键：只读出来核对，永不写入。重置后用于自检是否真的没动授权。 */
     const AUTH_KEYS = [
         "Config.code", "Config.codeUsed", "Config.codeFingerprint", "Config.codeTime",
         "Config.token", "Config.tokenTime", "Config.accessToken", "Config.accessTokenTime",
     ];
 
-    /* 只读快照：用来对比软重置前后，确认授权/配置真的没变 */
+    /* 只读快照：用来对比重置前后，确认授权/配置真的没变 */
     const snapshotKeys = (keys) => {
         const out = {};
         keys.forEach(k => { out[k] = GM_getValue(k, null); });
@@ -7872,9 +7872,9 @@ const __scBgKeepAlive = (function() {
             && before.tokenTime === after.tokenTime
             && before.codeUsed === after.codeUsed;
 
-        Utils.log("🧹", `软重置完成：清理 ${cleared.length} 项运行状态，授权${authIntact ? "完整保留 ✅" : "状态异常 ⚠️"}`);
+        Utils.log("🧹", `重置完成：清理 ${cleared.length} 项运行状态，授权${authIntact ? "完整保留 ✅" : "状态异常 ⚠️"}`);
         if (!authIntact) {
-            Utils.log("🔴", "软重置后发现授权状态有变化，请用「📊 Token状态」确认；如已失效请重新「🔑 手动授权」");
+            Utils.log("🔴", "重置后发现授权状态有变化，请用「📊 Token状态」确认；如已失效请重新「🔑 手动授权」");
         }
 
         /* 重置后立刻重新排一轮（带随机延长），不必等旧计划（旧计划已被清掉） */
@@ -7886,7 +7886,7 @@ const __scBgKeepAlive = (function() {
         return { cleared, authIntact, before, after };
     };
 
-    GM_registerMenuCommand("🧹 软重置运行状态", () => {
+    GM_registerMenuCommand("🧹 重置(任务卡住时尝试)", () => {
         const au = authFingerprint();
         const msg = "将把「运行状态 / 今日进度 / 节流记录」清成刚装脚本的样子。\n\n"
             + "✅ 会保留：授权码与 Token（不用重新授权）、所有配置项、任务开关、通知设置\n"
@@ -7894,11 +7894,11 @@ const __scBgKeepAlive = (function() {
             + `当前授权：${au.hasToken ? "Token 有效" : "无 Token"}${au.hasCode ? " / 已存授权码" : ""}\n\n`
             + "继续吗？";
         if (!Utils.uiConfirm(msg)) {
-            Utils.log("🧹", "软重置已取消");
+            Utils.log("🧹", "重置已取消");
             return;
         }
         const r = doSoftReset();
-        Utils.uiAlert(`🧹 软重置完成\n\n清理了 ${r.cleared.length} 项运行状态\n`
+        Utils.uiAlert(`🧹 重置完成\n\n清理了 ${r.cleared.length} 项运行状态\n`
             + `授权：${r.authIntact ? "✅ 完整保留，无需重新授权" : "⚠️ 有变化，请检查 Token状态"}\n\n`
             + "下一轮会自动开始（已按新的随机间隔排程）。");
     });

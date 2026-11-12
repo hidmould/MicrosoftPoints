@@ -34,7 +34,7 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 ## 二、必须在Chrome浏览器或者配置CDP才能完成的任务(须知)
 ***(更推荐使用Chrome，CDP在Edge136版本开始默认禁用，不懂CDP不建议配置)***
 
-[点击了解什么是CDP](https://blog.csdn.net/weixin_29008055/article/details/165897493)
+[点击了解什么是CDP](https://blog.csdn.net/weixin_29008055/article/details/165897493)(网上关于CDP相关的文章较少，可以询问AI)
 
 
 | 任务 |  Chrome |  Edge |
