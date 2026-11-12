@@ -120,7 +120,7 @@ Tasks:
         type: checkbox
         default: true
     intlDaily:
-        title: 国际版每日活动（必应面板里的拼图/问答/每日一句 5 张 × 5 分）
+        title: 国际版每日活动（面板 5 张卡 × 5 分，不勾选则完全不做）
         type: checkbox
         default: true
 Notice:
@@ -6448,7 +6448,10 @@ const __scBgKeepAlive = (function() {
 
         /* 主流程：取面板 → 挑卡 → 逐张交卷 → 复核。
            返回 {found, done, pending, points}；面板里没有这组活动时 found=0。 */
-        async run({ reason = "国际版每日活动" } = {}) {
+        /* gap / deadline 由调用方传入，复用 SEARCH_PACER 的节拍（Config.span）：
+           国际版卡片也是打微软的接口，打太快同样有风控风险，
+           所以不给自己留「1.5~3 秒连打 5 张」这种口子。 */
+        async run({ reason = "国际版每日活动", gap = 0, deadline = 0 } = {}) {
             if (!GM_getValue("Tasks.intlDaily", true)) return null;
             /* 这里不校验 Token：面板走的是 bing.com 的登录 Cookie，
                而不是 prod.rewardsplatform 的 OAuth Token，没有 Token 也能做。 */
@@ -6481,14 +6484,32 @@ const __scBgKeepAlive = (function() {
                中间的重试原因全部攒起来，只在「最终真的没成」时合并成一行 ——
                之前一张卡失败能刷 6 行（每种形态各一行），完全没法看。 */
             const failed = [];
+            const pacer = (typeof SEARCH_PACER !== "undefined") ? SEARCH_PACER : null;
+            /* 节拍基准：没传就按 Config.span（最低 60 秒）走，绝不定死成几秒 */
+            let beatGap = Number(gap) > 0 ? Number(gap) : (pacer ? pacer.startGap() : 60 * 1000);
+            let outOfTime = false;
+            let idx = 0;
             for (const card of todo) {
                 const name = card.title || card.offerId;
+                /* 到点就交班：剩下的卡片留给下一轮，不在同一轮里硬挤。
+                   用 idx 直接数「还剩几张」，别用 ok/failed 反推 ——
+                   accepted 那张既不算成功也不算失败，反推会算错。 */
+                if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) {
+                    outOfTime = true;
+                    Utils.log("🟡", `国际版每日活动到点交班，剩余 ${todo.length - idx} 张留给下一轮`);
+                    break;
+                }
+                idx++;
                 let last = null;
                 for (let attempt = 1; attempt <= this.MAX_ATTEMPTS; attempt++) {
                     last = await this.report(panel, card);
                     if (last.ok) break;
                     lastReason = last.reason || "未知原因";
-                    if (attempt < this.MAX_ATTEMPTS) await Utils.randomDelay(2500, 5000);
+                    /* 同一张卡的内部重试也拉开间隔，避免连续打同一张 */
+                    if (attempt < this.MAX_ATTEMPTS) {
+                        await Utils.randomDelay(Math.min(5000, Math.round(beatGap / 12) + 2000),
+                            Math.min(12000, Math.round(beatGap / 6) + 3000));
+                    }
                 }
                 if (last && last.ok) {
                     ok++;
@@ -6500,7 +6521,23 @@ const __scBgKeepAlive = (function() {
                 } else {
                     failed.push({ name, reason: lastReason });
                 }
-                if (todo.length > 1) await Utils.randomDelay(1500, 3000);
+                /* 卡片间隔 = 与搜索/阅读同一套节拍（Config.span，最低 60 秒）。
+                   原来这里是 1.5~3 秒 —— 5 张卡十几秒内打完，属于明显的机器行为。 */
+                const isLast = idx >= todo.length;
+                if (pacer) {
+                    beatGap = pacer.nextGap(beatGap, !!last && last.ok);
+                    if (!isLast) {
+                        if (deadline > 0 && !pacer.fits(deadline, beatGap)) {
+                            outOfTime = true;
+                            Utils.log("🟡", `国际版每日活动到点交班，剩余 ${todo.length - idx} 张留给下一轮`);
+                            break;
+                        }
+                        Utils.log("  ", `国际版卡片间隔 ${Math.round(pacer.minMs() / 1000)} 秒（与搜索同一节拍）`);
+                        await pacer.beat(beatGap);
+                    }
+                } else if (!isLast) {
+                    await Utils.randomDelay(1500, 3000);
+                }
             }
             if (failed.length > 0) {
                 Utils.log("🟠", `国际版卡片交卷未受理 ${failed.length} 张：`
@@ -6549,7 +6586,9 @@ const __scBgKeepAlive = (function() {
                 pending,
                 points: (gained > 0 ? gained : ok * (cards[0].points || 5)),
                 /* 汇总里要能说清「为什么还差」：只取第一句原因，别把 5 条通道全塞进去 */
-                reason: pending === 0 ? "" : String(lastReason || "").split("；")[0].slice(0, 60)
+                reason: pending === 0 ? "" : (outOfTime
+                    ? "本轮时间不够，剩下的下一轮继续"
+                    : String(lastReason || "").split("；")[0].slice(0, 60))
             };
         }
     };
@@ -7702,6 +7741,9 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟡", "出口探测未通过，国际版每日活动本轮跳过");
                 return false;
             }
+            /* 节拍与搜索/阅读共用 Config.span（最低 60 秒）：
+               5 张卡之间各隔一个节拍，而不是十几秒内连着打完。 */
+            const gap = SEARCH_PACER.startGap();
             const today = Utils.getTodayNum();
             const key = "Config.intlDailyDate";
             const st = GM_getValue(key, null);
@@ -7712,7 +7754,7 @@ const __scBgKeepAlive = (function() {
             }
             let res = null;
             try {
-                res = await IntlDaily.run({ reason: "国际版每日活动" });
+                res = await IntlDaily.run({ reason: "国际版每日活动", gap, deadline: roundDeadline });
             } catch (e) {
                 Utils.log("🟡", `国际版每日活动异常：${e.message}（不影响其它任务）`);
                 return false;
@@ -8084,10 +8126,14 @@ const __scBgKeepAlive = (function() {
                         : "⏭️ 已关闭"));
                     row("🧩 活动卡片", promosOn, promosOk, "");
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
-                    /* 国际版 5 张卡是「额外加分」，没这组活动的账号（found=0）不显示这一行 */
+                    /* 国际版 5 张卡是「额外加分」项：
+                       · 关掉 → 显示「⏭️ 已关闭」（和别的任务一致，别让人以为漏做）
+                       · 开着但这账号没有这组活动（found=0）→ 不显示这一行 */
                     const intlOn = GM_getValue("Tasks.intlDaily", true);
                     const intlFound = Number(RewardsAuto.state.intlFound) || 0;
-                    if (intlOn && intlFound > 0) {
+                    if (!intlOn) {
+                        row("🌍 国际版每日活动", false, true, "");
+                    } else if (intlFound > 0) {
                         const intlDone = Number(RewardsAuto.state.intlDone) || 0;
                         row("🌍 国际版每日活动", intlOn, intlOk && intlDone >= intlFound, intlDone + "/" + intlFound);
                     }
@@ -8325,62 +8371,6 @@ const __scBgKeepAlive = (function() {
             .finally(() => Utils.releaseLock("Config.runLock"));
         return text;
     };
-
-    /* 手动诊断/补做国际版每日活动：不走主循环、不抢运行锁，
-       跑完只写日志（有人只想补这 25 分，不想整轮重跑）。 */
-    const diagIntlDaily = async () => {
-        const enabled = GM_getValue("Tasks.intlDaily", true);
-        let text = "🌍 国际版每日活动（必应面板 5 张卡）\n\n";
-        text += `任务开关：${enabled ? "开启" : "关闭"}\n`;
-        if (!enabled) {
-            Utils.uiAlert(text + "\n请先在脚本设置里勾选「国际版每日活动」。");
-            return text;
-        }
-        let panel = null;
-        let usedHost = "";
-        for (const host of IntlDaily.hosts()) {
-            panel = await IntlDaily.fetchPanel(host);
-            if (panel) { usedHost = host; break; }
-        }
-        if (!panel) {
-            Utils.uiAlert(text + "\n❌ 读不到面板数据：确认浏览器已登录 bing.com，且出口是大陆直连。");
-            return text;
-        }
-        const cards = IntlDaily.pickCards(panel);
-        text += `接口主机：${usedHost}\n`;
-        text += `面板余额：${panel.balance}\n`;
-        text += `身份字段：channel=${panel.identity.channel} partnerId=${panel.identity.partnerId}\n`;
-        text += `国际版每日活动卡片：${cards.length} 张`;
-        if (cards.length) {
-            text += "\n" + cards.map(c => `  · ${c.complete ? "✅" : "⏳"} ${c.title} +${c.points}p（${c.day}）`).join("\n");
-        }
-        const pending = cards.filter(c => !c.complete);
-
-        /* 通道自检：报告每条交卷通道的真实状态。
-           「响应不是 JSON」这类现象没有这一段就永远查不清 —— 是 302、是游客响应、
-           还是页面代发服务不在线，必须分开说。 */
-        const pageAlive = typeof API !== "undefined" && API._pageChannelAlive && API._pageChannelAlive();
-        text += `\n\n交卷通道：`;
-        text += `\n  · 扩展后台 xhr：可用（GM_xmlhttpRequest）`;
-        text += `\n  · 页面代发：${pageAlive ? "✅ 在线" : "❌ 不在线（在 bing.com 页面上跑一次脚本后可用）"}`;
-
-        text += `\n\n待完成：${pending.length} 张` + (pending.length ? "，点确定后开始逐张交卷" : "（今日已全部完成）");
-        Utils.uiAlert(text);
-        if (pending.length === 0) return text;
-        if (!Utils.acquireLock("Config.runLock", 10 * 60 * 1000)) {
-            Utils.log("🟡", "已有一轮任务在跑，国际版诊断跳过（避免并发重复上报）");
-            return text;
-        }
-        Promise.resolve()
-            .then(() => IntlDaily.run({ reason: "手动补做国际版每日活动" }))
-            .catch(e => Utils.log("🔴", `国际版每日活动异常：${e.message}`))
-            .finally(() => Utils.releaseLock("Config.runLock"));
-        return text;
-    };
-
-    GM_registerMenuCommand("🌍 国际版每日活动（诊断/补做）", () => {
-        diagIntlDaily().catch(e => Utils.log("🔴", `国际版诊断失败：${e.message}`));
-    });
 
     GM_registerMenuCommand("🚀 立即运行", () => {
         Utils.log("🚀", "手动触发：立即运行一轮");
