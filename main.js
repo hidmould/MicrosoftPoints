@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.0
+// @version      1.5.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -59,11 +59,10 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 搜索间隔(最低 60，搜索/阅读/卡片共用；实际会在 60±15 秒内浮动)
+        title: 搜索间隔(秒，基准最低 60，可设更大；实际在基准±15 秒内浮动)
         type: number
         default: 60
         min: 60
-        max: 180
         unit: 秒
     winTime:
         title: 运行时段(格式 开始-结束，如 09:00-23:00；前后时间相同则全天不限)
@@ -6071,7 +6070,7 @@ const __scBgKeepAlive = (function() {
                 const reason = `连续 ${streak} 轮真实搜索（本轮 ${tried} 次）零记账，PC ${cur}/${cap}`;
                 this.saveSearchGuard({ streak: 0, cycles, cooldownUntil: until, reason, lastProgress: cur });
                 Utils.logOnce("🟡",
-                    `搜索连续 ${streak} 轮没有记账，第 ${cycles} 次冷却 ${Math.round(span / 60000)} 分钟后自动重试（不是今天不搜了）`,
+                    `搜索连续 ${streak} 轮没有记账，第 ${cycles} 次冷却 ${Math.round(span / 60000)} 分钟后自动重试`,
                     "searchRestricted", 6 * 60 * 60 * 1000);
                 Utils.log("🔍", `PC 搜索进入冷却：${new Date(until).toLocaleString("zh-CN")} 后自动重试`);
                 return this.searchGuard();
@@ -7024,18 +7023,24 @@ const __scBgKeepAlive = (function() {
     const ROUND_BUDGET_MS = 20 * 60 * 1000;
 
     const SEARCH_PACER = {
-        /* 节拍口径：以 Config.span（默认 60 秒）为基准，每次在 ±JITTER_MS 范围内
-           随机取一个值，做完一次搜索后按「本次已用掉多少」补齐差额，
-           使「搜索→搜索」的间隔稳定落在 span±15 秒。
+        /* 节拍口径：以 Config.span（默认 60 秒）为基准，每次在 ±JITTER_MS（±15 秒）
+           范围内随机取一个值，做完一次搜索后按「本次已用掉多少」补齐差额，
+           使「搜索→搜索」的间隔落在 span±15 秒。
 
-           30 秒已经被实测证明偏快（记账跟不上、也更容易被盯），所以下限抬到
-           1 分钟：MIN_MS 是硬下限，任何配置值都不会低于它；±15 秒的浮动同样
-           以 MIN_MS 为地板，所以最快也就是 60 秒，不会出现 50 秒的间隔。
+           两个下限是三件事，别混：
+             SPAN_MIN_MS  = 60 秒：用户能配的**基准**最低就是 60，配 30 也夹到 60；
+             JITTER_MS    = ±15 秒：基准两侧对称浮动，所以实际间隔可以到 45 秒；
+             浮动后的下限取 5 秒（只是防负数），不再有 60 秒地板。
+           也就是说：配 60 → 实际 45~75 秒；配 90 → 实际 75~105 秒。
+           基准不会低于 1 分钟，但单次间隔允许向下浮动到 45 秒 —— 这是
+           「不要下限、保留配置最低 60」的准确含义。
            限流保护不靠拖慢，而是靠下面两条刹车：
              NO_CREDIT_LIMIT（连续 10 分钟没记账就本轮收手）
              MAX_ATTEMPTS（单轮最多尝试次数） */
-        MIN_MS: 60 * 1000,
+        SPAN_MIN_MS: 60 * 1000,
         JITTER_MS: 15 * 1000,
+        /* 浮动后的绝对下限：只用来挡住负数/0，不是「最慢不能低于 1 分钟」 */
+        FLOOR_MS: 5 * 1000,
         OBSERVE_MIN: 5 * 1000,
         OBSERVE_MAX: 10 * 1000,
         VERIFY_MIN: 5 * 1000,
@@ -7045,13 +7050,12 @@ const __scBgKeepAlive = (function() {
         MIN_ATTEMPTS_BEFORE_GIVEUP: 8,
         RETRY_GAP: 5 * 60 * 1000,
 
-        /* 用户配置的间隔基准。上限留 180 秒（与 Config.span 的 max 一致），
-           下限 MIN_MS（60 秒）—— 再快会明显增加被限流的概率，实测 30 秒确实偏快。
-           存量的 Config.span=30 也会被这里夹到 60，不需要用户手动改设置。 */
+        /* 用户配置的间隔基准：只保证不低于 SPAN_MIN_MS（60 秒），
+           上限完全交给用户 —— 想设 10 分钟、1 小时都行。 */
         spanMs() {
             const span = Number(GM_getValue("Config.span", 60)) || 60;
-            const minSec = this.MIN_MS / 1000;
-            return Math.min(180 * 1000, Math.max(this.MIN_MS, Math.max(minSec, span) * 1000));
+            const ms = Math.round(span * 1000);
+            return Math.max(this.SPAN_MIN_MS, ms);
         },
 
         minMs() { return this.spanMs(); },
@@ -7061,14 +7065,14 @@ const __scBgKeepAlive = (function() {
         /* 兼容旧调用点：现在没有退让，上限就等于基准值。 */
         maxMs() { return this.spanMs(); },
 
-        /* 对称抖动：span ± JITTER_MS，两侧都不是单向放大。
-           地板用 MIN_MS（60 秒）而不是 5 秒：span=60 时向下浮动到 45 秒
-           会被夹回 60 秒，所以实际落在 60~75 秒之间，绝不会快于 1 分钟。 */
+        /* 对称浮动：base ± JITTER_MS，两侧等概率，不再向上单向。
+           地板只取 FLOOR_MS（5 秒，防负数），不设上限；配 60 时实际 45~75 秒，
+           向下浮动真的会生效 —— 这正是「取消下限」的效果。 */
         jitter(ms) {
             const base = Number(ms) || this.minMs();
             const delta = (Math.random() * 2 - 1) * this.JITTER_MS;
-            const jittered = Math.round((base + delta) / 1000) * 1000;
-            return Math.max(this.MIN_MS, jittered);
+            const out = Math.round((base + delta) / 1000) * 1000;
+            return Math.max(this.FLOOR_MS, out);
         },
 
         /* 不再退让：无论上一轮是否记账，下一次都用同一个基准间隔。
@@ -7682,9 +7686,9 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮按乐观估计结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
                     break;
                 }
-                /* 固定节拍：从「本次搜索开始」起算，到下一次搜索开始前一共隔 gap±抖动。
-                   把观察/复核已经花掉的时间扣掉，所以相邻两次搜索的间隔是稳定的，
-                   不会因为检查耗时不同而忽长忽短。 */
+                /* 节拍：从「本次搜索开始」起算，到下一次搜索开始前一共隔 cycle（60~75 秒随机）。
+                   观察/复核已经花掉 spent，wait = cycle - spent，所以日志里的「等待」
+                   比 cycle 小是正常的 —— 用户看到的是剩余等待，不是间隔本身。 */
                 const cycle = SEARCH_PACER.jitter(gap);
                 const now = Date.now();
                 if (lastStart > 0) peakGap = Math.max(peakGap, now - lastStart);
@@ -7695,7 +7699,7 @@ const __scBgKeepAlive = (function() {
                    网络慢到 spent 本身超过 cycle 时，下限 3 秒兜底，此时间隔 = spent + 3，
                    日志里如实报出来，不假装还在 ±15 秒内。 */
                 const actual = Math.round((spent + wait) / 1000);
-                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（两次搜索相隔约 ${actual} 秒）`);
+                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（本轮周期 ${Math.round(cycle / 1000)} 秒，已用 ${(spent / 1000).toFixed(0)} 秒，实际间隔约 ${actual} 秒）`);
                 await Utils.delay(wait);
             }
 
@@ -8521,9 +8525,9 @@ const __scBgKeepAlive = (function() {
         const coolLeft = API.searchCooldownLeft();
         let text = "🔍 PC 搜索诊断\n\n";
         text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
-        text += `搜索间隔：${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒` + `（实际 ${pacer.min}~${pacer.min + SEARCH_PACER.JITTER_MS / 1000} 秒，最快不低于 ${SEARCH_PACER.MIN_MS / 1000} 秒）\n`;
-        text += `间隔来源：Config.span（可自调，最低 ${SEARCH_PACER.MIN_MS / 1000} 秒，配更小也会被夹到 ${SEARCH_PACER.MIN_MS / 1000} 秒）\n`;
-        text += `间隔自证：日志里的「两次搜索相隔约 N 秒」就是实际补到的间隔\n`;
+        text += `搜索间隔：${Math.max(SEARCH_PACER.FLOOR_MS / 1000, pacer.min - SEARCH_PACER.JITTER_MS / 1000)} ~ ${pacer.min + SEARCH_PACER.JITTER_MS / 1000} 秒（对称随机 ±${SEARCH_PACER.JITTER_MS / 1000}，基准 ${pacer.min} 秒）\n`;
+        text += `间隔来源：Config.span（基准最低 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒，不设上限；配更小会夹到 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒）\n`;
+        text += `间隔自证：日志里的「本轮周期 N 秒」才是间隔；「等待 N 秒」是扣掉观察/复核后的剩余，比周期小是正常的\n`;
         text += `限流刹车：连续 ${SEARCH_PACER.NO_CREDIT_LIMIT / 60000} 分钟没记账则本轮收手（间隔本身不再拖慢）\n`;
         text += `阅读/卡片节拍：复用同一套，间隔同为 ${pacer.min} ± ${SEARCH_PACER.JITTER_MS / 1000} 秒\n`;
         if (pacer.last) {
