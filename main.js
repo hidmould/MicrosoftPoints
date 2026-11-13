@@ -359,6 +359,9 @@ const __scBgKeepAlive = (function() {
             intlCached: false,
             webNoAuth: false,
             webFailStreak: 0,
+            /* 活动卡片「数据源不可用，无法判断是否完成」。和 webNoAuth 一样是
+               「说不清」而不是「做完了」——汇总里要显示成未知，不能显示 ✅。 */
+            promosUnknown: false,
         }
     };
 
@@ -3617,7 +3620,15 @@ const __scBgKeepAlive = (function() {
                     if (!id) continue;
                     const cur = Number(item.pointProgress || 0);
                     const max = Number(item.pointProgressMax || 0);
-                    const done = item.isCompleted === true || item.complete === true || (max > 0 && cur >= max);
+                    /* 周期性每日卡（*DailyGlobalOffer*、DailySet）不能用
+                       progress>=max 判完成：这类卡每天重置，进度会停在满值，
+                       于是「满进度 = 今天做过」永远成立，卡片再也不会被处理。
+                       这类卡只认明确的完成字段。 */
+                    const periodic = /DailyGlobalOffer|DailySet|Encourage_Redemption/i.test(String(id));
+                    const explicit = item.isCompleted === true || item.complete === true
+                        || String(item.isCompleted).toLowerCase() === "true"
+                        || String(item.complete).toLowerCase() === "true";
+                    const done = explicit || (!periodic && max > 0 && cur >= max);
                     if (done || !map.has(id)) map.set(id, !!done);
                 }
                 this._webCompleteCache = { ts: now, map };
@@ -3995,6 +4006,13 @@ const __scBgKeepAlive = (function() {
             const seenCardKeys = new Set();
             let earnHtml = "";
             const lockStat = { count: 0, points: 0, app: 0 };
+            /* 数据源可用性：只有「真的问过服务端、且它确实答了」才算读到。
+               用来区分「今天确实没有待办卡」和「我根本没读到数据」——
+               以前两者都落到「未发现卡片 → ✅ 完成」，于是接口一挂，
+               活动卡片就永远显示完成（实测踩到：getuserinfo 回 401，
+               面板里却还有一堆卡能点）。 */
+            const sources = { getuserinfo: false, flight: false };
+            let sourceAnswered = false;
 
             const classify = (item, points = 0) => {
                 const lock = CardLock.probe(item);
@@ -4065,6 +4083,8 @@ const __scBgKeepAlive = (function() {
                         headers: { "user-agent": RewardsAuto.ua.pc, "referer": "https://rewards.bing.com/", "x-requested-with": "XMLHttpRequest" },
                     });
                     if (Utils.isJSON(userInfo)) {
+                        sources.getuserinfo = true;
+                        sourceAnswered = true;
                         const data = JSON.parse(userInfo);
                         const dashboard = data.dashboard || data;
                         const now = new Date();
@@ -4112,7 +4132,9 @@ const __scBgKeepAlive = (function() {
                 }
 
                 try {
-                    for (const item of this._flightItems(this._flightText(html))) {
+                    const flightItems = this._flightItems(this._flightText(html));
+                    if (flightItems.length > 0) sources.flight = true;
+                    for (const item of flightItems) {
                         if (!item.offerId || !item.hash) continue;
                         if (item.isCompleted === true || item.hidden === true) continue;
                         const points = Number(item.points || 0);
@@ -4145,8 +4167,14 @@ const __scBgKeepAlive = (function() {
 
                 if (cards.length > 0) {
                     Utils.log("🧩", `成功获取 ${cards.length} 个可执行卡片`);
+                } else if (sourceAnswered) {
+                    /* 真的问过、服务端也确实答了，只是没有符合条件的卡：
+                       这才叫「今天没有待办卡片」。 */
+                    Utils.log("🟡", "未发现可执行的活动卡片（服务端已应答，可能均已手动完成或被过滤）");
                 } else {
-                    Utils.log("🟡", "未发现可执行的活动卡片（可能均已手动完成或被过滤）");
+                    /* 一个数据源都没答上来：这是「读不到」，不是「做完了」。
+                       不能让上层把它当完成写进 promosDate —— 那会整天不再重试。 */
+                    Utils.log("🟠", "活动卡片数据源全部不可用（getuserinfo / earn 页都没返回有效数据）：本轮无法判断是否有待办卡片，不标记为完成");
                 }
             } catch (e) {
                 Utils.log("🔴", `卡片解析失败: ${e.message}`);
@@ -4163,6 +4191,12 @@ const __scBgKeepAlive = (function() {
                 }
             }
 
+            /* 把「数据源是否可用」挂到数组上带出去。
+               用属性而不是改返回类型，是为了不动所有既有调用点
+               （discoverCards 被 doPromos / doDailySet / 二次扫描共用）。 */
+            Object.defineProperty(cards, "sources", {
+                value: sources, enumerable: false, configurable: true, writable: true
+            });
             return cards;
         },
 
@@ -6490,16 +6524,20 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🟡", "国际版面板缺少 UserId：交卷会被服务端当成游客（IsRewardsUser=false），本轮跳过");
                 return null;
             }
-            /* userInfo.promotions 里同一批卡的 attributes.complete 是「已完成」的直接判据 */
+            /* userInfo.promotions 里同一批卡的 attributes.complete 是「已完成」的直接判据。
+               ⚠️ 这里只认 complete 字段本身，**不再用 progress >= max 兜底**：
+               这组卡是每天重置的周期性任务，一旦某天刷满过，progress/max 会一直
+               停在 5/5，于是「进度满 = 已完成」会把昨天的成绩当成今天的，
+               卡片从此永远判完成、再也不会被处理（实测踩到：面板明明还能点，
+               脚本却报「国际版每日活动已完成」）。
+               progress/max 只是「本次累计」，不等于「今天这一轮做过了」。 */
             const completeById = new Map();
             const rawPromos = (data.userInfo && data.userInfo.promotions) || [];
             for (const p of rawPromos) {
                 const a = (p && p.attributes) || {};
                 const id = String(a.offerid || a.offerId || p.name || "");
                 if (!id) continue;
-                const cur = parseInt(a.progress ?? 0, 10) || 0;
-                const max = parseInt(a.max ?? 0, 10) || 0;
-                completeById.set(id, String(a.complete).toLowerCase() === "true" || (max > 0 && cur >= max));
+                completeById.set(id, String(a.complete).toLowerCase() === "true");
             }
             return { host, identity, promos, completeById, balance: Number((data.userInfo || {}).balance) || 0 };
         },
@@ -6531,7 +6569,15 @@ const __scBgKeepAlive = (function() {
                 const needApp = !!lock.appExclusive || lock.appOnly === true;
                 if (!p.hash) continue;              /* 没有 hash 就交不了卷，别占位 */
                 if (seen.has(offerId)) continue;
+                /* complete 的三种形态都要认，别只判断布尔 true：
+                     · p.complete      —— 面板给的是布尔
+                     · attr.complete   —— 面板给的是**字符串** "True"/"False"
+                     · completeById    —— userInfo.promotions 里的权威值
+                   以前这里写的是 `p.complete === true`，字符串 "True" 直接漏过，
+                   只能靠 completeById 兜底；而 completeById 当时又掺了
+                   progress>=max，于是两个都不靠谱。 */
                 const done = p.complete === true
+                    || String(p.complete).toLowerCase() === "true"
                     || String(attr.complete).toLowerCase() === "true"
                     || panel.completeById.get(offerId) === true;
                 const destination = String(attr.destination || "");
@@ -8271,12 +8317,25 @@ const __scBgKeepAlive = (function() {
                 }
             } catch (_) {}
             if (cards.length === 0) {
+                /* 关键：区分「问过了、确实没有待办」和「根本没读到」。
+                   以前这里无条件标 ✅ + 写 promosDate + 封盘，于是
+                   getuserinfo 一挂（现在它常年 401），活动卡片就永远显示完成。
+                   读不到时必须如实报「未知」并保留重试机会。 */
+                const src = cards.sources || {};
+                const answered = !!(src.getuserinfo || src.flight);
+                if (!answered) {
+                    Utils.log("🟠", "活动卡片：数据源不可用，本轮无法确认是否已完成（不标记完成，下一轮会重试）", true);
+                    RewardsAuto.state.promosUnknown = true;
+                    return false;
+                }
+                RewardsAuto.state.promosUnknown = false;
                 Utils.log("✅", "未发现待处理活动卡片");
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 CDP._promosClean = true;   /* 没有卡片 = 今天不需要 CDP，收尾时直接封盘 */
                 this.save();
                 return true;
             }
+            RewardsAuto.state.promosUnknown = false;
             Utils.log("🧩", `发现 ${cards.length} 个卡片`);
 
             try {
@@ -9149,6 +9208,11 @@ const __scBgKeepAlive = (function() {
                     const readOk = this.readDate === today || (readMaxProg > 0 && readProg >= readMaxProg);
                     const searchOk = info.pc.progress >= info.pc.max;
                     const promosOk = this.promosDate === today;
+                    /* 活动卡片「说不清」时，不能显示 ✅（那是冒充完成）。
+                       优先级：数据源挂了 > 真的没卡（promosDate 已写）。
+                       注意 promosOk 仍然是「今天标记过完成」，只有确定读到
+                       「确实没有待办」才会写这个标记，所以两者不冲突。 */
+                    const promosUnknown = !!RewardsAuto.state.promosUnknown && !promosOk;
                     const dailyOk = !!dailySetRes;
                     /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
                        intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
@@ -9219,7 +9283,12 @@ const __scBgKeepAlive = (function() {
                     rows.push("🌐 Edge 浏览连签 · " + (edge
                         ? (edge.done ? "✅" : edge.skipped ? "⏭️" : "⏳") + " " + edge.text
                         : "⏭️ 已关闭"));
-                    row("🧩 活动卡片", promosOn, promosOk, "");
+                    /* 数据源不可用时明确指出「没读到」，不要用 ✅ 掩盖 */
+                    if (promosUnknown) {
+                        rows.push("🧩 活动卡片 · " + (promosOn ? "❓读取失败，未确认（不当作完成）" : "⏭️ 已关闭"));
+                    } else {
+                        row("🧩 活动卡片", promosOn, promosOk, "");
+                    }
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
                     /* 国际版 5 张卡是「额外加分」项：
                        · 关掉   → 「⏭️ 已关闭」（和别的任务一致，别让人以为漏做）
