@@ -2685,9 +2685,11 @@ const __scBgKeepAlive = (function() {
         _balance(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
             /* dashboard 有的版本没有 "balance"，只有 availablePoints；读不到余额
-               会让「领取后余额差值」恒为 0，误判成没领到。 */
-            const m = clean.match(/"(?:balance|availablePoints)"\s*:\s*"?(\d+)"?/i);
-            return m ? (parseInt(m[1], 10) || 0) : 0;
+               会让「领取后余额差值」恒为 0，误判成没领到。
+               金额要容忍千分位（"56,036"）：只写 (\d+) 会被逗号截成 56，
+               那样「领取前后余额差」就等于在拿假数字做减法。 */
+            const m = clean.match(/"(?:balance|availablePoints)"\s*:\s*"?([\d,]+)"?/i);
+            return m ? (parseInt(String(m[1]).replace(/,/g, ""), 10) || 0) : 0;
         },
 
         /* 从 pointClaim 起点按花括号配平截出这一个对象。
@@ -3091,6 +3093,12 @@ const __scBgKeepAlive = (function() {
                     const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                     const clean = html.replace(/\\"/g, '"');
                     let balance = 0;
+                    /* 今日已赚积分：earn 页 pointsCounters.totalPoints。
+                       这不是账号余额 —— 余额在别处（DAPI balance / availablePoints）。
+                       原来把它赋给了 balance，于是「今日获取」顶替了「总积分」，
+                       页面上就成了「今日获取 +15 · 总积分 155」两个数都对不上。
+                       null = 页面上没读到这个字段（真的 0 分要能和「读不到」区分开）。 */
+                    let earnedToday = null;
                     let pcMax = 60, pcCur = 0, mobMax = 0, mobCur = 0;
                     let dailyOffer = 0;
                     let searchQuotaFound = false;
@@ -3108,13 +3116,18 @@ const __scBgKeepAlive = (function() {
                             mobMax = pts.mobile?.max ?? 0;
                             mobCur = pts.mobile?.progress ?? 0;
                             dailyOffer = pts.dailyOffer ?? 0;
-                            if (pts.totalPoints != null) balance = Number(pts.totalPoints);
+                            if (pts.totalPoints != null) {
+                                const v = Number(pts.totalPoints);
+                                if (Number.isFinite(v) && v >= 0) earnedToday = v;
+                            }
                         } catch {}
                     }
-                    if (balance === 0) {
-                        const balMatch = clean.match(/"balance":(\d+)/) || clean.match(/"availablePoints":(\d+)/);
-                        if (balMatch) balance = parseInt(balMatch[1]);
-                    }
+                    /* 余额只认这两个字段，绝不拿 totalPoints 顶（见上面的说明）。
+                       要容忍两种形态：数字 56036、带千分位的字符串 "56,036"。
+                       原来只写 (\d+)，遇到 "56,036" 会截成 56 —— 页面一旦改成
+                       带引号或带逗号的写法，总积分就会变成两位数的假值。 */
+                    const balMatch = clean.match(/"(?:balance|availablePoints)"\s*:\s*"?([\d,]+)"?/);
+                    if (balMatch) balance = parseInt(String(balMatch[1]).replace(/,/g, ""), 10) || 0;
                     const todayDetails = [];
                     const acIdx = clean.indexOf('"activityCards":[');
                     if (acIdx !== -1) {
@@ -3210,7 +3223,12 @@ const __scBgKeepAlive = (function() {
                     } else {
                         Utils.log("🟡", "阅读进度查询失败，汇总里的阅读进度可能不准");
                     }
-                    return { balance, pc: { progress: pcCur, max: pcMax }, mobile: { progress: mobCur, max: mobMax }, readProgress, readMax, dailyOffer, todayDetails, history };
+                    return {
+                        balance, earnedToday,
+                        pc: { progress: pcCur, max: pcMax },
+                        mobile: { progress: mobCur, max: mobMax },
+                        readProgress, readMax, dailyOffer, todayDetails, history
+                    };
                 } catch (e) {
                     if (attempt < maxRetries) { await Utils.delay(3210); continue; }
                     Utils.log("🔴", `仪表盘获取失败: ${e.message}`);
@@ -8448,7 +8466,18 @@ const __scBgKeepAlive = (function() {
                         rows.push("🔒 锁卡 · " + RewardsAuto.state.lockedCount + " 张 / " + RewardsAuto.state.lockedPoints + " 分");
                     }
                     if (this.claimSummary) rows.push("🎁 领取积分 · " + this.claimSummary);
-                    rows.push("💰 今日获取 +" + earned + " · 总积分 " + (info.balance || endBalance));
+                    /* 两个数各有各的来源，别再串位：
+                       · 今日获取 = 服务端 earn 页 pointsCounters.totalPoints（今天累计赚到的）
+                         —— 页面上读不到时才退回「本轮余额差」，并标注口径
+                       · 总积分   = 账号当前余额（DAPI balance / availablePoints）
+                       原来 totalPoints 被当成 balance 用，于是「今日获取 +15 · 总积分 155」
+                       两个数其实都是「今日获取」的变体，总积分根本不是账号总额。 */
+                    const dayEarnedKnown = info.earnedToday != null && Number.isFinite(Number(info.earnedToday));
+                    const dayEarned = dayEarnedKnown ? Number(info.earnedToday) : earned;
+                    const totalPoints = info.balance || endBalance || 0;
+                    rows.push("💰 今日获取 +" + dayEarned
+                        + (dayEarnedKnown ? "" : "（本轮）")
+                        + " · 总积分 " + totalPoints);
 
                     /* 标题不带图标：推送图标由 Utils.log 第一参数统一加，
                        否则会拼成「🎉 🎉 今日任务已全部完成！」 */
