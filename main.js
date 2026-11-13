@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.1
+// @version      1.5.2
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -2757,9 +2757,11 @@ const __scBgKeepAlive = (function() {
         },
 
         async _sendOnce(req) {
+            /* stopOnFalse：领取接口对空池回 200+false，这已经是最终答案，
+               不必再换通道重问（以前会白打 2~3 发请求）。 */
             return await API.postAction(
                 { url: req.url, headers: req.headers, data: req.body },
-                { savedKey: this.KEY_VARIANT }
+                { savedKey: this.KEY_VARIANT, stopOnFalse: true }
             );
         },
 
@@ -2767,8 +2769,47 @@ const __scBgKeepAlive = (function() {
             return await API._anyRewardsPage();
         },
 
+        /* 读 dashboard / earn 页面：领取出问题时靠它回读证据。
+           viaCdp 为 true 时优先在 CDP 页面里同源 fetch（拿到的才是登录态页面），
+           失败再退回脚本自己的后台 xhr。 */
+        async _readPage(url, { viaCdp = false } = {}) {
+            if (viaCdp) {
+                try {
+                    const page = await this._cdpPage();
+                    if (page) {
+                        if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
+                        const html = await CDP.fetchPageText(url);
+                        if (html) return html;
+                    }
+                } catch (_) {}
+            }
+            try { return await Utils.xhr({ url }) || ""; } catch (_) { return ""; }
+        },
+
+        /* 没领成时的人话原因：把「通道根本没应答」「服务端拒绝」「返回认不出来」分开，
+           别再一句话都算成「通道被浏览器拒绝」。 */
+        _whyNotAccepted(sent) {
+            const tried = (sent && sent.tried) ? sent.tried.join(" ") : "";
+            const status = sent ? (Number(sent.status) || 0) : 0;
+            if (!sent || !sent.reached) {
+                return `领取通道没有应答（${tried || "无可用通道"}）`;
+            }
+            return `领取通道返回 HTTP ${status}（${tried}）`;
+        },
+
+        /* 领完之后的定性。到账证据按可信度排序：
+             ① 余额真的涨了
+             ② 待领池被清空（标记没了 / 金额归 0）
+             ③ 待领金额变小
+           服务端 2xx + false 是「接口被调用且明确回答没有可领的」，单独一种情形：
+           此时若页面本来就显示不出可领金额，回读也显示不出来，那就是「待领为 0」——
+           按用户口径属于成功，不能报成「未成功」。 */
         async run({ name = "领取积分" } = {}) {
-            const out = { claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "", uncertain: false, settled: false };
+            const out = {
+                claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "",
+                uncertain: false, settled: false, nothingToClaim: false, denied: false,
+                verdict: "", reached: false
+            };
             let dashHtml = "";
             try {
                 if (await CDP.available()) {
@@ -2790,23 +2831,22 @@ const __scBgKeepAlive = (function() {
                 out.reason = "读不到待领池标记（页面可能是登录页或结构已变）";
                 return out;
             }
-            /* 关键判定：pool.has 只代表「解析器看见了金额」。uncertain（标记在、金额读 0）
-               说明的是「读不到」，不是「没有」。原来这里直接 return，于是页面一改版
-               就永远读 0、永远不领 —— 注释里自称「按无可领处理」正是那句话的来源。
-               领取接口本身幂等，空池调用没有副作用，所以读不准时先打一发再回读判定。 */
+            /* 待领就是 0：这是成功态（没有待领 = 不需要领 = 已领完），
+               不该进「未成功」，也不该每轮都去打一次领取接口。 */
             if (!pool.has && !pool.uncertain) {
-                const kind = "待领池为空";
                 const last = Number(GM_getValue(this.KEY_EMPTY_AT, 0)) || 0;
-                if (Date.now() - last < this.EMPTY_TTL) {
-                    out.empty = true;
-                    out.reason = `${kind}（15 分钟内已确认过）`;
-                    return out;
-                }
-                GM_setValue(this.KEY_EMPTY_AT, Date.now());
                 out.empty = true;
-                out.reason = kind;
+                out.settled = true;
+                out.nothingToClaim = true;
+                out.reason = Date.now() - last < this.EMPTY_TTL
+                    ? "待领为 0（15 分钟内已确认过）"
+                    : "待领为 0，无需领取";
+                if (Date.now() - last >= this.EMPTY_TTL) GM_setValue(this.KEY_EMPTY_AT, Date.now());
                 return out;
             }
+            /* 关键判定：pool.has 只代表「解析器看见了金额」。uncertain（标记在、金额读 0）
+               说明的是「读不到」，不是「没有」。领取接口本身幂等，空池调用没有副作用，
+               所以读不准时先打一发，再用服务端回答 + 回读页面一起定性。 */
             if (pool.uncertain) {
                 Utils.log("🔍", "待领池标记存在但解析不出金额，改为直接发领取请求再回读判定"
                     + `（pointClaim 片段：${pool.snippet || "无"}）`);
@@ -2815,64 +2855,79 @@ const __scBgKeepAlive = (function() {
 
             const actionMap = await ActionMap.ensure([dashHtml]);
             const req = this._request(actionMap);
-            const accepted = await this._sendOnce(req);
-            out.variant = accepted.ok ? accepted.variant : "";
-            out.reason = accepted.ok
-                ? ""
-                : `三种通道都没受理（${(accepted.tried || []).join(" ")}）`;
-            if (!accepted.ok) return out;
+            const sent = await this._sendOnce(req);
+            out.reached = !!sent.reached;
+            out.verdict = sent.verdict || (sent.ok ? "true" : "unknown");
+            /* 服务端 2xx + false：请求确实到了服务端，它明确回答「没有可领的」。
+               这不是通道失败（原来就是在这里误报「三种通道都没受理」）。 */
+            const denied = !sent.ok && out.reached && out.verdict === "false";
+            /* 只有「服务端真的回过话」才记通道名：通道全挂时留空，
+               收尾通知才会把它归到「通道被拒」而不是「已受理待复核」。 */
+            out.variant = (sent.ok || denied) ? (sent.variant || "") : "";
+            if (!sent.ok && !denied) {
+                out.reason = this._whyNotAccepted(sent);
+                return out;
+            }
 
-            await Utils.delay(1200);
-            let afterHtml = "";
-            try {
-                if (accepted.variant === "page") {
-                    const page = await this._cdpPage();
-                    if (page) afterHtml = await CDP.fetchPageText("https://rewards.bing.com/earn") || "";
-                }
-                if (!afterHtml) afterHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
-            } catch (_) { afterHtml = ""; }
+            /* 回读证据：earn 页看余额，dashboard 看待领池 */
+            await Utils.delay(sent.ok ? 1200 : 900);
+            const afterHtml = await this._readPage("https://rewards.bing.com/earn", { viaCdp: sent.variant === "page" });
             out.after = this._balance(afterHtml);
             out.claimed = (out.before > 0 && out.after > out.before) ? (out.after - out.before) : 0;
 
-            /* 到账证据三选一（按可信度排序）：余额确实上涨 → 池子被清空 → 池子金额变小。
-               原来只看余额差，读不到余额就一律判失败，领取明明生效了也报「未成功」。 */
-            if (out.claimed <= 0) {
-                await Utils.delay(2500);
-                try {
-                    let again = "";
-                    if (accepted.variant === "page") {
-                        const page = await this._cdpPage();
-                        if (page) again = await CDP.fetchPageText("https://rewards.bing.com/dashboard") || "";
-                    }
-                    if (!again) again = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
-                    const later = this._balance(again);
-                    if (out.before > 0 && later > out.before) {
-                        out.after = later;
-                        out.claimed = later - out.before;
-                        out.reason = "";
-                    }
-                    const poolAgain = this.parse(again);
-                    if (out.claimed <= 0 && poolAgain.known && !poolAgain.has) {
-                        /* 池子清空是最硬的证据：待领标记没了，说明服务端收下了这次领取。
-                           金额读不到（uncertain）时用 before 快照的金额，读不到就记 0 但判成功。 */
-                        out.claimed = Math.max(pool.amount || 0, 0);
-                        out.empty = true;
-                        out.settled = true;
-                        out.reason = out.claimed > 0
-                            ? "已受理，待领池已清空（余额差读不到，按页面金额计）"
-                            : "已受理，待领池已清空（金额与余额都读不到，按已领取处理）";
-                    } else if (out.claimed <= 0 && poolAgain.known && poolAgain.has
-                        && pool.amount > 0 && poolAgain.amount > 0 && poolAgain.amount < pool.amount) {
-                        out.claimed = pool.amount - poolAgain.amount;
-                        out.reason = "已受理，待领金额下降（余额差读不到）";
-                    }
-                } catch (_) {}
+            await Utils.delay(2200);
+            const again = await this._readPage("https://rewards.bing.com/dashboard", { viaCdp: sent.variant === "page" });
+            const later = this._balance(again);
+            if (out.before > 0 && later > out.before) {
+                out.after = later;
+                out.claimed = later - out.before;
             }
-            if (out.claimed <= 0 && !out.settled) {
-                out.reason = pool.amount > 0
-                    ? `已受理但余额未变（页面可领取 ${pool.amount}）`
-                    : "已受理，但金额与余额都读不到，无法确认到账；下一轮再复核";
+            if (out.claimed > 0) {
+                out.reason = "";
+                return out;
             }
+
+            const poolAgain = this.parse(again);
+            /* uncertain 的「没有金额」和「池子清空」长得一样，必须分开：
+               池子清空是硬证据，读不准只能算待复核。 */
+            const poolNowEmpty = poolAgain.known && !poolAgain.has && !poolAgain.uncertain;
+            const poolStillHas = poolAgain.known && poolAgain.has && poolAgain.amount > 0;
+
+            if (poolNowEmpty) {
+                out.claimed = Math.max(pool.amount || 0, 0);
+                out.empty = true;
+                out.settled = true;
+                /* 只有「服务端回 false 且金额本来就 0」才算「本来就没有待领」；
+                   服务端回 true = 它确实领了，金额读不到也按已领取处理。 */
+                out.nothingToClaim = out.claimed <= 0 && denied;
+                out.reason = out.claimed > 0
+                    ? "已受理，待领池已清空（余额差读不到，按页面金额计）"
+                    : (denied ? "待领为 0（服务端回 false，回读也是空池）" : "已领取，待领池已清空");
+                return out;
+            }
+            if (pool.amount > 0 && poolStillHas && poolAgain.amount < pool.amount) {
+                out.claimed = pool.amount - poolAgain.amount;
+                out.reason = "已受理，待领金额下降（余额差读不到）";
+                return out;
+            }
+            if (denied) {
+                /* 页面一开始就读不出可领金额、回读也没有可领金额 → 两边一致：确实没有待领 */
+                if (!(pool.amount > 0) && !poolStillHas) {
+                    out.empty = true;
+                    out.settled = true;
+                    out.nothingToClaim = true;
+                    out.reason = "待领为 0（服务端回 false，页面也无可领金额）";
+                    return out;
+                }
+                /* 页面明明白白写着可领取 N，服务端却回 false：这是真的没领成，
+                   不能算「待领为 0」，也不能算已受理。 */
+                out.denied = true;
+                out.reason = `服务端拒绝了领取请求（页面可领取 ${pool.amount}）`;
+                return out;
+            }
+            out.reason = pool.amount > 0
+                ? `已受理但余额未变（页面可领取 ${pool.amount}）`
+                : "已受理，但金额与余额都读不到，无法确认到账；下一轮再复核";
             return out;
         }
     };
@@ -4613,17 +4668,27 @@ const __scBgKeepAlive = (function() {
             return settled ? result : null;
         },
 
-        _actionLooksAccepted(res) {
+        /* 动作响应的三态判定：
+           "true"    服务端说这件事做成了
+           "false"   服务端明确说没做成 —— 领取接口在「池子里没有可领」时就是回 false，
+                     这是「没什么可做」，不是通道失败，两种含义必须分开
+           "unknown" 认不出来（错误帧 / HTML / 空响应），只能当没确认
+           以前只有真假两态，于是「池子本来就空」和「通道被拒」被混成同一句「未成功」。 */
+        _actionVerdict(res) {
             const text = String(res || "");
-            if (!text) return false;
-            if (/(?:^|\n)[0-9a-f]+:E\{/i.test(text) || /"digest"\s*:/.test(text)) return false;
-            if (/^\s*<!doctype\s+html/i.test(text) || /<html[\s>]/i.test(text)) return false;
+            if (!text) return "unknown";
+            if (/(?:^|\n)[0-9a-f]+:E\{/i.test(text) || /"digest"\s*:/.test(text)) return "unknown";
+            if (/^\s*<!doctype\s+html/i.test(text) || /<html[\s>]/i.test(text)) return "unknown";
 
             const verdicts = [...text.matchAll(/\d+:(true|false)(?![\w{])/g)];
             if (verdicts.length > 0) {
-                return verdicts[verdicts.length - 1][1] === "true";
+                return verdicts[verdicts.length - 1][1];
             }
-            return text.includes('"ok":true');
+            return text.includes('"ok":true') ? "true" : "unknown";
+        },
+
+        _actionLooksAccepted(res) {
+            return this._actionVerdict(res) === "true";
         },
 
         QUESTS: {
@@ -5589,7 +5654,7 @@ const __scBgKeepAlive = (function() {
             return t.replace(/\s+/g, " ").slice(0, 110);
         },
 
-        async postAction(req, { savedKey = "Config.actionVariant" } = {}) {
+        async postAction(req, { savedKey = "Config.actionVariant", stopOnFalse = false } = {}) {
             const saved = String(GM_getValue(savedKey, "") || "");
             const order = (saved && BrowserEnv.channelOrder().includes(saved))
                 ? [saved, ...BrowserEnv.channelOrder().filter(v => v !== saved)]
@@ -5597,57 +5662,74 @@ const __scBgKeepAlive = (function() {
             const tried = [];
             let accepted = null;
             let last = null;
+            /* 「请求到了服务端、但它明确回答 false」要单独记下来：
+               领取接口在空池时就是这么回，这既不是通道失败也不是领到，
+               调用方（领取积分）需要靠它区分「没什么可领」和「通道被拒」。 */
+            let lastReached = null;
             for (const v of order) {
                 let r;
                 try {
                     r = await this._postVia(v, req);
                 } catch (e) {
-                    r = { ok: false, status: 0, text: String((e && e.message) || e), variant: v };
+                    r = { ok: false, status: 0, text: String((e && e.message) || e), variant: v, reached: false };
                 }
-                tried.push(`${v}=${r.status}${r.ok ? "✓" : "✗"}`);
+                tried.push(`${v}=${r.status}${r.ok ? "✓" : (r.reached ? "✗" : "·")}`);
                 if (r.status > 0) last = r;
+                if (r.reached && r.verdict === "false") lastReached = r;
                 if (r.ok) { accepted = r; break; }
                 if (r.status === 401 || r.status === 403) break;
+                /* 服务端已经明确回答「没有可领的」：再换通道问一遍也是同一个答案，
+                   反而让空池场景多打两发请求。 */
+                if (stopOnFalse && lastReached) break;
             }
             if (accepted && accepted.variant !== saved) {
                 GM_setValue(savedKey, accepted.variant);
                 if (saved) Utils.log("🎁", `动作请求通道已切换：${saved} → ${accepted.variant}`);
             }
-            return accepted || {
+            if (accepted) return accepted;
+            const pick = lastReached || last;
+            return {
                 ok: false,
-                status: last ? last.status : 0,
-                text: last ? last.text : "",
-                variant: last ? last.variant : "",
+                /* 服务端确实回过话（哪怕回答 false）也算 reached，文案与重试策略都靠它 */
+                reached: !!(lastReached || (last && last.reached)),
+                verdict: lastReached ? "false" : ((last && last.verdict) || "unknown"),
+                status: pick ? pick.status : 0,
+                text: pick ? pick.text : "",
+                variant: pick ? pick.variant : "",
                 tried
+            };
+        },
+
+        /* 一次通道尝试的收尾：把「HTTP 到达」和「服务端怎么回答」拆成两件事。
+           delivered = 请求真的到了服务端（2xx），响应可被解读；
+           verdict   = true / false / unknown。 */
+        _judgeSent(status, text, variant) {
+            const delivered = status >= 200 && status < 300;
+            const verdict = delivered ? this._actionVerdict(text) : "unknown";
+            return {
+                ok: delivered && verdict === "true",
+                reached: delivered, verdict,
+                status, text, variant
             };
         },
 
         async _postVia(variant, req) {
             if (variant === "page") {
-                if (!(await CDP.available())) return { ok: false, status: 0, text: "CDP 不可用", variant };
+                if (!(await CDP.available())) return { ok: false, status: 0, text: "CDP 不可用", variant, reached: false };
                 const page = await this._anyRewardsPage();
-                if (!page) return { ok: false, status: 0, text: "没有可用的 rewards 页面", variant };
+                if (!page) return { ok: false, status: 0, text: "没有可用的 rewards 页面", variant, reached: false };
                 await CDP.usePage(page);
                 const r = await CDP.claimInPage(req.url, req.headers, req.data);
-                return {
-                    ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
-                    status: r.status, text: r.text, variant
-                };
+                return this._judgeSent(r.status, r.text, variant);
             }
             if (variant === "proxy") {
-                if (!this._pageChannelAlive()) return { ok: false, status: 0, text: "页面代发服务不在线", variant };
+                if (!this._pageChannelAlive()) return { ok: false, status: 0, text: "页面代发服务不在线", variant, reached: false };
                 const r = await this.viaPageChannel(req.url, req.headers, req.data, 20000);
-                if (!r) return { ok: false, status: 0, text: "页面代发超时", variant };
-                return {
-                    ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
-                    status: r.status, text: r.text || r.error || "", variant
-                };
+                if (!r) return { ok: false, status: 0, text: "页面代发超时", variant, reached: false };
+                return this._judgeSent(r.status, r.text || r.error || "", variant);
             }
             const r = await this._rawXhr({ method: "POST", url: req.url, headers: req.headers, data: req.data });
-            return {
-                ok: r.status >= 200 && r.status < 300 && this._actionLooksAccepted(r.text),
-                status: r.status, text: r.text, variant
-            };
+            return this._judgeSent(r.status, r.text, variant);
         },
 
         /* 只读借用：页面里只发 fetch，不改地址，所以用你自己开着的 rewards 页也完全无感。 */
@@ -7872,21 +7954,36 @@ const __scBgKeepAlive = (function() {
             try {
                 try { await API.getCookieHeader(); } catch (_) {}
                 const res = await ClaimPoints.run();
-                if (res.empty) {
-                    /* empty 现在有两层含义：池子确认为空 / 池子被本次领取清空。
-                       后者是真领到了，不能再报「无可领」。 */
-                    this.claimSummary = res.settled
-                        ? (res.claimed > 0 ? `✅ +${res.claimed} · 池已清空` : "✅ 已领取 · 池已清空")
-                        : "✅ 无可领";
-                    this.claimReason = res.settled ? "" : (res.uncertain ? (res.reason || "") : "");
-                    Utils.log("🎁", res.reason || "已领取");
+                /* 三种「成功」：真领到了 / 池子被本次领取清空 / 本来就没有待领（=0）。
+                   后两种都不能再报「未成功」——待领为 0 本来就意味着不需要领。
+                   以前只要没读到余额差就一路走到「未成功」，于是服务端明明回了
+                   200+false（=没有可领的）也被记成领取失败，还连带把「需要 CDP」
+                   的结论带到下一轮。 */
+                if (res.claimed > 0) {
+                    this.claimSummary = res.empty
+                        ? `✅ +${res.claimed} · 池已清空`
+                        : `✅ +${res.claimed} · 余额 ${res.after}`;
+                    this.claimReason = "";
+                    Utils.log("🎁", res.empty
+                        ? `已自动领取 ${res.claimed} 积分（当前余额：${res.after}，待领池已清空）`
+                        : `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`);
                     return;
                 }
-                if (res.claimed > 0) {
-                    this.claimSummary = `✅ +${res.claimed} · 余额 ${res.after}`;
+                if (res.nothingToClaim) {
+                    this.claimSummary = "✅ 待领为 0";
                     this.claimReason = "";
-                    Utils.log("🎁", `已自动领取 ${res.claimed} 积分（当前余额：${res.after}）`);
-                } else if (res.variant) {
+                    Utils.log("✅", res.reason || "待领为 0，无需领取");
+                    return;
+                }
+                if (res.settled) {
+                    this.claimSummary = "✅ 已领取 · 池已清空";
+                    this.claimReason = "";
+                    Utils.log("🎁", res.reason || "已领取，待领池已清空");
+                    return;
+                }
+                if (res.variant && !res.denied) {
+                    /* 服务端确实收下了（回了 true），只是余额/池子读不出证据：
+                       这才是「待复核」。 */
                     this.claimSummary = "⏳ 已受理待复核";
                     this.claimReason = res.reason || "";
                     Utils.log("🟡", `积分领取请求已受理，但没能确认到账（${res.reason}）；下一轮再复核`);
@@ -8274,8 +8371,10 @@ const __scBgKeepAlive = (function() {
                     /* 三类「受环境限制」的项目不参与达标判定：
                        🖥️ 桌面专属任务（交卷了但服务端不一定记账）
                        🔒 日常带锁卡（必须在必应 App 里点）
-                       🎁 首页待领取（通道被浏览器安全策略挡掉）
-                       它们没完成不影响「全部完成」的判定，但通知里要点名。 */
+                       🎁 首页待领取（领取通道没打通，或服务端明确拒绝）
+                       它们没完成不影响「全部完成」的判定，但通知里要点名。
+                       注意：待领为 0 / 池子已清空都是成功态，claimSummary
+                       用的是 ✅ 前缀，不会落到这里。 */
                     const desktopPending = Number(RewardsAuto.state.weeklyQuestPending) || 0;
                     const desktopFailed = Number(RewardsAuto.state.weeklyQuestFailed) || 0;
                     /* 具体卡片名只在后台日志里保留（state 里仍记录），通知只报数量 */
@@ -8293,11 +8392,13 @@ const __scBgKeepAlive = (function() {
                         blocked.push(`🔒 带锁卡片 ${RewardsAuto.state.lockedCount} 张 / ${RewardsAuto.state.lockedPoints} 分`);
                     }
                     if (claimPending) {
-                        /* 通道类失败的原话太技术，换成一句人话；其它原因照抄 */
+                        /* 把技术原话换成一句人话；其它原因照抄（去掉括号里的诊断细节） */
                         const rawReason = String(this.claimReason || "");
-                        const claimText = (/三种通道都没受理/.test(rawReason)
-                            ? "领取通道被浏览器拒绝"
-                            : (rawReason || String(this.claimSummary).replace("⏳ ", "")))
+                        const claimText = (/没有应答/.test(rawReason)
+                            ? "领取通道没打通"
+                            : (/返回 HTTP/.test(rawReason)
+                                ? "领取请求被服务端拒绝"
+                                : (rawReason || String(this.claimSummary).replace("⏳ ", ""))))
                             .replace(/（[^）]*）/g, "").replace(/\([^)]*\)/g, "").trim();
                         blocked.push("🎁 首页待领取" + String(this.claimSummary).replace("⏳ ", "")
                             + (claimText ? `：${claimText}` : ""));
@@ -8371,8 +8472,11 @@ const __scBgKeepAlive = (function() {
                     if (blocked.length > 0) {
                         logMsg += "\n\n⏳ 受限制未完成：\n"
                             + blocked.map(s => "· " + s).join("\n");
-                        /* 只有「需要 Chrome / CDP」的那几条才提浏览器；国际版不在此列 */
-                        const needChrome = (desktopOn && (desktopPending > 0 || desktopFailed > 0)) || claimPending;
+                        /* 只有「通道没打通」这类才值得提浏览器；服务端明确拒绝
+                           （HTTP 5xx/403 已到达）与「已受理待复核」都不该甩给 CDP。 */
+                        const channelDown = /没有应答/.test(String(this.claimReason || ""));
+                        const needChrome = (desktopOn && (desktopPending > 0 || desktopFailed > 0))
+                            || (claimPending && channelDown);
                         if (needChrome) {
                             logMsg += "\n💡 「桌面专属任务 / 首页待领取」需要 Chrome，或按第三节配好 CDP";
                         }
@@ -8485,16 +8589,23 @@ const __scBgKeepAlive = (function() {
         if (raw.snippet) text += `pointClaim 片段：${raw.snippet}\n`;
         text += `余额：${ClaimPoints._balance(dashHtml) || "读不到"}\n\n`;
         const pool = await ClaimPoints.run();
-        text += `待领状态：${pool.empty
-            ? (pool.settled ? "已领取，池已清空" : (pool.uncertain ? "读不准（标记在、金额 0）" : "空池"))
-            : (pool.variant ? `已受理（${pool.variant}）` : "未受理")}\n`;
-        text += `本次结果：${pool.claimed > 0 ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）` : (pool.reason || "—")}\n`;
-        if (!pool.variant && !pool.empty) {
+        text += `服务端回答：${pool.reached ? (pool.verdict === "false" ? "已到达，回答「没有可领的」(false)" : "已到达") : "未应答（通道没打通）"}`
+            + `${pool.variant ? `，通道 ${pool.variant}` : ""}\n`;
+        text += `待领状态：${pool.nothingToClaim
+            ? "✅ 待领为 0（无需领取）"
+            : (pool.empty || pool.settled
+                ? (pool.settled ? "已领取，池已清空" : "空池")
+                : (pool.claimed > 0 ? "已领取" : (pool.reason ? "未能确认" : "未知")))}\n`;
+        text += `本次结果：${pool.claimed > 0
+            ? `+${pool.claimed} 分（余额 ${pool.before} → ${pool.after}）`
+            : (pool.reason || "—")}\n`;
+        if (!pool.variant && !pool.empty && !pool.nothingToClaim) {
             text += `\n提示：新版 Edge 请用桌面「Rewards Edge」快捷方式启动（端口 ${CDP.PORT}），`
                 + "脚本检测到 CDP 会自己在后台开一个临时标签页做同源请求，用完自动关闭"
                 + "（不抢焦点、不切走你正在看的页面）；Chrome 上后台直发通常也能过。";
         }
-        text += "\n判定口径：余额上涨 > 待领池清空 > 待领金额下降；三者都拿不到才记「无法确认」。";
+        text += "\n判定口径：余额上涨 > 待领池清空 > 待领金额下降；"
+            + "页面/服务端任一侧表示「没有待领」即为成功；真拿不到证据才记「无法确认」。";
         if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
         return text;
     };
