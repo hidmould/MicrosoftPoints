@@ -346,6 +346,12 @@ const __scBgKeepAlive = (function() {
             intlFound: 0,
             intlDone: 0,
             intlPending: 0,
+            /* 三个「为什么没有这一行」的标记，互斥：
+               intlAbsent = 账号面板里确实没有这组卡（地区/账号不支持）
+               intlCached = 今天已封盘，本轮没再拉面板（数值来自缓存）
+               都为 false 且 intlFound=0 = 本轮没跑到（出口拦截/被预算挤掉） */
+            intlAbsent: false,
+            intlCached: false,
             webNoAuth: false,
             webFailStreak: 0,
         }
@@ -2642,11 +2648,18 @@ const __scBgKeepAlive = (function() {
         KEY_EMPTY_AT: "Config.claimEmptyAt",
         EMPTY_TTL: 15 * 60 * 1000,
 
+        /* 页面上同时存在两个名字相近的字段，必须严格区分：
+             "pointClaim":{points:3,...}                  ← 待领对象（小写 p，要的就是它）
+             "PointClaim":{CategoryNames:{...}}           ← i18n 文案字典（大写 P，没有金额）
+           原来正则带了 /i，会先命中大写的字典，从里面读不到金额 → 判成 uncertain
+           → 每轮都"直接发一次领取请求再回读"，即使早就领完了也在刷日志和接口。 */
+        _CLAIM_KEY: /"pointClaim"\s*:\s*(null|\{|\[)/,
+
         parse(html) {
             const raw = String(html || "");
             if (!raw) return { known: false, has: false, amount: 0 };
             const clean = raw.replace(/\\"/g, '"');
-            const m = clean.match(/"pointClaim"\s*:\s*(null|\{|\[)/i);
+            const m = clean.match(this._CLAIM_KEY);
             if (m) {
                 if (m[1] === "null") return { known: true, has: false, amount: 0, source: "pointClaim" };
                 const amount = this._amount(clean);
@@ -2715,7 +2728,8 @@ const __scBgKeepAlive = (function() {
 
         _amount(html) {
             const clean = String(html || "").replace(/\\"/g, '"');
-            const at = clean.search(/"pointClaim"\s*:/i);
+            /* 用与小写 key 精确匹配的地址，别用 /i —— 否则会从 PointClaim 文案字典里取数 */
+            const at = clean.search(/"pointClaim"\s*:/);
             if (at < 0) return 0;
             const win = this._braceWindow(clean, at);
             /* 取该对象内所有「积分语义」字段的最大值：
@@ -2732,10 +2746,11 @@ const __scBgKeepAlive = (function() {
         },
 
         /* pointClaim 原文（压成一行），解析失败时写进日志：
-           下次再报「金额 0」就能直接看出是字段名变了，还是整页压根没登录。 */
+           下次再报「金额 0」就能直接看出是字段名变了，还是整页压根没登录。
+           同样只认小写 key：抓错了会显示一大段 CategoryNames 文案，反而看不出重点。 */
         _snippet(html) {
             const clean = String(html || "").replace(/\\"/g, '"').replace(/\s+/g, " ");
-            const at = clean.search(/"pointClaim"\s*:/i);
+            const at = clean.search(/"pointClaim"\s*:/);
             return at < 0 ? "" : clean.slice(at, at + 260);
         },
 
@@ -7079,7 +7094,11 @@ const __scBgKeepAlive = (function() {
             const base = {
                 date: today, count: 0, last: 0, complete: false, activated: false,
                 notified: false, extra: 0, total: 0, intervalMin: 5, offerid: "", type: "714", sync: 0,
-                giveUp: false, startAt: 0
+                giveUp: false, startAt: 0,
+                /* 服务端最近一次回读到的进度（分钟）。汇总只认它和 complete，
+                   不再拿本地的「已上报次数」冒充进度 —— 那是脚本内部计数，
+                   跟页面上「分钟: 30/30」根本不是一回事。 */
+                serverMin: 0, serverMax: 0
             };
             if (st.date !== today) return base;
             const intervalMin = Number(st.intervalMin) || 5;
@@ -7106,6 +7125,8 @@ const __scBgKeepAlive = (function() {
                 type: String(st.type || "714"),
                 sync: Number(st.sync) || 0,
                 giveUp: !!st.giveUp,
+                serverMin: Number(st.serverMin) || 0,
+                serverMax: Number(st.serverMax) || 0,
                 /* 本轮「开始累计」的锚点。服务端记的是「你实际浏览了多久」，
                    所以第 1 次上报也必须先真的过去一个计费窗口，
                    不能脚本一启动就立刻拍一次「已浏览 5 分钟」。 */
@@ -7125,6 +7146,48 @@ const __scBgKeepAlive = (function() {
         typeOf(attr) {
             const t = String((attr && attr.report_offer_type) || "").trim();
             return /^\d+$/.test(t) ? t : "714";
+        },
+
+        /* 把服务端 promo 里的「是否完成 / 已浏览分钟」抄进本地状态。
+           汇总只认它，不再拿本地 count 冒充进度（那只是「我发了几次上报」）。
+
+           ⚠️ 坑：这个 promotion 的 attributes 里还有积分字段（`max` / `value` 常常是 120 ——
+           那是这张卡给的**积分**，不是分钟）。早先的候选列表把 `attr.max` 也列进去，
+           于是把 120 当成分钟目标，汇总里出现「✅ 120/120 分钟」这种离谱数字。
+           分钟类字段只认名字里带 minute 的；`max/value/target` 一律不碰。 */
+        syncFromPromo(st, promo) {
+            if (!promo) return st;
+            const attr = promo.attributes || {};
+            const done = String(attr.complete).toLowerCase() === "true";
+            st.complete = done;
+            const pickNum = (...vals) => {
+                for (const v of vals) {
+                    const n = Number(v);
+                    if (Number.isFinite(n) && n >= 0) return n;
+                }
+                return null;
+            };
+            /* 只认「分钟语义」的键名。pointProgress/Max 在别的活动里是分钟口径，
+               但本活动里可能是积分，所以还要再过一道合理性检查（见下）。 */
+            const cur = pickNum(attr.minutesProgress, attr.minuteProgress,
+                attr.browsingMinutes, attr.browsedMinutes, attr.progressMinutes);
+            const max = pickNum(attr.minutesMax, attr.minuteMax,
+                attr.targetMinutes, attr.totalMinutes);
+            const sane = (v, limit) => (v != null && v >= 0 && v <= limit);
+            if (sane(cur, 24 * 60)) st.serverMin = cur;
+            if (sane(max, 24 * 60) && max > 0) st.serverMax = max;
+            /* 服务端没给可信分钟数时，目标时长就是活动规定的 30 分钟。
+               绝不让积分值（120）混进来当分母。 */
+            if (!(Number(st.serverMax) > 0)) st.serverMax = EDGE.TARGET_MINUTES;
+            if (Number(st.serverMax) > 24 * 60) st.serverMax = EDGE.TARGET_MINUTES;
+            if (Number(st.serverMin) > Number(st.serverMax)) st.serverMin = 0;
+            if (done) {
+                /* 已完成以目标时长为准，别显示 28/30 这种半截数字 */
+                st.serverMax = EDGE.TARGET_MINUTES;
+                st.serverMin = EDGE.TARGET_MINUTES;
+            }
+            st.sync = Date.now();
+            return st;
         },
 
         findPromotion(profile) {
@@ -7230,6 +7293,8 @@ const __scBgKeepAlive = (function() {
             st.offerid = String(attr.offerid || "").trim();
             st.type = this.typeOf(attr);
             const total = st.total;
+            /* 先把服务端的真实进度抄下来：汇总读的是这一份，不是本地 count */
+            this.syncFromPromo(st, promo);
 
             if (String(attr.complete).toLowerCase() === "true") {
                 st.complete = true;
@@ -7311,6 +7376,7 @@ const __scBgKeepAlive = (function() {
             await Utils.delay(Utils.randomRange(2000, 4000));
             const after = await API.getEdgeProfile(region);
             const afterPromo = after ? this.findPromotion(after) : null;
+            if (afterPromo) this.syncFromPromo(st, afterPromo);
             if (afterPromo && String((afterPromo.attributes || {}).complete).toLowerCase() === "true") {
                 st.complete = true;
                 st.sync = Date.now();
@@ -7319,10 +7385,37 @@ const __scBgKeepAlive = (function() {
                 this.notifyDone(st);
                 return { done: true, count: total, total, waitMs: 30 * 60 * 1000 };
             }
+            this.save(st);
             return {
                 done: false, count: st.count, total,
                 waitMs: dup ? Math.max(60 * 1000, st.intervalMin * 60 * 1000) : st.intervalMin * 60 * 1000
             };
+        },
+
+        /* 只读刷新：拉一次 profile 把「是否完成 / 分钟进度」更新到本地，不上报、不激活。
+           存在的理由：EdgePacer 有节流（nextAt），一轮里可能压根没轮到 EdgeStreak.step()，
+           而汇总只在每轮结束读一次本地状态。于是「页面早就 30/30 了，
+           推送还说 ⏳ 0/30」——显示的是一天前甚至更早的陈旧值。
+           这里在汇总前补一次轻量回读，代价是一次 GET。 */
+        async refreshFromServer() {
+            if (!GM_getValue("Tasks.edge", true)) return null;
+            if (!GM_getValue("Config.token", false)) return null;
+            try {
+                const region = API.edgeRegion();
+                const profile = await API.getEdgeProfile(region);
+                const promo = profile ? this.findPromotion(profile) : null;
+                if (!promo) return null;
+                const st = this.state();
+                const attr = promo.attributes || {};
+                st.intervalMin = this.intervalOf(attr);
+                st.total = Math.ceil(EDGE.TARGET_MINUTES / st.intervalMin);
+                this.syncFromPromo(st, promo);
+                if (st.complete) st.count = st.total;
+                this.save(st);
+                return st;
+            } catch (_) {
+                return null;
+            }
         },
 
         async run() {
@@ -7342,12 +7435,33 @@ const __scBgKeepAlive = (function() {
             }
         },
 
+        /* 汇总口径：服务端「有没有完成」说了算，分钟数也取服务端回读值。
+           本地 count 只是「我发了几次上报」——它可能因为判重、跨设备浏览、
+           服务端延迟记账而和真实进度差很远。以前拿它当进度显示，
+           于是出现「页面 30/30 已完成，推送却说 0/6 ⏳」这种自相矛盾。 */
         summary() {
             if (!GM_getValue("Tasks.edge", true)) return null;
             const st = this.state();
-            const total = st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
-            const count = Math.min(st.count, total);
-            return { done: st.complete, skipped: st.giveUp && !st.complete, count, total, text: `${count}/${total}` };
+            const done = !!st.complete;
+            /* 分母只能是「活动要求的分钟数」。服务端若给出可信值才采用，
+               但必须同时满足：> 0 且 <= 24 小时 且 不是明显的积分值。
+               实际遇到的脏数据是 120（这张卡给的积分），所以「比目标大一倍以上」
+               一律视为误读 —— 分母退回 EDGE.TARGET_MINUTES（30）。 */
+            const rawMax = Number(st.serverMax) || 0;
+            const maxMin = (rawMax > 0 && rawMax <= EDGE.TARGET_MINUTES * 2) ? rawMax : EDGE.TARGET_MINUTES;
+            let curMin = Number(st.serverMin) || 0;
+            if (done) curMin = maxMin;
+            if (!(curMin >= 0) || curMin > maxMin) curMin = 0;
+            const count = Math.min(st.count, st.total || 0);
+            return {
+                done,
+                skipped: st.giveUp && !done,
+                count,
+                total: st.total || 0,
+                /* 分钟口径：与服务端面板一致；读不到服务端值时才退回「已完成/未完成」 */
+                minutes: { cur: curMin, max: maxMin, known: Number(st.serverMax) > 0 || done },
+                text: `${curMin}/${maxMin} 分钟`
+            };
         }
     };
 
@@ -8066,7 +8180,7 @@ const __scBgKeepAlive = (function() {
                    网络慢到 spent 本身超过 cycle 时，下限 3 秒兜底，此时间隔 = spent + 3，
                    日志里如实报出来，不假装还在 ±15 秒内。 */
                 const actual = Math.round((spent + wait) / 1000);
-                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（本轮周期 ${Math.round(cycle / 1000)} 秒，已用 ${(spent / 1000).toFixed(0)} 秒，实际间隔约 ${actual} 秒）`);
+                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（本轮周期 ${Math.round(cycle / 1000)} 秒，已用 ${(spent / 1000).toFixed(0)} 秒`);
                 await Utils.delay(wait);
             }
 
@@ -8316,8 +8430,16 @@ const __scBgKeepAlive = (function() {
             const today = Utils.getTodayNum();
             const key = "Config.intlDailyDate";
             const st = GM_getValue(key, null);
-            /* 服务端已确认做完就当天封盘，省掉这轮的面板请求 */
+            /* 服务端已确认做完就当天封盘，省掉这轮的面板请求。
+               注意必须把 state 补回来：汇总渲染读的是 RewardsAuto.state.intlFound，
+               而 state 每轮开始是 0。以前这里只写日志就 return，于是
+               「当天已封盘」的那几轮汇总里根本没有这一行，看起来像漏做了。 */
             if (st && Number(st.date) === today && Number(st.pending) === 0) {
+                RewardsAuto.state.intlFound = Number(st.found) || 0;
+                RewardsAuto.state.intlDone = Number(st.done) || 0;
+                RewardsAuto.state.intlPending = 0;
+                RewardsAuto.state.intlReason = "";
+                RewardsAuto.state.intlCached = true;
                 Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
                 return true;
             }
@@ -8330,9 +8452,18 @@ const __scBgKeepAlive = (function() {
             }
             if (!res) return false;
             if (res.found === 0) {
+                /* 面板里一张都没有：这账号本来就没有这组活动（地区/账号不支持）。
+                   和「代码没跑到」是两回事，日志里要能一眼区分，否则下次又得回来查。 */
                 GM_setValue(key, { date: today, found: 0, done: 0, pending: 0 });
+                RewardsAuto.state.intlFound = 0;
+                RewardsAuto.state.intlDone = 0;
+                RewardsAuto.state.intlPending = 0;
+                RewardsAuto.state.intlAbsent = true;
+                Utils.log("  ", "国际版每日活动：此账号面板里没有这组卡片（地区/账号不支持），跳过");
                 return true;
             }
+            RewardsAuto.state.intlAbsent = false;
+            RewardsAuto.state.intlCached = false;
             GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending });
             RewardsAuto.state.intlFound = res.found;
             RewardsAuto.state.intlDone = res.done;
@@ -8613,6 +8744,10 @@ const __scBgKeepAlive = (function() {
                 const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
                 const endBalance = await API.getBalance();
                 const earned = (startBalance > 0 && endBalance > 0) ? (endBalance - startBalance) : 0;
+                /* 汇总前补一次 Edge 连签的服务端回读：
+                   EdgePacer 有节流，本轮可能没轮到 step()，本地状态会是老值。
+                   这一步只读不写（不上报、不激活），失败也不影响汇总。 */
+                try { await EdgeStreak.refreshFromServer(); } catch (_) {}
                 const info = await API.getRewardsInfo();
                 if (info) {
                     /* 汇总的图标约定：一枚图标只表达一件事
@@ -8700,15 +8835,24 @@ const __scBgKeepAlive = (function() {
                     row("🧩 活动卡片", promosOn, promosOk, "");
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
                     /* 国际版 5 张卡是「额外加分」项：
-                       · 关掉 → 显示「⏭️ 已关闭」（和别的任务一致，别让人以为漏做）
-                       · 开着但这账号没有这组活动（found=0）→ 不显示这一行 */
+                       · 关掉   → 「⏭️ 已关闭」（和别的任务一致，别让人以为漏做）
+                       · 有卡片 → 正常显示 N/M（封盘轮次标注「今日已封盘」，一眼看出没重跑）
+                       · 没有   → 明确写出原因，而不是整行消失。
+                         整行消失会让人分不清「账号没有这项活动」和「脚本没跑到」，
+                         这轮排查就是这么来的。 */
                     const intlOn = GM_getValue("Tasks.intlDaily", true);
                     const intlFound = Number(RewardsAuto.state.intlFound) || 0;
                     if (!intlOn) {
                         row("🌍 国际版每日活动", false, true, "");
                     } else if (intlFound > 0) {
                         const intlDone = Number(RewardsAuto.state.intlDone) || 0;
-                        row("🌍 国际版每日活动", intlOn, intlOk && intlDone >= intlFound, intlDone + "/" + intlFound);
+                        row("🌍 国际版每日活动", intlOn, intlOk && intlDone >= intlFound,
+                            intlDone + "/" + intlFound
+                            + (RewardsAuto.state.intlCached ? "（今日已封盘）" : ""));
+                    } else if (RewardsAuto.state.intlAbsent) {
+                        rows.push("🌍 国际版每日活动 · ⏭️ 此账号无这项活动");
+                    } else {
+                        rows.push("🌍 国际版每日活动 · ⏳ 本轮未检查（下一轮再试）");
                     }
                     row("🖥️ 桌面专属任务", desktopOn, desktopPending === 0 && desktopFailed === 0,
                         desktopPending > 0 ? `${desktopPending} 张未记账`
@@ -8921,7 +9065,14 @@ const __scBgKeepAlive = (function() {
             : 0;
         let text = "🌐 Edge 浏览连签\n\n";
         text += `任务开关：${enabled ? "开启" : "关闭"}\n`;
-        text += `上报进度：${Math.min(st.count, total)}/${total} 次（每次覆盖 ${st.intervalMin} 分钟，满 ${EDGE.TARGET_MINUTES} 分钟记账）\n`;
+        /* 汇总口径（服务端为准）放在最前面，和推送里那一行保持一致 */
+        {
+            const sum = EdgeStreak.summary();
+            text += `服务端进度：${st.complete ? "✅" : "⏳"} ${sum ? sum.text : "—"}`
+                + `（${EDGE.TARGET_MINUTES} 分钟为达标）\n`;
+        }
+        text += `上报次数（本地计数，仅供排查）：${Math.min(st.count, total)}/${total} 次`
+            + `（每次覆盖 ${st.intervalMin} 分钟）\n`;
         text += `服务端状态：${st.complete ? "✅ 已完成" : (st.giveUp ? "⏭️ 今日已跳过" : "⏳ 未完成")}\n`;
         text += `本轮计时起点：${st.startAt ? new Date(st.startAt).toLocaleString("zh-CN") : "尚未开始（今天还没进入累计）"}\n`;
         text += `上次上报：${st.last ? new Date(st.last).toLocaleString("zh-CN") : "无"}\n`;
