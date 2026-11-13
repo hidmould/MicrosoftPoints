@@ -6193,6 +6193,13 @@ const __scBgKeepAlive = (function() {
     const IntlDaily = {
         PATH: "/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards",
         REPORT_PATH: "/msrewards/api/v1/reportactivity",
+        /* 这一族 offer 的完整形态是 <PREFIX>star_Rewards_DailyGlobalOffer_<星期>，
+           PREFIX 会随「区域 + 活动版本」变化：
+             ENstar_  国际版（5 分）
+             ZHstar_  国内版（5 分）
+           实测还存在带锁的变体（面板显示 🔒 +10），命名也在这一族里，
+           所以这里不再写死单个前缀，改用正则统一识别。 */
+        OFFER_RE: /^[A-Za-z]{2}star_Rewards_DailyGlobalOffer_(Evergreen_)?(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$/,
         OFFER_PREFIX: "ENstar_Rewards_DailyGlobalOffer_",
         WEEKDAYS: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
         /* 面板接口的 Referer 必须是 bing 主页；缺了会被判成外站请求 */
@@ -6303,12 +6310,22 @@ const __scBgKeepAlive = (function() {
             const seen = new Map();
             for (const p of panel.promos) {
                 const name = String(p.name || p.offerId || "");
-                if (!name.startsWith(this.OFFER_PREFIX)) continue;
+                const matched = name.match(this.OFFER_RE);
+                if (!matched) continue;
                 const attr = p.attributes || {};
                 const offerId = String(p.offerId || attr.offerid || name);
-                const day = name.slice(this.OFFER_PREFIX.length).replace(/^Evergreen_/, "");
-                if (!this.WEEKDAYS.includes(day)) continue;
+                const day = matched[2];
                 if (want && !want.has(day)) continue;
+
+                /* 带锁变体（面板左上角 🔒，如「Complete this puzzle +10」）：
+                   国内版的结论是「锁 ≠ 不能做，而是要换通道」（App / 真拼图）。
+                   所以这里**不跳过**，只打个标记，照常尝试：
+                     · 面板接口能过就过
+                     · 过不了再按渠道兜底（拼图走真拼、Quiz 走真作答）
+                   只有全部失败才记为「受限」，最后一并报出来 ——
+                   直接跳过会让它永远不完成，这才是之前「带锁卡不动」的原因。 */
+                const lock = CardLock.probe({ ...attr, name, State: p.State || attr.State });
+                const needApp = !!lock.appExclusive || lock.appOnly === true;
                 if (!p.hash) continue;              /* 没有 hash 就交不了卷，别占位 */
                 if (seen.has(offerId)) continue;
                 const done = p.complete === true
@@ -6321,6 +6338,10 @@ const __scBgKeepAlive = (function() {
                    实测：只调面板的 msrewards/reportactivity 对它是无效的。 */
                 const isQuiz = /Homepage%20quiz|BingQA_Quiz|form=ML2BF1/i.test(destination)
                     || /do you know the answer/i.test(String(attr.title || p.title || ""));
+                /* 拼图卡：落地页是 spotlight/imagepuzzle。
+                   普通 +5 版走面板接口就够，但带锁 +10 版必须真拼 —— 由 report() 按需分流。 */
+                const isPuzzle = /spotlight\/imagepuzzle/i.test(destination)
+                    || /puzzle|拼图/i.test(String(attr.title || p.title || ""));
                 seen.set(offerId, {
                     offerId,
                     name,
@@ -6331,7 +6352,12 @@ const __scBgKeepAlive = (function() {
                     points: Number(p.pointProgressMax || attr.max || 5) || 5,
                     complete: done,
                     destination,
-                    isQuiz
+                    isQuiz,
+                    isPuzzle,
+                    /* 锁态只作参考：带锁卡照样尝试，失败后单独汇报 */
+                    locked: lock.locked === true,
+                    lockReason: lock.reason || "",
+                    needApp
                 });
             }
             return [...seen.values()];
@@ -6346,6 +6372,158 @@ const __scBgKeepAlive = (function() {
              只调 msrewards/reportactivity  → 卡永远不完成
              打开落地页 + 点正确选项        → 页面自己发 reportActivity，记账
            所以这里按「取题 → 作答 → 用同样的参数上报」复刻整条链路。 */
+
+        /* ── 拼图卡（Complete this puzzle / 周中拼图）专用通道 ────────────────
+           普通 +5 拼图调面板 reportactivity 就能记账；
+           但**带锁的 +10 变体**（面板左上角 🔒）走的是另一条路：
+           必须先在该拼图落地页里真的把图拼好，页面才会记账。
+           实测落地页（spotlight/imagepuzzle）结构：
+             · #tiles > div.tile[x][y]，空的那格没有子元素
+             · 每格里的 <img id="imgN">，N 就是该块的目标位置（0..rows*cols-1）
+             · 拼好时 #congrats 去掉 b_hide，并自动跳转 spotlight 页
+           所以这里用 BFS 求最短解，再模拟真实点击顺序。 */
+
+        /* 从落地页 HTML 解出拼图布局（row/col 与每格对应的图块编号） */
+        _parsePuzzle(html) {
+            const text = String(html || "");
+            const rows = Number((text.match(/puzzleSettings\.rows\s*=\s*(\d+)/) || [])[1]) || 0;
+            const cols = Number((text.match(/puzzleSettings\.columns\s*=\s*(\d+)/) || [])[1]) || 0;
+            if (!rows || !cols) return { ok: false, reason: "落地页里没有拼图配置" };
+            /* <div x="0" y="1" ... id="01" ...><div class="parentTile">...<img id="img1"> */
+            const tiles = [...text.matchAll(/<div\s+x="(\d+)"\s+y="(\d+)"[^>]*id="(\d+)"[^>]*>([\s\S]{0,600}?)<\/div>\s*<\/div>/g)]
+                .map(m => {
+                    const img = (m[4].match(/<img[^>]*id="img(\d+)"/) || [])[1];
+                    return { x: Number(m[1]), y: Number(m[2]), id: m[3], img: img === undefined ? null : Number(img) };
+                });
+            if (tiles.length !== rows * cols) {
+                /* 退一步：只按 tile 块 + img 配对，不依赖嵌套结构 */
+                const simple = [...text.matchAll(/id="(\d{2})"[^>]*>([\s\S]{0,500}?)<img[^>]*id="img(\d+)"/g)]
+                    .map(m => ({ x: Number(m[1][0]), y: Number(m[1][1]), id: m[1], img: Number(m[3]) }));
+                if (simple.length === rows * cols - 1) return { ok: true, rows, cols, tiles: simple, blank: rows * cols - 1 };
+                return { ok: false, reason: `拼图块数对不上（${tiles.length || simple.length}/${rows * cols}）` };
+            }
+            return { ok: true, rows, cols, tiles, blank: rows * cols - 1 };
+        },
+
+        /* 通过 CDP 打开拼图页并把它真拼完。
+           返回 {ok, moves, reason}。只有 CDP 可用时才有戏；不可用就如实返回原因。 */
+        async solvePuzzleViaCdp(destination) {
+            if (typeof WebSocket === "undefined") return { ok: false, reason: "当前环境没有 WebSocket" };
+            if (!(await CDP.available())) return { ok: false, reason: `CDP 未连接（端口 ${CDP.PORT}）` };
+            const url = String(destination || "").trim();
+            if (!url) return { ok: false, reason: "缺少拼图落地页" };
+            let page = null;
+            try {
+                page = await CDP._ownedPage(url, { create: true, reason: "card-cdp" });
+                if (!page || !page.webSocketDebuggerUrl) return { ok: false, reason: "拿不到 CDP 页面" };
+                if (!CDP._ws || CDP._ws.readyState !== 1) await CDP.connect(page.webSocketDebuggerUrl);
+                await CDP.goto(page, url);
+                /* 等图块生成：页面会先拉图片再切块，给足时间 */
+                for (let i = 0; i < 20; i++) {
+                    const n = await CDP.evaluate("document.querySelectorAll('#tiles > .tile').length");
+                    if (Number(n) >= 4) break;
+                    await Utils.delay(500);
+                }
+                /* 在页面里跑 BFS + 模拟点击：一次求值里做完，避免来回几十次 CDP 调用 */
+                const script = `(async () => {
+                  const tiles = [...document.querySelectorAll('#tiles > .tile')];
+                  if (!tiles.length) return { ok:false, reason:'没有图块' };
+                  const xs = tiles.map(t=>Number(t.getAttribute('x'))), ys = tiles.map(t=>Number(t.getAttribute('y')));
+                  const rows = Math.max(...xs)+1, cols = Math.max(...ys)+1, BLANK = rows*cols-1;
+                  const read = () => {
+                    const g = []; for (let x=0;x<rows;x++){ g[x]=[]; for(let y=0;y<cols;y++) g[x][y]=BLANK; }
+                    for (const t of tiles) {
+                      const img = t.querySelector('img');
+                      if (!img) continue;
+                      const n = Number(String(img.id||'').replace('img',''));
+                      if (!Number.isNaN(n)) g[Number(t.getAttribute('x'))][Number(t.getAttribute('y'))] = n;
+                    }
+                    return g;
+                  };
+                  const goal = []; for (let x=0;x<rows;x++){ goal[x]=[]; for(let y=0;y<cols;y++) goal[x][y]=x*cols+y; }
+                  const key = g => g.flat().join(',');
+                  const goalKey = key(goal);
+                  const start = read();
+                  if (key(start) === goalKey) return { ok:true, moves:0, already:true };
+                  const q = [{ g:start, m:[] }], seen = new Set([key(start)]);
+                  const dirs = [[-1,0],[1,0],[0,-1],[0,1]];
+                  let found = null, head = 0;
+                  while (head < q.length && !found) {
+                    const cur = q[head++];
+                    let bx=-1, by=-1;
+                    for (let x=0;x<rows;x++) for (let y=0;y<cols;y++) if (cur.g[x][y]===BLANK) { bx=x; by=y; }
+                    for (const [dx,dy] of dirs) {
+                      const nx=bx+dx, ny=by+dy;
+                      if (nx<0||nx>=rows||ny<0||ny>=cols) continue;
+                      const ng = cur.g.map(r=>r.slice());
+                      const t = ng[bx][by]; ng[bx][by]=ng[nx][ny]; ng[nx][ny]=t;
+                      const k = key(ng);
+                      if (seen.has(k)) continue;
+                      seen.add(k);
+                      const nm = cur.m.concat([[nx,ny]]);
+                      if (k === goalKey) { found = nm; break; }
+                      q.push({ g:ng, m:nm });
+                    }
+                  }
+                  if (!found) return { ok:false, reason:'拼图无解', states:seen.size };
+                  // 按解的顺序真实点击
+                  for (const [x,y] of found) {
+                    const cell = document.getElementById(String(x)+String(y));
+                    const img = cell && cell.querySelector('img');
+                    if (!img) { await new Promise(r=>setTimeout(r,40)); continue; }
+                    img.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
+                    await new Promise(r=>setTimeout(r,45));
+                  }
+                  await new Promise(r=>setTimeout(r,300));
+                  const done = !document.getElementById('congrats').classList.contains('b_hide');
+                  return { ok:done, moves:found.length, states:seen.size, done };
+                })()`;
+                const r = await CDP.evaluate(script);
+                if (!r || typeof r !== "object") return { ok: false, reason: "页面求值没有返回结果" };
+                if (r.ok) return { ok: true, moves: r.moves || 0 };
+                return { ok: false, reason: r.reason || "拼图未完成" };
+            } catch (e) {
+                return { ok: false, reason: `CDP 拼图异常：${e.message}` };
+            }
+        },
+
+        /* BFS 求最短解：返回点击顺序 [{x,y}...]（点的是空格旁边的块） */
+        _solvePuzzle(puzzle) {
+            const { rows, cols, tiles, blank } = puzzle;
+            const grid = [];
+            for (let x = 0; x < rows; x++) grid[x] = new Array(cols).fill(blank);
+            for (const t of tiles) {
+                if (t.img === null || t.img === undefined) continue;
+                if (t.x >= 0 && t.x < rows && t.y >= 0 && t.y < cols) grid[t.x][t.y] = t.img;
+            }
+            const goal = [];
+            for (let x = 0; x < rows; x++) { goal[x] = []; for (let y = 0; y < cols; y++) goal[x][y] = x * cols + y; }
+            const key = g => g.flat().join(",");
+            const goalKey = key(goal);
+            if (key(grid) === goalKey) return { ok: true, path: [] };
+            const q = [{ g: grid, m: [] }];
+            const seen = new Set([key(grid)]);
+            const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+            let head = 0;
+            while (head < q.length) {
+                const cur = q[head++];
+                let bx = -1, by = -1;
+                for (let x = 0; x < rows; x++) for (let y = 0; y < cols; y++) if (cur.g[x][y] === blank) { bx = x; by = y; }
+                for (const [dx, dy] of dirs) {
+                    const nx = bx + dx, ny = by + dy;
+                    if (nx < 0 || nx >= rows || ny < 0 || ny >= cols) continue;
+                    const ng = cur.g.map(r => r.slice());
+                    const t = ng[bx][by]; ng[bx][by] = ng[nx][ny]; ng[nx][ny] = t;
+                    const k = key(ng);
+                    if (seen.has(k)) continue;
+                    seen.add(k);
+                    const nm = cur.m.concat([{ x: nx, y: ny }]);
+                    if (k === goalKey) return { ok: true, path: nm, states: seen.size };
+                    q.push({ g: ng, m: nm });
+                }
+            }
+            return { ok: false, reason: "拼图无解（可能是无解局面）" };
+        },
 
         /* 把落地页 URL 里的 filters 参数解析成键值（面板下发的是转义过的串） */
         _parseQuizFilters(destination) {
@@ -6539,6 +6717,10 @@ const __scBgKeepAlive = (function() {
                    继续试只会多打几次请求。直接把原因交给上层。 */
                 return { ok: false, outcome: "unknown", reason: `quiz: ${r.reason}` };
             }
+
+            /* 说明：拼图卡**不**在这里无条件走 CDP ——
+               普通 +5 拼图用面板接口就能记账（已实测），只有带锁的 +10 变体
+               才必须真拼。所以这里仍走下面的面板通道，失败后在函数末尾回退到 CDP。 */
             const body = {
                 ActivityType: card.activityType,
                 ActivitySubType: "",
@@ -6680,6 +6862,17 @@ const __scBgKeepAlive = (function() {
                 } catch (e) {
                     reasons.push(`page: ${e.message}`);
                 }
+            }
+            /* 拼图卡最后的兜底：面板接口没受理时，才真去落地页把它拼完。
+               带锁的 +10 变体就是这种情况 —— 面板接口对它永远不记账，
+               页面里拼好才会由页面自己上报。普通 +5 卡在上面就已经成功了，
+               不会走到这里，所以不会平白无故开 CDP 标签页。 */
+            if (card.isPuzzle && card.destination) {
+                const solved = await this.solvePuzzleViaCdp(card.destination);
+                if (solved.ok) {
+                    return { ok: true, via: "puzzle", points: card.points, balance: 0 };
+                }
+                reasons.push(`puzzle: ${solved.reason}`);
             }
             return { ok: false, outcome, reason: reasons.join("；") || "全部通道失败" };
         },
