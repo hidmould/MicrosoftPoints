@@ -6886,23 +6886,37 @@ const __scBgKeepAlive = (function() {
             const base = {
                 date: today, count: 0, last: 0, complete: false, activated: false,
                 notified: false, extra: 0, total: 0, intervalMin: 5, offerid: "", type: "714", sync: 0,
-                giveUp: false
+                giveUp: false, startAt: 0
             };
             if (st.date !== today) return base;
+            const intervalMin = Number(st.intervalMin) || 5;
+            const count = Number(st.count) || 0;
+            const last = Number(st.last) || 0;
+            /* 老状态升级：旧版本没有 startAt，但有 count/last。
+               用 last 反推一个等效锚点，别让已累计的进度被当成「全新一天」重来。
+               放在 state() 里做，任何读状态的地方（含诊断面板）都能看到同一个值。 */
+            let startAt = Number(st.startAt) || 0;
+            if (!startAt && count > 0 && last) {
+                startAt = last - (count - 1) * Math.max(1, intervalMin) * 60 * 1000;
+            }
             return {
                 ...base,
-                count: Number(st.count) || 0,
-                last: Number(st.last) || 0,
+                count,
+                last,
                 complete: !!st.complete,
                 activated: !!st.activated,
                 notified: !!st.notified,
                 extra: Number(st.extra) || 0,
                 total: Number(st.total) || 0,
-                intervalMin: Number(st.intervalMin) || 5,
+                intervalMin,
                 offerid: String(st.offerid || ""),
                 type: String(st.type || "714"),
                 sync: Number(st.sync) || 0,
                 giveUp: !!st.giveUp,
+                /* 本轮「开始累计」的锚点。服务端记的是「你实际浏览了多久」，
+                   所以第 1 次上报也必须先真的过去一个计费窗口，
+                   不能脚本一启动就立刻拍一次「已浏览 5 分钟」。 */
+                startAt,
             };
         },
 
@@ -6949,11 +6963,40 @@ const __scBgKeepAlive = (function() {
             if (st.complete && Date.now() - st.sync < 2 * 60 * 60 * 1000) {
                 return { done: true, count: st.count || totalOf(), total: totalOf(), waitMs: 30 * 60 * 1000 };
             }
-            if (!st.complete && st.count > 0 && st.last && Date.now() - st.last < st.intervalMin * 60 * 1000) {
-                return {
-                    done: false, count: st.count, total: totalOf(),
-                    waitMs: st.last + st.intervalMin * 60 * 1000 - Date.now()
-                };
+            /* 节拍判定：第 N 次上报必须等「锚点 + N 个计费窗口」真的过去。
+               以前条件是 `st.count > 0 && ...`，每天第一次进来 count 就是 0，
+               守卫直接失效 —— 脚本一启动立刻把第 1 个「5 分钟」拍上去，
+               而那一刻一分钟都还没浏览，服务端记的却是真实时长。
+               这里先按「已知的间隔」挡一下，避免每次心跳都去联网拉 profile。
+               （老状态升级时的锚点反推在 state() 里完成。） */
+            {
+                const winMs = Math.max(1, st.intervalMin) * 60 * 1000;
+                const anchor = st.startAt || st.last;
+                if (anchor && st.count < totalOf()) {
+                    const byAnchor = anchor + (st.count + 1) * winMs;
+                    const byLast = st.last ? st.last + winMs : 0;
+                    const dueAt = Math.max(byAnchor, byLast);
+                    if (Date.now() < dueAt - 5000) {
+                        return {
+                            done: false, count: st.count, total: totalOf(),
+                            waitMs: dueAt - Date.now()
+                        };
+                    }
+                }
+            }
+            /* 还没有锚点，且已经知道真实计费窗口（st.total > 0 = 之前跟服务端对过话）：
+               现在落锚点，第 1 次上报等满一个窗口。
+               如果连窗口都还不知道，就先别落，等下面拉到 profile 用真实间隔落，
+               否则会按默认 5 分钟计时，碰上 10 分钟的活动就会早报。
+               注意：次数已经攒满（count >= total）但服务端没确认时不走这里，
+               那是「等复核」而不是「重新开始」，进度不能报成 0。 */
+            if (!st.startAt && st.total > 0 && st.count < st.total) {
+                st.startAt = Date.now();
+                this.save(st);
+                const win = Math.max(1, st.intervalMin);
+                Utils.log("🌐", `Edge 浏览连签：开始累计，${st.total} 次 × 每次 ${win} 分钟`
+                    + `（第 1 次将在约 ${win} 分钟后上报）`);
+                return { done: false, count: 0, total: st.total, waitMs: win * 60 * 1000 };
             }
             if (!RewardsAuto.state.token) {
                 const ok = await API.renewToken();
@@ -7006,7 +7049,29 @@ const __scBgKeepAlive = (function() {
             if (st.complete) {
                 Utils.log("🟡", "Edge 浏览连签：本地标记已完成但服务端未确认，重新累计");
                 st.complete = false; st.count = 0; st.last = 0; st.extra = 0; st.notified = false;
+                /* 重来一轮 = 重新计时，第 1 次上报照样要等满一个窗口 */
+                st.startAt = 0;
                 this.save(st);
+            }
+            /* 走到这儿说明服务端还没做完，且（按已知窗口）已经到点。
+               如果上面是用默认 5 分钟判的，而真实窗口更大，这里用服务端的
+               intervalMin 再判一次，避免按小窗口提前上报。 */
+            if (!st.startAt) {
+                st.startAt = Date.now();
+                this.save(st);
+                const win = Math.max(1, st.intervalMin);
+                Utils.log("🌐", `Edge 浏览连签：开始累计，${total} 次 × 每次 ${win} 分钟`
+                    + `（第 1 次将在约 ${win} 分钟后上报）`);
+                return { done: false, count: 0, total, waitMs: win * 60 * 1000 };
+            }
+            {
+                const winMs = Math.max(1, st.intervalMin) * 60 * 1000;
+                const byAnchor = st.startAt + (st.count + 1) * winMs;
+                const byLast = st.last ? st.last + winMs : 0;
+                const dueAt = Math.max(byAnchor, byLast);
+                if (st.count < total && Date.now() < dueAt) {
+                    return { done: false, count: st.count, total, waitMs: dueAt - Date.now() };
+                }
             }
             if (!st.offerid) {
                 st.giveUp = true;
@@ -7027,6 +7092,10 @@ const __scBgKeepAlive = (function() {
                 st.extra++;
                 st.count = 0;
                 st.last = 0;
+                /* 整轮重来 = 重新计时：锚点必须换成「现在」，
+                   否则 state() 会拿旧的 last 反推出一个过去的锚点，
+                   下一轮就以为窗口早就过了，于是立刻上报。 */
+                st.startAt = Date.now();
                 this.save(st);
                 Utils.log("🟡", `Edge 浏览连签：服务端未确认完成，第 ${st.extra}/${EDGE.MAX_EXTRA_ROUNDS} 轮重新累计`);
                 return { done: false, count: 0, total, waitMs: 0 };
@@ -8648,14 +8717,26 @@ const __scBgKeepAlive = (function() {
         const enabled = GM_getValue("Tasks.edge", true);
         const st = EdgeStreak.state();
         const total = st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
-        const waitMs = (!st.complete && st.count > 0 && st.last)
-            ? Math.max(0, st.last + st.intervalMin * 60000 - Date.now()) : 0;
+        /* 等待时间与上报逻辑同一口径：锚点 + 第 N 个窗口，且不早于上次上报 + 一个窗口。
+           原来这里也写着 `st.count > 0`，于是刚启动时面板不显示「下次上报」。 */
+        const winMs = Math.max(1, st.intervalMin) * 60 * 1000;
+        const waitMs = (!st.complete && st.count < total && (st.startAt || st.last))
+            ? Math.max(0, Math.max(
+                (st.startAt || st.last) + (st.count + 1) * winMs,
+                st.last ? st.last + winMs : 0
+            ) - Date.now())
+            : 0;
         let text = "🌐 Edge 浏览连签\n\n";
         text += `任务开关：${enabled ? "开启" : "关闭"}\n`;
         text += `上报进度：${Math.min(st.count, total)}/${total} 次（每次覆盖 ${st.intervalMin} 分钟，满 ${EDGE.TARGET_MINUTES} 分钟记账）\n`;
         text += `服务端状态：${st.complete ? "✅ 已完成" : (st.giveUp ? "⏭️ 今日已跳过" : "⏳ 未完成")}\n`;
+        text += `本轮计时起点：${st.startAt ? new Date(st.startAt).toLocaleString("zh-CN") : "尚未开始（今天还没进入累计）"}\n`;
         text += `上次上报：${st.last ? new Date(st.last).toLocaleString("zh-CN") : "无"}\n`;
-        if (waitMs > 0) text += `下次上报：约 ${Math.ceil(waitMs / 60000)} 分钟后\n`;
+        if (waitMs > 0) {
+            text += `下次上报：约 ${Math.max(1, Math.ceil(waitMs / 60000))} 分钟后`;
+            if (st.count === 0) text += "（第 1 次会等满一个计费窗口，不会一启动就报）";
+            text += "\n";
+        }
         text += `活动激活：${st.activated ? "已尝试" : "未尝试"}${st.extra ? `（已重来 ${st.extra}/${EDGE.MAX_EXTRA_ROUNDS} 轮）` : ""}\n`;
         text += `客户端：${RewardsAuto.ua.edge}\n\n`;
         text += "现在立刻推进一次（不足一个计费窗口会自动跳过，不刷接口）。";
