@@ -35,6 +35,7 @@
 // @grant        GM_openInTab
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_deleteValue
 // @grant        GM_cookie
 // @grant        GM_closeTab
 // @grant        GM_info
@@ -7345,7 +7346,11 @@ const __scBgKeepAlive = (function() {
         init() {
             RewardsAuto.state.dateNowNum = Utils.getTodayNum();
             RewardsAuto.state.dateNowStr = Utils.getTodayStr();
-            const tasks = GM_getValue("Config.tasks", {});
+            /* 注意：软重置会把 Config.tasks 显式写成 null，此时 GM_getValue 的默认值
+               （{}）不会生效（只有键不存在时才回退），直接读 tasks.sign 会抛
+               「Cannot read properties of null」。所以这里必须先判定成对象。 */
+            const rawTasks = GM_getValue("Config.tasks", null);
+            const tasks = (rawTasks && typeof rawTasks === "object") ? rawTasks : {};
             this.signDate = tasks.sign || 0;
             this.readDate = tasks.read || 0;
             this.promosDate = tasks.promos || 0;
@@ -8781,11 +8786,12 @@ const __scBgKeepAlive = (function() {
         const before = authFingerprint();
         /* 先把要清的键里「本来就存在的」记下来，报告时能说清清了什么 */
         const cleared = SOFT_RESET_KEYS.filter(k => GM_getValue(k, null) !== null);
+        /* 用 GM_deleteValue 而非写 null：写 null 会让「键存在但值为空」，
+           GM_getValue 的默认值只在键不存在时才生效，于是下游读到 null 就崩
+           delete 之后键真的消失，默认值全部恢复正常。 */
         SOFT_RESET_KEYS.forEach(k => {
-            try { GM_setValue(k, null); } catch (_) {}
+            try { GM_deleteValue(k); } catch (_) { try { GM_setValue(k, undefined); } catch (_) {} }
         });
-
-        /* 内存态也要一起回到初值，否则不刷新页面时仍按旧状态跑 */
         try {
             TaskManager.init();                    // 任务标记全部归零
             TaskManager.running = false;
