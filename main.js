@@ -6436,7 +6436,21 @@ const __scBgKeepAlive = (function() {
              ZHstar_  国内版（5 分）
            实测还存在带锁的变体（面板显示 🔒 +10），命名也在这一族里，
            所以这里不再写死单个前缀，改用正则统一识别。 */
-        OFFER_RE: /^[A-Za-z]{2}star_Rewards_DailyGlobalOffer_(Evergreen_)?(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$/,
+        /* 这一族 offer 的完整形态是
+             <PREFIX>star_Rewards_DailyGlobalOffer_[Evergreen_]<星期 或 变体名>
+           PREFIX 随「区域 + 活动版本」变化：ZHstar_（国内版）、ENstar_（国际版）。
+           第三段除了星期名，还会出现**变体名**顶替星期名的位置 —— 实测 2026-11：
+             ENstar_Rewards_DailyGlobalOffer_Evergreen_VerB_Locked_level2   （+10 带锁拼图）
+           它不是 "Evergreen_Monday" 这种，而是把 VerB_Locked_level2 直接写在第三段。
+           旧正则要求第三段必须是星期名且到此结尾，于是这张卡**永远匹配不到**，
+           pickCards 看不见它 —— 现象就是「+10 那张拼图一直不做」，
+           而日志里同名 +5 的 "Complete this puzzle" 却完成了。
+
+           现在第三段接受「星期名」或「变体名」，且允许后续还有 _ 分段。
+           星期名仍从第 2 组取（拿不到就用变体名兜底，不要因此丢卡）。 */
+        OFFER_RE: /^[A-Za-z]{2}star_Rewards_DailyGlobalOffer_(Evergreen_)?([A-Za-z0-9_]+)$/,
+        /* 星期名本身：从第三段里再认一次，认不出就整段当变体名 */
+        DAY_RE: /\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/i,
         OFFER_PREFIX: "ENstar_Rewards_DailyGlobalOffer_",
         WEEKDAYS: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
         /* 面板接口的 Referer 必须是 bing 主页；缺了会被判成外站请求 */
@@ -6555,7 +6569,11 @@ const __scBgKeepAlive = (function() {
                 if (!matched) continue;
                 const attr = p.attributes || {};
                 const offerId = String(p.offerId || attr.offerid || name);
-                const day = matched[2];
+                /* 星期名从第三段里再认一次：变体卡（VerB_Locked_level2）没有星期名，
+                   此时整段当变体名。只有调用方显式按星期过滤时才需要它，
+                   默认不过滤星期，所以拿不到星期不影响正常处理。 */
+                const dayMatch = String(matched[2] || "").match(this.DAY_RE);
+                const day = dayMatch ? dayMatch[1] : String(matched[2] || "");
                 if (want && !want.has(day)) continue;
 
                 /* 带锁变体（面板左上角 🔒，如「Complete this puzzle +10」）：
@@ -6934,14 +6952,30 @@ const __scBgKeepAlive = (function() {
             const detail = data.ErrorDetail || {};
             const code = Number(detail.ErrorCode ?? data.ErrorCode ?? 0) || 0;
             const message = String(detail.Message || data.ErrorMessage || "").trim();
+            /* ── 为什么 OfferComplete 不能当「有没有加分」的判据 ──────────────
+               实测（2026-11，cn.bing.com，面板交卷接口）一次**成功**的响应长这样：
+                 {"OfferComplete":false, "EarnedCredits":5, "ActivityComplete":true,
+                  "Balance":{"Available":3878.0}, "ErrorDetail":{"ErrorCode":0}}
+               余额真的 +5、卡片回读也是 complete:true，但 OfferComplete 偏偏是 false。
+
+               旧代码把这两个字段用 || 揉成一个布尔：
+                 offerComplete: data.OfferComplete === true || data.ActivityComplete === true
+               于是调用方看到 false 就判「已受理但未记账」，把成功的卡算成失败 ——
+               日志里「余额 +20 / 6 张卡」就是这么来的（6 张里只有 4 张被认下来）。
+
+               正确的判据是 EarnedCredits（这次到底加了多少分），
+               OfferComplete/ActivityComplete 只作辅助参考，原样保留两个字段。 */
+            const earned = Number(data.EarnedCredits ?? data.PointsEarned ?? 0) || 0;
             return {
                 json: true,
                 balance: bal,
-                earned: Number(data.EarnedCredits ?? data.PointsEarned ?? 0) || 0,
+                earned,
                 errorCode: code,
                 message,
                 retryable: detail.Retryable === true,
-                offerComplete: data.OfferComplete === true || data.ActivityComplete === true,
+                /* 两个字段分开保留，别再揉在一起 */
+                offerComplete: data.OfferComplete === true,
+                activityComplete: data.ActivityComplete === true,
                 isRewardsUser: data.IsRewardsUser !== false
             };
         },
@@ -7082,15 +7116,23 @@ const __scBgKeepAlive = (function() {
                     reasons.push(`${v.name}: 服务端未识别登录态（游客响应）`);
                     continue;
                 }
-                /* ErrorCode=0 + OfferComplete=false + 已识别登录：服务端说
-                   「收到但这次没算上」，多半是这张卡今天已经做过了。
-                   不能据此判成功，交给面板回读定夺。 */
-                if (r.offerComplete === false) {
-                    reasons.push(`${v.name}: 已受理但未标记完成（${r.message || "no message"}）`);
-                    outcome = "accepted";
-                    continue;
+                /* ── 判成功的唯一依据：EarnedCredits ─────────────────────────
+                   OfferComplete 在成功的响应里也可能是 false（实测见 _readReport 注释），
+                   拿它当判据会把已经加分的卡算成失败。真正说明「这次加了几分」的
+                   只有 EarnedCredits；ActivityComplete 也认，它表示这张卡这一轮算做完了。
+
+                   earned > 0                 → 确实记账了，成功
+                   ActivityComplete=true      → 卡被标记完成（可能之前已做过，不重复计数）
+                   两者都没有                 → 已受理待复核，交给面板回读 */
+                if (r.earned > 0 || r.activityComplete === true) {
+                    return { ok: true, via: v.name, points: r.earned, balance: r.balance };
                 }
-                return { ok: true, via: v.name, points: r.earned, balance: r.balance };
+                if (r.offerComplete === true) {
+                    return { ok: true, via: v.name, points: r.earned, balance: r.balance };
+                }
+                reasons.push(`${v.name}: 已受理但未新增记账（${r.message || "no message"}）`);
+                outcome = "accepted";
+                continue;
             }
 
             /* 兜底：页面代发通道（仅在 bing 页面上跑脚本时可用）。
@@ -7099,12 +7141,14 @@ const __scBgKeepAlive = (function() {
                 try {
                     const out = await API.viaPageChannel(url, { ...base, "content-type": "text/plain;charset=UTF-8" }, payload, 20000, "POST");
                     const r = this._readReport((out && out.text) || "");
-                    if (r.json && !r.errorCode && r.isRewardsUser !== false && r.offerComplete !== false) {
+                    /* 判据同上：认 EarnedCredits / ActivityComplete，不认 OfferComplete */
+                    if (r.json && !r.errorCode && r.isRewardsUser !== false
+                        && (r.earned > 0 || r.activityComplete === true || r.offerComplete === true)) {
                         return { ok: true, via: "page", points: r.earned, balance: r.balance };
                     }
                     if (r.json && !r.errorCode && r.isRewardsUser !== false) {
                         outcome = "accepted";
-                        reasons.push("page: 已受理但未标记完成");
+                        reasons.push("page: 已受理但未新增记账");
                     } else {
                         reasons.push(`page: HTTP ${(out && out.status) || 0} ${r.json ? `ErrorCode=${r.errorCode}` : "返回非 JSON"}`);
                     }
@@ -7194,7 +7238,12 @@ const __scBgKeepAlive = (function() {
                 if (last && last.ok) {
                     ok++;
                     doneIds.add(card.offerId);
-                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p`);
+                    /* 这里**不能**写「已完成」：ok 只代表服务端受理了这一发请求，
+                       真正的记账与否要等面板回读（见下面的 readBack）。
+                       以前这里直接打「🟢 国际版卡片已完成 +5p」，用户看到 6 行
+                       「已完成」，实际只加了 20/35 分 —— 这就是「日志骗人」的来源。
+                       现在只说「已交卷」，完成与否一律等回读结论。 */
+                    Utils.log("📮", `国际版卡片已交卷（待服务端确认）：${name} 名义 +${card.points}p`);
                 } else if (last && last.outcome === "accepted") {
                     /* 服务端收了但没新增记账：通常这张卡今天已经做过，不吵 */
                     Utils.log("  ", `国际版卡片已受理（未新增记账）：${name}`);
@@ -7234,6 +7283,12 @@ const __scBgKeepAlive = (function() {
                过一会儿再看却是完成的。所以复核一次不够，要「复核 → 补做 → 再复核」。 */
             let gained = 0;
             let confirmed = 0;
+            /* 「交卷被受理」和「服务端确认到账」是两件事，必须用两个集合分开记：
+                 doneIds       —— 本轮的发送状态（交给补做轮去重，别再打同一张）
+                 confirmedIds  —— 只有面板回读 complete=true 才会写进来，
+                                  对外结论（日志 / 通知 / 返回值）一律以它为准。
+               混用这两个就是「明明没到账却报全部完成」的根源。 */
+            const confirmedIds = new Set();
             const readBack = async () => {
                 let after = await this.fetchPanel(panel.host);
                 if (!after) {
@@ -7242,7 +7297,12 @@ const __scBgKeepAlive = (function() {
                 }
                 if (!after) return null;
                 const nowCards = this.pickCards(after);
-                for (const c of nowCards) if (c.complete) doneIds.add(c.offerId);
+                for (const c of nowCards) {
+                    if (c.complete) {
+                        doneIds.add(c.offerId);
+                        confirmedIds.add(c.offerId);
+                    }
+                }
                 gained = Math.max(gained, after.balance - balanceBefore);
                 return { cards: nowCards, confirmed: nowCards.filter(c => c.complete).length, balance: after.balance };
             };
@@ -7255,6 +7315,29 @@ const __scBgKeepAlive = (function() {
                     const newlyAcked = first.cards.filter(c => c.complete
                         && todo.some(t => t.offerId === c.offerId)).length;
                     if (newlyAcked > 0) ok = Math.max(ok, newlyAcked);
+                    /* 回读后的**真实**战果，逐张说清楚。
+                       这是唯一能对外声明的结论：complete 是服务端给的，
+                       不是脚本猜的。区分三种情况，别再一律说「已完成」：
+                         ✅ 服务端确认 complete=true  → 真的拿到了
+                         ❌ 交卷受理但 complete 仍 false → 没拿到，说清楚
+                         ⏭️ 本轮没轮到（到点交班）      → 下一轮继续 */
+                    const acked = [];
+                    const notAcked = [];
+                    for (const card of todo) {
+                        const nm = card.title || card.offerId;
+                        const now = first.cards.find(c => c.offerId === card.offerId);
+                        if (now && now.complete) acked.push(`${nm} +${card.points}p`);
+                        else notAcked.push(nm);
+                    }
+                    if (acked.length > 0) {
+                        Utils.log("✅", `服务端已确认到账 ${acked.length} 张：${acked.join("、")}`);
+                    }
+                    if (notAcked.length > 0) {
+                        Utils.log("🟡", `服务端未确认到账 ${notAcked.length} 张：${notAcked.join("、")}（回读仍为未完成，下一轮继续）`);
+                    }
+                } else {
+                    /* 回读不到 = 无法确认。既不能报完成，也不能报失败。 */
+                    Utils.log("🟠", "国际版卡片回读失败：本轮无法确认真实到账情况（不报完成，下一轮重新核对）", true);
                 }
 
                 /* 补做轮：还有没记账的，隔一个节拍再来一次。
@@ -7286,7 +7369,8 @@ const __scBgKeepAlive = (function() {
                         if (last && last.ok) {
                             ok++;
                             doneIds.add(card.offerId);
-                            Utils.log("🟢", `国际版卡片补做成功：${name} +${card.points}p`);
+                            /* 同上：交卷≠到账，等回读 */
+                            Utils.log("📮", `国际版卡片补做已交卷（待确认）：${name} 名义 +${card.points}p`);
                         }
                         if (pacer) await pacer.beat(beatGap);
                     }
@@ -7296,20 +7380,35 @@ const __scBgKeepAlive = (function() {
                 }
             } catch (_) {}
 
-            const pending = cards.filter(c => !doneIds.has(c.offerId)).length;
+            /* ── 最终结论只看服务端 ────────────────────────────────────
+               以前 pending 是拿 doneIds 算的，而 doneIds 在「交卷被受理」那一刻
+               就已经写入 —— 于是无论服务端到底记没记账，pending 永远是 0，
+               日志永远打「全部完成」。这就是用户看到的「明明没做却显示已完成」。
+               现在 pending 只认 readBack 回读到的 complete=true（已写进 doneIds
+               的那些「受理即完成」的项要剔除），拿不到就如实说「无法确认」。 */
+            const pending = cards.filter(c => !confirmedIds.has(c.offerId)).length;
+            const confirmedCount = cards.length - pending;
             if (pending === 0) {
                 Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`
-                    + (gained > 0 ? `（余额 +${gained}）` : ""));
+                    + (gained > 0 ? `（余额 +${gained}）` : "（服务端已确认）"));
+            } else if (confirmedCount === 0) {
+                /* 一张都没确认：别说「还差几张」，要说清「一张都没到账」 */
+                Utils.log("🟠", `国际版每日活动：${cards.length} 张均未确认到账`
+                    + `（交卷已发，但服务端回读仍是未完成；余额 +${gained}）`
+                    + `${lastReason ? `：${String(lastReason).split("；")[0]}` : ""}`, true);
             } else {
-                const names = cards.filter(c => !doneIds.has(c.offerId)).map(c => c.title || c.day).join("、");
-                Utils.log("🟡", `国际版每日活动还差 ${pending} 张：${names}`
-                    + `（${lastReason || "服务端本次未记账"}，下一轮继续）`);
+                const names = cards.filter(c => !confirmedIds.has(c.offerId)).map(c => c.title || c.day).join("、");
+                Utils.log("🟡", `国际版每日活动：确认到账 ${confirmedCount}/${cards.length} 张`
+                    + `（余额 +${gained}），还差 ${pending} 张：${names}`
+                    + `${lastReason ? `（${String(lastReason).split("；")[0]}）` : ""}，下一轮继续`);
             }
             return {
                 found: cards.length,
-                done: cards.length - pending,
+                done: confirmedCount,
                 pending,
-                points: (gained > 0 ? gained : ok * (cards[0].points || 5)),
+                /* 分数只报**实测余额增量**，不拿「名义分值 × 交卷次数」估算 ——
+                   那正是以前虚报 +35 而实际只有 +20 的原因。 */
+                points: gained > 0 ? gained : 0,
                 /* 汇总里要能说清「为什么还差」：只取第一句原因，别把 5 条通道全塞进去 */
                 reason: pending === 0 ? "" : (outOfTime
                     ? "本轮时间不够，剩下的下一轮继续"
@@ -9302,9 +9401,19 @@ const __scBgKeepAlive = (function() {
                         row("🌍 国际版每日活动", false, true, "");
                     } else if (intlFound > 0) {
                         const intlDone = Number(RewardsAuto.state.intlDone) || 0;
-                        row("🌍 国际版每日活动", intlOn, intlOk && intlDone >= intlFound,
-                            intlDone + "/" + intlFound
-                            + (RewardsAuto.state.intlCached ? "（今日已封盘）" : ""));
+                        const intlPending = Number(RewardsAuto.state.intlPending) || 0;
+                        /* 一张都没确认 + 确实有待办 → 说清是「没到账」，不是「没做」。
+                           这里也**不能**因为 intlOk 就显示 ✅：intlOk 只表示
+                           "本轮没抛异常"，不等于服务端确认到账。 */
+                        const nothingConfirmed = intlDone === 0 && intlPending > 0;
+                        if (nothingConfirmed) {
+                            rows.push("🌍 国际版每日活动 · ❌ 0/" + intlFound
+                                + " 未确认到账（已交卷，服务端回读仍未完成）");
+                        } else {
+                            row("🌍 国际版每日活动", intlOn, intlDone >= intlFound,
+                                intlDone + "/" + intlFound
+                                + (RewardsAuto.state.intlCached ? "（今日已封盘）" : ""));
+                        }
                     } else if (RewardsAuto.state.intlAbsent) {
                         rows.push("🌍 国际版每日活动 · ⏭️ 此账号无这项活动");
                     } else {
