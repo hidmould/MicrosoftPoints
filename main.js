@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.2
+// @version      1.9.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -334,6 +334,11 @@ const __scBgKeepAlive = (function() {
             lockedPoints: 0,
             lockedTitles: [],
             desktopPendingTitles: [],
+            /* 「已自动上报搜索、需手动点一次」的卡片名单。
+               以前没在这里声明，靠 state.manualCards || [] 惰性兜住，
+               初见时其实是 undefined；显式声明后，轮末 releaseRound 清空它
+               也不会在下一轮读到 undefined。 */
+            manualCards: [],
             weeklyQuestDone: 0,
             weeklyQuestPending: 0,
             weeklyQuestFailed: 0,
@@ -3215,6 +3220,19 @@ const __scBgKeepAlive = (function() {
                         else if (lifetimeJsonMatch) history.lifetime = parseInt(lifetimeJsonMatch[1]);
                     }
                     if (!searchQuotaFound) {
+                        /* 面板接口优先：它最近一直比 getuserinfo 稳（后者会回 HTML 错误页），
+                           而且直接给 PCSearch 的 pointProgress。 */
+                        const panelResult = await this.getSearchQuotaFromPanel(false);
+                        if (panelResult) {
+                            Utils.log("🟢", "页面未命中搜索配额，使用面板接口兜底");
+                            return Object.assign({ todayDetails: [], history: null }, panelResult, {
+                                earnedToday, mobile: { progress: mobCur, max: mobMax },
+                                dailyOffer, readProgress: RewardsAuto.state.readProgress ?? 0,
+                                readMax: RewardsAuto.state.readMax ?? 30
+                            });
+                        }
+                    }
+                    if (!searchQuotaFound) {
                         const userInfoResult = await this.getSearchQuotaFromUserInfo();
                         if (userInfoResult) {
                             Utils.log("🟢", "页面未命中搜索配额，使用 getuserinfo 兜底");
@@ -3797,7 +3815,94 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
+        /* 面板接口（Bing 首页右上角那个小浮窗的数据源）。
+           为什么单独加这一条：rewards.bing.com/api/getuserinfo 已经不稳了 ——
+           实测 2026-11 它对已登录的账号直接返回 HTML 错误页（「积分商城错误」），
+           Utils.isJSON 失败 → getSearchQuotaFromUserInfo 返回 false →
+           getPcQuota 两个来源全落空 → doSearch 里的「记账核对」整轮都在
+           verifyFails 分支上跑，永远看不到 progress 变化。
+           而面板接口一直正常，并且**直接给出 PCSearch 的 pointProgress/max**，
+           所以把它作为独立来源补进来。
+
+           注意字段名大小写不同：getuserinfo 是 pcSearch，面板是 PCSearch。 */
+        async getSearchQuotaFromPanel(light = true) {
+            const hosts = [];
+            try {
+                const h = String(RewardsAuto.state.host || "").trim();
+                if (h) hosts.push(h);
+            } catch (_) {}
+            for (const h of ["cn.bing.com", "www.bing.com"]) {
+                if (!hosts.includes(h)) hosts.push(h);
+            }
+            /* 某个域读到余额但没有 PC 计数器时先记下来：
+               继续试下一个域（可能这个域字段缺失），全都拿不到 PC 进度，
+               再把余额当兜底线索返回，交给上层用「总积分是否上涨」判定。 */
+            let balanceOnly = 0;
+            for (const host of hosts) {
+                let text = "";
+                try {
+                    text = await Utils.xhr({
+                        url: `https://${host}/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards&_=${Date.now()}`,
+                        headers: {
+                            "accept": "application/json, text/plain, */*",
+                            "user-agent": RewardsAuto.ua.pc,
+                            "referer": `https://${host}/`,
+                            "x-requested-with": "XMLHttpRequest"
+                        },
+                        timeout: 20000
+                    });
+                } catch (_) { continue; }
+                const data = Utils.parseJSON(text);
+                if (!data) continue;
+                const us = (data.flyoutResult && data.flyoutResult.userStatus)
+                    || (data.dashboard && data.dashboard.userStatus)
+                    || data.userStatus || {};
+                const counters = us.counters || data.counters || {};
+                /* 只认 PC 搜索的计数器，大小写都兼容（面板回 PCSearch，其它通道回 pcSearch）。
+                   这里**不能**退到 MobileSearch：手机配额是另一条进度，
+                   拿它当 PC 的基准会让「这次搜索有没有加分」完全判错。 */
+                const raw = counters.PCSearch || counters.pcSearch || null;
+                const balance = Number(
+                    us.availablePoints
+                    ?? (data.userInfo && data.userInfo.balance)
+                    ?? 0
+                ) || 0;
+                if (!Array.isArray(raw) || raw.length === 0) {
+                    if (balance > 0) balanceOnly = Math.max(balanceOnly, balance);
+                    continue;
+                }
+                const sum = raw.reduce((acc, item) => {
+                    acc.progress += Number(item.pointProgress || 0);
+                    acc.max += Number(item.pointProgressMax || item.pointMax || 0);
+                    return acc;
+                }, { progress: 0, max: 0 });
+                if (sum.max <= 0) {
+                    if (balance > 0) balanceOnly = Math.max(balanceOnly, balance);
+                    continue;
+                }
+                if (!light) {
+                    Utils.log("📊", `面板查询(${host}): PC ${sum.progress}/${sum.max}, 积分 ${balance}`);
+                }
+                return { balance, pc: { progress: sum.progress, max: sum.max } };
+            }
+            /* PC 计数器整个缺失（账号换档 / 字段改名）：绝不冒充 PC 进度，
+               但把余额带回去做兜底判据。 */
+            return balanceOnly > 0 ? { balance: balanceOnly, pc: null } : false;
+        },
+
         async getPcQuota() {
+            /* 三条通道，任一成功即可。顺序按「实测可靠度」排：
+                 ① 面板接口（一直可用，字段最直接）
+                 ② getuserinfo（近期常回 HTML 错误页 / 401）
+                 ③ DAPI（需要 token）
+               三条全废时返回 null，让上层如实记一次「核对失败」并收手，
+               由冷却 + 下一轮重新校正 —— 绝不拿手机配额冒充 PC 进度。 */
+            try {
+                const panel = await this.getSearchQuotaFromPanel(true);
+                if (panel && panel.pc && panel.pc.max > 0) {
+                    return { progress: panel.pc.progress, max: panel.pc.max };
+                }
+            } catch (_) {}
             try {
                 const ui = await this.getSearchQuotaFromUserInfo(true);
                 if (ui && ui.pc && ui.pc.max > 0) return { progress: ui.pc.progress, max: ui.pc.max };
@@ -5995,6 +6100,19 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟠", "搜索上报未被识别为登录态（IsAuthenticated=false），这次搜索可能不记账");
                     return false;
                 }
+                /* ── 上报「被受理」≠「已记账」────────────────────────────
+                   实测（2026-11，cn.bing.com）：同一个 IG 反复打 reportActivity，
+                   每次都会回 200 + IsAuthenticated:true + RewardsIncrement:1，
+                   但积分计数器一点都不涨。也就是说把 IsAuthenticated 当成功判据，
+                   等于给「已经刷到底/被限流」的账号发一张假的成功凭证：
+                   doSearch 看到上报成功就继续下一次，结果无限搜索、永不记账。
+
+                   这里不再声称自己知道有没有加分 —— 服务端在这次响应里没给
+                   可核对的分值。真正的判据交给 doSearch 的「配额回读」：
+                   只有积分计数器真的涨了才算 credited。返回值改为三态：
+                     true  = 请求确实发出去了（不代表加分）
+                     false = 明确的失败（未登录 / 网络异常）
+                   记账与否一律由调用方的 quota 回读决定。 */
                 return true;
             } catch (e) {
                 Utils.log("🟡", `搜索上报失败: ${e.message}`);
@@ -6003,11 +6121,52 @@ const __scBgKeepAlive = (function() {
         },
 
         async checkRegion() {
-            if (!RegionGuard.enabled()) return true;
+            if (!RegionGuard.enabled()) {
+                /* 出口检测关掉时没人设 host，仍要按落地页校正一次，
+                   否则会一直拿 www.bing.com 去发搜索上报（见 syncSearchHost）。 */
+                await this.syncSearchHost();
+                return true;
+            }
             const v = await RegionGuard.check({ fresh: true });
-            if (v.ok) return true;
+            if (v.ok) {
+                /* 出口确认是国内，必须把 host 落到 cn.bing.com：
+                   www.bing.com 在国内会被 302 到 cn.bing.com，而 reportActivity 是 POST，
+                   跟随 302 之后请求体被丢掉，服务端看到的就是「一次空上报」——
+                   照样回 200 + IsAuthenticated:true，但不计分。
+                   这就是「日志说记账了，rewards 面板没涨」的根因之一。 */
+                await this.syncSearchHost();
+                return true;
+            }
             if (!v.ipInfo) await this.getIPInfo();
             return false;
+        },
+
+        /* 把 RewardsAuto.state.host 校正成「真实落地」的搜索域。
+           只做一次、结果缓存，失败不抛错（保持原来的 www.bing.com）。 */
+        async syncSearchHost() {
+            if (this._hostSynced) return RewardsAuto.state.host;
+            this._hostSynced = true;
+            const prev = RewardsAuto.state.host;
+            try {
+                const res = await Utils.xhrFull({
+                    method: "GET",
+                    url: `https://${prev}/search?q=bing&form=QBLH`,
+                    headers: { "user-agent": RewardsAuto.ua.pc, "cache-control": "no-cache" },
+                    timeout: 15000
+                });
+                let landed = "";
+                try { landed = new URL(res.finalUrl || "").host; } catch (_) { landed = ""; }
+                if (!landed) {
+                    /* finalUrl 拿不到时退回看正文：国内首页会带 cn.bing.com 的痕迹 */
+                    const txt = String(res.text || "");
+                    if (/cn\.bing\.com|京ICP备|beian\.miit\.gov\.cn/i.test(txt)) landed = "cn.bing.com";
+                }
+                if (landed && /(^|\.)bing\.com$/i.test(landed) && landed !== prev) {
+                    RewardsAuto.state.host = landed;
+                    Utils.log("🖥️", `搜索域已按实际落地校正：${prev} → ${landed}`);
+                }
+            } catch (_) { /* 保持原值 */ }
+            return RewardsAuto.state.host;
         },
 
         async getIPInfo() {
@@ -6191,11 +6350,40 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔍", `PC 搜索进入冷却：${new Date(until).toLocaleString("zh-CN")} 后自动重试`);
                 return this.searchGuard();
             }
+            /* ── 命中率判定（替换原来的「有记账就清零」）──────────────────
+               原来只要本轮成功过一次，就把限流计数和冷却档位全部清零。
+               实测问题是：通道半坏时（比如 6 次成功 1 次）每轮都能「清零」，
+               于是永远积累不到冷却条件，调度就无限重复 → 用户看到的现象
+               就是「一直卡在 9/60、反复搜索、反复卡住」。
+
+               现在按命中率分档：
+                 ≥ 50%      通道正常，计数清零
+                 < 50%      偏坏，累计一轮；够 3 轮就进冷却
+               这样「偶尔成功一次」不再能无限续命。 */
             if (got > 0) {
-                if (st.streak > 0 || st.cooldownUntil > 0 || st.cycles > 0) {
-                    Utils.log("✅", "本轮有记账，搜索通道正常，限流计数与冷却档位清零");
+                const hitRate = tried > 0 ? got / tried : 0;
+                if (hitRate >= 0.5) {
+                    if (st.streak > 0 || st.cooldownUntil > 0 || st.cycles > 0) {
+                        Utils.log("✅", `本轮记账 ${got}/${tried}（${Math.round(hitRate * 100)}%），搜索通道正常，计数清零`);
+                    }
+                    this.saveSearchGuard({ streak: 0, cycles: 0, cooldownUntil: 0, reason: "", lastProgress: cur });
+                    return this.searchGuard();
                 }
-                this.saveSearchGuard({ streak: 0, cycles: 0, cooldownUntil: 0, reason: "", lastProgress: cur });
+                Utils.log("🟡", `本轮记账率偏低 ${got}/${tried}（${Math.round(hitRate * 100)}%），计入限流统计`);
+                const lowStreak = st.streak + 1;
+                if (lowStreak < SEARCH_GUARD.STREAK_LIMIT) {
+                    this.saveSearchGuard({ ...st, streak: lowStreak, cooldownUntil: 0, reason: "", lastProgress: cur });
+                    return this.searchGuard();
+                }
+                const lowCycles = st.cycles + 1;
+                const lowSpan = Math.min(SEARCH_GUARD.COOLDOWN_MS * Math.pow(2, lowCycles - 1), SEARCH_GUARD.COOLDOWN_MAX_MS);
+                const lowUntil = Date.now() + lowSpan;
+                const lowReason = `连续 ${lowStreak} 轮记账率偏低（本轮 ${got}/${tried}），PC ${cur}/${cap}`;
+                this.saveSearchGuard({ streak: 0, cycles: lowCycles, cooldownUntil: lowUntil, reason: lowReason, lastProgress: cur });
+                Utils.logOnce("🟡",
+                    `搜索连续 ${lowStreak} 轮记账率过低，第 ${lowCycles} 次冷却 ${Math.round(lowSpan / 60000)} 分钟后自动重试`,
+                    "searchRestricted", 6 * 60 * 60 * 1000);
+                Utils.log("🔍", `PC 搜索进入冷却：${new Date(lowUntil).toLocaleString("zh-CN")} 后自动重试`);
                 return this.searchGuard();
             }
             /* 本轮搜索次数太少（预算被前面的任务吃掉）：样本不足，不做判定，只更新基线 */
@@ -7525,6 +7713,8 @@ const __scBgKeepAlive = (function() {
         MAX_ATTEMPTS: 60,
         NO_CREDIT_LIMIT: 10 * 60 * 1000,
         MIN_ATTEMPTS_BEFORE_GIVEUP: 8,
+        /* 连续这么多次搜索都没记账，就提前收手（比 NO_CREDIT_LIMIT 的时间判据更快） */
+        STREAK_STOP: 10,
         RETRY_GAP: 5 * 60 * 1000,
 
         /* 用户配置的间隔基准：只保证不低于 SPAN_MIN_MS（60 秒），
@@ -7679,7 +7869,8 @@ const __scBgKeepAlive = (function() {
         },
 
         /* 强制收尾：只放掉「确实是自己」的锁。
-           如果锁已经被别的上下文接手，那这里清掉会把别人正在跑的一轮搞坏。 */
+           如果锁已经被别的上下文接手，那这里清掉会把别人正在跑的一轮搞坏。
+           释放的动作全部走 releaseRound/finishRound，不再各写一份。 */
         forceCleanupOwnRound(reason) {
             this.abortRound = true;
             this.stopHeartbeat();
@@ -7692,11 +7883,136 @@ const __scBgKeepAlive = (function() {
             if (!lock || lock.mine) GM_setValue("Config.runLock", null);
             try { Sched.state("done"); } catch (_) {}
             try { Sched.clearClaim(); } catch (_) {}
+            /* 被强制收尾时更要清干净：卡住的缓存/闸门正是「一直卡着」的元凶 */
+            try { this.releaseRound({ force: false }); } catch (_) {}
             if (reason) Utils.log("🔴", reason);
         },
 
         /* 到点或被强制收尾后，长循环要尽快退出，别再往微软发请求 */
         aborted() { return !!this.abortRound; },
+
+        /* ── 轮末统一释放 ────────────────────────────────────────────
+           目的：这一轮结束后，凡是「只对本次运行有意义」的内存、缓存、标记、
+           一次性令牌、并发闸门，全部归零；下一轮从干净状态起步。
+           不在这里做的事（写清楚，免得以后误伤）：
+             · 不删 Config.* 的**任务进度**（tasks/searchDate/cdpDoneDate…），
+               那是「今天已经做过什么」的事实，删了会重做、重复上报；
+             · 不动授权相关键（token / code / accessToken）；
+             · 不杀 Sched.timer（常驻调度要靠它排下一轮），
+               也不动 PC 搜索结果（searchGuard 有自己的冷却生命周期）。
+           返回本次真正释放了哪些项，供日志自证。 */
+        releaseRound(opts = {}) {
+            const done = [];
+            const soft = (name, fn) => {
+                try { fn(); done.push(name); } catch (_) {}
+            };
+
+            /* ① 本轮计数 / 汇总文本 / 一次性提示（纯内存） */
+            soft("计数", () => {
+                this.signTimes = 0;
+                this.readTimes = 0;
+                this.promosTimes = 0;
+                this.claimSummary = "";
+                this.claimReason = "";
+            });
+
+            /* ② 本轮业务状态（RewardsAuto.state 里只对本轮有意义的字段）。
+               注意保留 host / region / dateNowNum：它们是「环境事实」，
+               重新探测既慢又可能探测失败，留着是对的。 */
+            soft("业务状态", () => {
+                const s = RewardsAuto.state;
+                s.lockedCount = 0;
+                s.lockedPoints = 0;
+                s.lockedTitles = [];
+                s.desktopPendingTitles = [];
+                s.manualCards = [];
+                s.weeklyQuestDone = 0;
+                s.weeklyQuestPending = 0;
+                s.weeklyQuestFailed = 0;
+                s.monthlyFound = 0;
+                s.monthlyDone = 0;
+                s.monthlyTotal = 0;
+                s.monthlyPending = 0;
+                s.monthlyComplete = false;
+                s.monthlyUnlocked = 0;
+                s.intlFound = 0;
+                s.intlDone = 0;
+                s.intlPending = 0;
+                s.intlAbsent = false;
+                s.intlCached = false;
+                s.webNoAuth = false;
+                s.webFailStreak = 0;
+                s.sendMSG = "";
+                s.startTime = 0;
+            });
+
+            /* ③ 各模块的短命缓存：有效期都远小于一轮，留着只会让下一轮读到旧值 */
+            soft("接口缓存", () => {
+                API._promoCache = null;
+                API._webCompleteCache = null;
+                /* cookie 头是登录态快照：把**缓存有效性**清掉，让下一次
+                   getCookieHeader() 真的重读一遍。
+                   但不要把它替换成空函数 —— 有很多请求（getRewardsInfo /
+                   交卷 / 国际版面板）并不先调 getCookieHeader，它们依赖
+                   Utils.xhr 自动补的这份快照。清成空 = 下一轮前半段全部裸奔，
+                   那会直接退化成「未登录」而静默不记账。
+                   保留旧值、只失效缓存，是最安全的做法。 */
+                API._ckCache = "";
+                API._ckAt = 0;
+            });
+
+            /* ④ CDP 的一次性令牌与封盘标记。
+               _promosClean 表示「本轮活动卡是否全清」，是**本轮**结论，
+               跨轮沿用会让下一轮误以为可以直接封盘。 */
+            soft("CDP令牌", () => {
+                CDP.revokeAllow();
+                CDP._promosClean = false;
+                CDP._uaOverrideAt = 0;
+                CDP._warnedAt = 0;
+            });
+
+            /* ⑤ 并发闸门：理论上一轮结束时都为 false，但 await 抛错时可能卡住，
+               卡住就等于下一轮永远不跑（这正是「死循环」的另一半成因）。 */
+            soft("并发闸门", () => {
+                EdgePacer.busy = false;
+            });
+
+            /* ⑥ 出口检测的内存结论：保留「上次是好的」会掩盖线路已切换的事实。
+               只清内存，不动它的 TTL 缓存语义。 */
+            soft("出口检测", () => {
+                RegionGuard._inflight = null;
+            });
+
+            /* ⑦ 强制收尾时才动的东西：把当前轮次标记换代，
+               让旧 promise 链后续的 tick/heartbeat 彻底失效。 */
+            if (opts.force) {
+                soft("轮次换代", () => {
+                    this.abortRound = true;
+                    this.roundSeq++;
+                    this.roundId = this.roundSeq;
+                });
+            }
+
+            return done;
+        },
+
+        /* 轮末收尾的唯一入口：释放 → 写调度状态 → 记日志。
+           runAll 的 finally 与 forceCleanupOwnRound 都走这里，
+           避免两条路径各清一半、漏掉对方清的东西。 */
+        finishRound(reason = "", opts = {}) {
+            const released = this.releaseRound(opts);
+            this.stopHeartbeat();
+            this.running = false;
+            this.runningSince = 0;
+            this.abortRound = false;
+            try { Utils.releaseLock("Config.runLock"); } catch (_) {}
+            try { Sched.state("done"); } catch (_) {}
+            if (reason) Utils.log("🔴", reason);
+            if (released.length > 0) {
+                Utils.log("🧹", `本轮已释放 ${released.length} 组状态：${released.join("、")}（下一轮从干净状态开始）`);
+            }
+            return released;
+        },
         ensureAlive() {
             const err = msg => {
                 const e = new Error(msg);
@@ -8045,10 +8361,36 @@ const __scBgKeepAlive = (function() {
 
         async doSearch(roundDeadline) {
             if (!GM_getValue("Tasks.search", true)) return;
+            /* ── 开跑前先用「权威来源」校正一次进度 ──────────────────────
+               getRewardsInfo 优先解析 earn 页 HTML，可那个页面的 pointsCounters
+               未必刷新（实测日志里出现「记账 9/60」，而面板同时已是 60/60）。
+               拿着偏低的基数进循环，会让每一次 quota 回读都判成「刚涨了 N 分」，
+               于是既打出一串假的「记账成功」，又白白多发几十次搜索。
+               这里直接用 getPcQuota（面板优先）对一次，拿它当唯一基准。 */
+            let progress = 0, max = 0;
             const info = await API.getRewardsInfo();
-            if (!info) { Utils.log("🔴", "无法获取积分信息"); return; }
-            let progress = info.pc.progress;
-            let max = info.pc.max;
+            if (info) {
+                progress = info.pc.progress;
+                max = info.pc.max;
+            }
+            try {
+                const auth = await API.getPcQuota();
+                if (auth && auth.max > 0) {
+                    if (auth.progress !== progress || auth.max !== max) {
+                        Utils.log("🟢", `搜索配额以面板为准校正：${progress}/${max} → ${auth.progress}/${auth.max}`);
+                    }
+                    progress = auth.progress;
+                    max = auth.max;
+                } else if (!max) {
+                    /* 面板没给 PC 计数器、页面也没解析出来：这时候没有任何可信的
+                       PC 进度可用。不猜、不拿手机配额顶替，直接说清楚并收手 ——
+                       盲目搜索只会重复「发了但不加分」的老问题。 */
+                    Utils.log("🟡", "PC 搜索计数器读不到（面板/页面/DAPI 都没有），本轮不搜索，避免空转；下一轮自动重试", true);
+                    SEARCH_PACER.setPending(true);
+                    return;
+                }
+            } catch (_) {}
+            if (!max) { Utils.log("🔴", "无法获取积分信息"); return; }
             RewardsAuto.state.pcProgress = progress;
             RewardsAuto.state.pcMax = max;
             Utils.log("🔍", `搜索配额: PC ${progress}/${max}`);
@@ -8089,8 +8431,15 @@ const __scBgKeepAlive = (function() {
             let lastStart = 0;
             const needed = Math.max(1, Math.ceil((max - progress) / 3));
             const attemptCap = Math.min(SEARCH_PACER.MAX_ATTEMPTS, Math.max(12, needed * 2));
-            let attempts = 0, credits = 0, sinceCredit = 0, verifyFails = 0;
+            let attempts = 0, credits = 0, sinceCredit = 0, verifyFails = 0, streakNoCredit = 0;
             let lastCreditAt = startedAt;
+            /* 总积分基线：只在「PC 计数器读不到」时用作第二判据（见下面的兜底分支）。
+               读不到就是 0，此时不做余额判断，不虚报任何进展。 */
+            let lastBalance = 0;
+            try {
+                const b = await API.getBalance();
+                if (b > 0) lastBalance = b;
+            } catch (_) {}
             const usedQueries = new Set();
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
@@ -8123,8 +8472,13 @@ const __scBgKeepAlive = (function() {
                     if (e && e.regionBlocked) throw e;
                     Utils.log("🟡", `搜索失败: ${e.message}`);
                 }
-
                 await Utils.delay(Utils.randomRange(SEARCH_PACER.OBSERVE_MIN, SEARCH_PACER.OBSERVE_MAX));
+
+                /* ── 记账核对 ──────────────────────────────────────────────
+                   只认「服务端计数器真的涨了」。以前这里有个坑：读不到配额时
+                   代码会凭空 progress += 3 做「乐观估计」，那时打出的「记账成功」
+                   是假的，还会让下一轮的 before 值偏高，真涨了也判成没涨。
+                   现在 quota 读不到就如实算一次核对失败，绝不虚改进度。 */
                 const before = progress;
                 let quota = await API.getPcQuota();
                 if (quota && quota.progress <= before) {
@@ -8139,32 +8493,65 @@ const __scBgKeepAlive = (function() {
                         progress = quota.progress;
                         credits++;
                         sinceCredit = 0;
+                        streakNoCredit = 0;
                         lastCreditAt = Date.now();
                         Utils.log("✅", `记账成功 +${progress - before}（${progress}/${max}）`);
                     } else {
                         progress = Math.max(progress, quota.progress);
                         sinceCredit++;
-                        /* 间隔不再随失败放大：保持配置值，只把「连续未记账」记进日志。
-                           连续太多次会有 NO_CREDIT_LIMIT 兜底收手。 */
+                        streakNoCredit++;
                         const left = Math.round((SEARCH_PACER.NO_CREDIT_LIMIT - (Date.now() - lastCreditAt)) / 60000);
                         Utils.log("🟡", `本次未记账（${progress}/${max}，连续 ${sinceCredit} 次；再 ${Math.max(0, left)} 分钟没进展就本轮收手）`);
                     }
                 } else {
+                    /* ── 兜底：PC 计数器整条通道都读不到时的第二判据 ──────────
+                       注意这里**不碰手机配额**：手机搜索是另一条独立进度，
+                       拿 mobileSearch 当 PC 的基准，会把「PC 没加分」误判成「加了」，
+                       也会把真实的 PC 加分算到手机头上 —— 比读不到更糟。
+
+                       能用的独立证据只有「全站总积分有没有涨」：一次有效搜索
+                       至少 +1 分，余额涨了就说明这次确实计入到账号上了。
+                       缺点也说清楚：它分不清是哪条任务加的分（阅读/活动也会动余额），
+                       所以只用来证明「这次上报不是纯空转」，不用来推 PC 进度 ——
+                       progress 依旧不动，等下一轮拿到真配额再校正。 */
+                    const balNow = await API.getBalance();
+                    const gained = (balNow > 0 && lastBalance > 0) ? (balNow - lastBalance) : 0;
+                    if (balNow > 0) lastBalance = balNow;
                     verifyFails++;
-                    sinceCredit++;
-                    progress = Math.min(max, progress + 3);
+                    if (gained > 0) {
+                        /* 账号确实加分了 → 不是空转，清零「连续未记账」但不动 progress */
+                        sinceCredit = 0;
+                        streakNoCredit = 0;
+                        lastCreditAt = Date.now();
+                        Utils.log("🟢", `配额读不到，但总积分 +${gained}（${progress}/${max} 以服务端计数器为准，下一轮校正）`);
+                    } else {
+                        sinceCredit++;
+                        Utils.log("🟡", `配额查询失败（连续 ${verifyFails} 次，总积分未变），不做乐观推算`);
+                    }
                 }
                 RewardsAuto.state.pcProgress = progress;
 
                 if (progress >= max) break;
 
                 const noCreditMs = Date.now() - lastCreditAt;
+
+                /* ── 刹车一：连续未记账太多，立刻收手 ──────────────────────
+                   以前要「10 分钟」和「8 次」同时满足才停，于是常见的是：
+                   34 次尝试全打了水漂，还要空转到上限才退出，下一轮再重复，
+                   用户看到的就是「一直卡在 9/60」。现在加一条更早的判据：
+                   连续 STREAK_STOP 次零记账就停，不必等到时间窗口。 */
+                if (streakNoCredit >= SEARCH_PACER.STREAK_STOP && attempts >= SEARCH_PACER.MIN_ATTEMPTS_BEFORE_GIVEUP) {
+                    Utils.log("🟡", `连续 ${streakNoCredit} 次搜索都没有记账（本轮 ${attempts} 次，${progress}/${max}），`
+                        + `判定当前通道不记账，本轮提前收手，交给冷却后重试`);
+                    break;
+                }
+
                 if (noCreditMs >= SEARCH_PACER.NO_CREDIT_LIMIT && attempts >= SEARCH_PACER.MIN_ATTEMPTS_BEFORE_GIVEUP) {
                     Utils.log("🟡", `连续 ${Math.round(noCreditMs / 60000)} 分钟没有任何记账（本轮 ${attempts} 次搜索），判定被限流，本轮收手（已记 ${progress}/${max}）`);
                     break;
                 }
                 if (verifyFails >= 6) {
-                    Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮按乐观估计结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
+                    Utils.log("🟡", `记账核对连续失败 ${verifyFails} 次，本轮结束（已记 ${progress}/${max}），下一轮用真实进度校正`);
                     break;
                 }
                 /* 节拍：从「本次搜索开始」起算，到下一次搜索开始前一共隔 cycle（60~75 秒随机）。
@@ -8180,7 +8567,7 @@ const __scBgKeepAlive = (function() {
                    网络慢到 spent 本身超过 cycle 时，下限 3 秒兜底，此时间隔 = spent + 3，
                    日志里如实报出来，不假装还在 ±15 秒内。 */
                 const actual = Math.round((spent + wait) / 1000);
-                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（本轮周期 ${Math.round(cycle / 1000)} 秒，已用 ${(spent / 1000).toFixed(0)} 秒`);
+                Utils.log("⏳", `等待 ${(wait / 1000).toFixed(0)} 秒（本轮周期 ${Math.round(cycle / 1000)} 秒，已用 ${(spent / 1000).toFixed(0)} 秒，实际间隔约 ${actual} 秒）`);
                 await Utils.delay(wait);
             }
 
@@ -8948,12 +9335,7 @@ const __scBgKeepAlive = (function() {
                 /* 被强制收尾后可能已经有新的一轮接上来了：
                    旧轮的 finally 不能把新一轮的 running/锁/阶段清掉。 */
                 if (myRound === this.roundId) {
-                    this.stopHeartbeat();
-                    this.running = false;
-                    this.runningSince = 0;
-                    this.abortRound = false;
-                    Utils.releaseLock("Config.runLock");
-                    Sched.state("done");
+                    this.finishRound("");
                 } else {
                     Utils.log("🟡", "上一轮的收尾被跳过（已经由更新的那一轮接管）");
                 }
