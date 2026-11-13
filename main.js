@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.4.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅出口检测（非大陆 IP 直接停手）
+// @version      1.5.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @background
@@ -104,19 +104,23 @@ Tasks:
         type: checkbox
         default: true
     edge:
-        title: Edge 浏览连签（后台分次上报，累计 30 分钟）
+        title: Edge 浏览连签
         type: checkbox
         default: true
     desktopWeekly:
-        title: 桌面应用每周专属任务（每轮检测，按星期逐日解锁）
+        title: 桌面应用每周专属任务
         type: checkbox
         default: true
     monthly:
-        title: 月度计划（月度 punchcard，子项解锁后自动完成）
+        title: 月度计划
         type: checkbox
         default: true
     claimPoints:
-        title: 自动领取待领积分（搜索打卡/每日活动的奖励需点一次才入账）
+        title: 自动领取待领积分
+        type: checkbox
+        default: true
+    intlDaily:
+        title: 国际版每日活动
         type: checkbox
         default: true
 Notice:
@@ -339,6 +343,9 @@ const __scBgKeepAlive = (function() {
             monthlyPending: 0,
             monthlyComplete: false,
             monthlyUnlocked: 0,
+            intlFound: 0,
+            intlDone: 0,
+            intlPending: 0,
             webNoAuth: false,
             webFailStreak: 0,
         }
@@ -705,6 +712,8 @@ const __scBgKeepAlive = (function() {
         },
 
         xhrFull(options) {
+            /* options.cookie === false 在本函数里是「别自己拼 cookie 头」的语义：
+               GM_xmlhttpRequest 原生就会带浏览器 cookie，这里只需不额外设置。 */
             return new Promise((resolve, reject) => {
                 const start = Date.now();
                 /* 同 xhr()：后台被冻结时回调不会来，用计时器保证一定会 settle */
@@ -721,12 +730,22 @@ const __scBgKeepAlive = (function() {
                     finish(reject, new Error(`请求无响应（${Math.round(softMs / 1000)} 秒未回调），已放弃`));
                 }, softMs);
                 GM_xmlhttpRequest({
-                    ...options,
+                    ...(({ cookie, ...rest }) => rest)(options || {}),
                     timeout: Number(options && options.timeout) || 15000,
+                    /* 只有显式要了 manual 才接管重定向；默认仍由 GM 跟随，保持旧行为。 */
+                    ...(options && options.redirect === "manual" ? { redirect: "manual" } : {}),
                     onload: (res) => {
                         const cost = ((Date.now() - start) / 1000).toFixed(2);
-                        if (res.status >= 200 && res.status < 300) {
-                            finish(resolve, { text: res.responseText, finalUrl: res.finalUrl || "", status: res.status });
+                        /* 3xx 也当「有响应」返回：调用方需要 Location 才能判断是不是被跳去登录页。
+                           以前这里直接 reject，302 的原因就被丢掉了。 */
+                        if (res.status >= 200 && res.status < 400) {
+                            const loc = String(res.responseHeaders || "").match(/location:\s*(\S+)/i);
+                            finish(resolve, {
+                                text: res.responseText,
+                                finalUrl: res.finalUrl || "",
+                                status: res.status,
+                                location: loc ? loc[1] : ""
+                            });
                         } else {
                             finish(reject, new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
                         }
@@ -751,7 +770,10 @@ const __scBgKeepAlive = (function() {
                 const hdr = Object.assign({}, (options && options.headers) || {});
                 const needCookie = /(^|\.)(bing\.com|live\.com|microsoft\.com|microsoftonline\.com)\//i.test(url);
                 const hasCookie = Object.keys(hdr).some(k => k.toLowerCase() === "cookie");
-                if (needCookie && !hasCookie && this._ckReady) {
+                /* options.cookie === false：不要手工拼 cookie 头，交给 GM 自己带浏览器 cookie。
+                   GM_xmlhttpRequest 默认就带 cookie，而手工拼的那份是「部分 cookie」，
+                   一旦显式设置就会整体覆盖真实登录态（服务端因此 301 要求重放）。 */
+                if (needCookie && !hasCookie && options.cookie !== false && this._ckReady) {
                     const ck = this._ckReady();
                     if (ck) hdr["cookie"] = ck;
                 }
@@ -4491,7 +4513,7 @@ const __scBgKeepAlive = (function() {
             const out = { id: req.id, at: Date.now(), status: 0, text: "", error: "" };
             try {
                 const r = await fetch(req.url, {
-                    method: "POST",
+                    method: req.method || "POST",
                     headers: req.headers || {},
                     body: req.body,
                     credentials: "include",
@@ -4544,10 +4566,10 @@ const __scBgKeepAlive = (function() {
             return null;
         },
 
-        async viaPageChannel(url, headers, body, timeoutMs = 15000) {
+        async viaPageChannel(url, headers, body, timeoutMs = 15000, method = "POST") {
             const id = Date.now() + "-" + Math.floor(Math.random() * 1e6);
             GM_setValue(this.PAGE_BOX.res, null);
-            GM_setValue(this.PAGE_BOX.req, { id, url, headers, body, at: Date.now() });
+            GM_setValue(this.PAGE_BOX.req, { id, url, method, headers, body, at: Date.now() });
 
             const pack = (res) => ({
                 ok: res.status >= 200 && res.status < 300,
@@ -6068,6 +6090,692 @@ const __scBgKeepAlive = (function() {
         },
     };
 
+    const IntlDaily = {
+        PATH: "/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards",
+        REPORT_PATH: "/msrewards/api/v1/reportactivity",
+        OFFER_PREFIX: "ENstar_Rewards_DailyGlobalOffer_",
+        WEEKDAYS: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        /* 面板接口的 Referer 必须是 bing 主页；缺了会被判成外站请求 */
+        MAX_ATTEMPTS: 2,
+
+        /* 面板挂在 bing 搜索域下：优先用脚本自己的搜索主机，再退回 cn / www
+           （两个域的接口都在，实测都能记账）。 */
+        hosts() {
+            let configured = "";
+            try { configured = String(RewardsAuto.state.host || "").trim(); } catch (_) {}
+            const out = [];
+            for (const h of [configured, "cn.bing.com", "www.bing.com"]) {
+                if (h && /^[a-z0-9.-]+$/i.test(h) && !out.includes(h)) out.push(h);
+            }
+            return out;
+        },
+
+        weekdayName(date = new Date()) {
+            return this.WEEKDAYS[date.getDay()] || "";
+        },
+
+        /* 面板数据一次性取回：拿到卡片列表 + 请求体要用的身份字段。
+           返回 null 表示「国际版面板不可用 / 没登录」，调用方要当无事发生。 */
+        async fetchPanel(host) {
+            const url = `https://${host}${this.PATH}`;
+            let text = "";
+            try {
+                text = await Utils.xhr({
+                    url,
+                    headers: {
+                        "accept": "application/json, text/plain, */*",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": `https://${host}/`,
+                        "x-requested-with": "XMLHttpRequest"
+                    },
+                    timeout: 20000
+                });
+            } catch (e) {
+                Utils.log("🟡", `国际版面板读取失败（${host}）：${e.message}`);
+                return null;
+            }
+            const data = Utils.parseJSON(text);
+            if (!data) {
+                Utils.log("🟡", `国际版面板返回的不是 JSON（${host}），本轮跳过`);
+                return null;
+            }
+            if (data.isError === true || data.isRewardsUser === false) {
+                Utils.log("🟡", `国际版面板不可用：isError=${data.isError}，isRewardsUser=${data.isRewardsUser}`);
+                return null;
+            }
+            const flyout = data.flyoutResult || {};
+            const promos = [];
+            const push = (item) => {
+                if (!item || typeof item !== "object") return;
+                const name = String(item.name || item.offerId || "");
+                if (!name) return;
+                promos.push(item);
+            };
+            for (const key of ["morePromotions", "highValueActionPromotions", "dailySetPromotions", "pointClaimCardPromotion"]) {
+                const v = flyout[key];
+                if (Array.isArray(v)) v.forEach(push);
+                else if (v && typeof v === "object") Object.values(v).forEach(x => Array.isArray(x) ? x.forEach(push) : push(x));
+            }
+
+            const pickStr = (...vals) => {
+                for (const v of vals) {
+                    const t = String(v == null ? "" : v).trim();
+                    if (t && t !== "undefined" && t !== "null") return t;
+                }
+                return "";
+            };
+            const identity = {
+                channel: pickStr(data.channel, flyout.channel, "BingFlyout"),
+                partnerId: pickStr(data.partnerId, flyout.partnerId, "BingRewards"),
+                userId: pickStr(
+                    data.userId,
+                    data.UserId,
+                    data.userInfo && data.userInfo.userId,
+                    data.userInfo && data.userInfo.UserId,
+                    data.flyoutResult && data.flyoutResult.profile && data.flyoutResult.profile.userId,
+                    data.loggingContext && data.loggingContext.userId
+                )
+            };
+            if (!identity.userId) {
+                Utils.log("🟡", "国际版面板缺少 UserId：交卷会被服务端当成游客（IsRewardsUser=false），本轮跳过");
+                return null;
+            }
+            /* userInfo.promotions 里同一批卡的 attributes.complete 是「已完成」的直接判据 */
+            const completeById = new Map();
+            const rawPromos = (data.userInfo && data.userInfo.promotions) || [];
+            for (const p of rawPromos) {
+                const a = (p && p.attributes) || {};
+                const id = String(a.offerid || a.offerId || p.name || "");
+                if (!id) continue;
+                const cur = parseInt(a.progress ?? 0, 10) || 0;
+                const max = parseInt(a.max ?? 0, 10) || 0;
+                completeById.set(id, String(a.complete).toLowerCase() === "true" || (max > 0 && cur >= max));
+            }
+            return { host, identity, promos, completeById, balance: Number((data.userInfo || {}).balance) || 0 };
+        },
+
+        /* 从面板数据里挑出国际版每日活动的卡片。
+           只认 offerId 前缀 —— 面板里还有 Instant Win、Star bonus、兑换广告……
+           它们不是每日活动，误报只会白打接口。
+           5 张卡每天都能做（offerId 里的星期名只是编号），所以默认不过滤星期。 */
+        pickCards(panel, { weekdays = null } = {}) {
+            const want = Array.isArray(weekdays) && weekdays.length ? new Set(weekdays) : null;
+            const seen = new Map();
+            for (const p of panel.promos) {
+                const name = String(p.name || p.offerId || "");
+                if (!name.startsWith(this.OFFER_PREFIX)) continue;
+                const attr = p.attributes || {};
+                const offerId = String(p.offerId || attr.offerid || name);
+                const day = name.slice(this.OFFER_PREFIX.length).replace(/^Evergreen_/, "");
+                if (!this.WEEKDAYS.includes(day)) continue;
+                if (want && !want.has(day)) continue;
+                if (!p.hash) continue;              /* 没有 hash 就交不了卷，别占位 */
+                if (seen.has(offerId)) continue;
+                const done = p.complete === true
+                    || String(attr.complete).toLowerCase() === "true"
+                    || panel.completeById.get(offerId) === true;
+                const destination = String(attr.destination || "");
+                /* 「Do you know the answer?」这类是**交互式 Quiz**，不是普通 redirect：
+                   落地页里有个真题目，必须点掉答案，页面才会带着
+                   WQOskey/WQId/WQQI 这些参数去打 rewardsapp/reportActivity 记账。
+                   实测：只调面板的 msrewards/reportactivity 对它是无效的。 */
+                const isQuiz = /Homepage%20quiz|BingQA_Quiz|form=ML2BF1/i.test(destination)
+                    || /do you know the answer/i.test(String(attr.title || p.title || ""));
+                seen.set(offerId, {
+                    offerId,
+                    name,
+                    day,
+                    title: attr.title || p.title || day,
+                    activityType: p.activityType || "bingredirect",
+                    hash: p.hash,
+                    points: Number(p.pointProgressMax || attr.max || 5) || 5,
+                    complete: done,
+                    destination,
+                    isQuiz
+                });
+            }
+            return [...seen.values()];
+        },
+
+        /* ── 交互式 Quiz（「Do you know the answer?」）专用通道 ──────────────
+           这类卡和拼图/每日一句不是一回事：
+             · 拼图 / 每日一句：面板 reportactivity 一发就记账
+             · Quiz：必须真的打开落地页、点掉那道题，页面才会带着
+               WQOskey / WQId / WQQI 去打 rewardsapp/reportActivity
+           实测（2026-11 cn.bing.com）：
+             只调 msrewards/reportactivity  → 卡永远不完成
+             打开落地页 + 点正确选项        → 页面自己发 reportActivity，记账
+           所以这里按「取题 → 作答 → 用同样的参数上报」复刻整条链路。 */
+
+        /* 把落地页 URL 里的 filters 参数解析成键值（面板下发的是转义过的串） */
+        _parseQuizFilters(destination) {
+            const out = {};
+            try {
+                const u = new URL(destination);
+                const raw = u.searchParams.get("filters") || "";
+                const decoded = decodeURIComponent(raw.replace(/\+/g, " "));
+                for (const m of decoded.matchAll(/([A-Za-z_]+)\s*:\s*"([^"]*)"/g)) out[m[1]] = m[2];
+                if (out.WQOskey) out.__q = u.searchParams.get("q") || "";
+            } catch (_) {}
+            return out;
+        },
+
+        /* 打开落地页，取出题目与正确选项（页面内联 JS 里直接带 isCorrect） */
+        async _fetchQuizPuzzle(host, destination) {
+            const url = String(destination || "").replace(/^https?:\/\/www\.bing\.com/i, `https://${host}`);
+            let html = "";
+            try {
+                html = await Utils.xhr({
+                    url,
+                    headers: {
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": `https://${host}/`
+                    },
+                    timeout: 20000
+                });
+            } catch (e) {
+                return { ok: false, reason: `落地页打开失败：${e.message}` };
+            }
+            const text = String(html || "");
+            /* QuizQuestionPane.init( answerId, questionId, 题干, choices, recordUrl )
+               注意：选项数组是**变量**（var choices = [...]），写在 init 之前，
+               所以要取 init 之前的一段来找 isCorrect。 */
+            const initIdx = text.indexOf("QuizQuestionPane.init(");
+            if (initIdx < 0) return { ok: false, reason: "落地页里没有找到 Quiz 题组" };
+            const seg = text.slice(Math.max(0, initIdx - 3000), initIdx + 1200);
+            /* 正确选项：isCorrect: "true" 那一项的 id */
+            const choices = [...seg.matchAll(/\{\s*id:\s*"([^"]*)",\s*isCorrect:\s*"([^"]*)",\s*text:\s*"([^"]*)"\s*\}/g)]
+                .map(m => ({ id: m[1], correct: m[2] === "true", text: m[3] }));
+            const correct = choices.find(c => c.correct);
+            /* 前两个 init 参数分别是答案 id 与题目 id */
+            const initSeg = text.slice(initIdx, initIdx + 1200);
+            const ids = initSeg.match(/init\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,/);
+            const recordUrl = (initSeg.match(/"(https:[^"]*funapi\/api\/quiz\/record[^"]*)"/) || [])[1] || "";
+            const questionText = (initSeg.match(/init\(\s*"[^"]*"\s*,\s*"[^"]*"\s*,\s*"([^"]*)"/) || [])[1] || "";
+            if (!correct) return { ok: false, reason: "没有找到正确选项" };
+            /* quizId：卡片自身的 destination 里没有 filters，得从落地页 HTML 里抽
+               （形如 HPQuiz_20261112_NorthWindow）。取第一个即可 —— 那正是本页的题组。 */
+            const quizId = (text.match(/HPQuiz_\d+_[A-Za-z0-9]+/) || [])[0] || "";
+            return {
+                ok: true,
+                url,
+                answerId: correct.id,
+                questionId: ids ? ids[2] : "0",
+                questionText,
+                recordUrl,
+                quizId,
+                choiceCount: choices.length
+            };
+        },
+
+        /* 作答：先调 quiz/record 记录，再带 quiz 参数打 rewardsapp/reportActivity */
+        async _solveQuiz(host, destination) {
+            const puzzle = await this._fetchQuizPuzzle(host, destination);
+            if (!puzzle.ok) return { ok: false, reason: puzzle.reason };
+
+            /* destination 本身不带 filters，所以这里自己拼一份「点击选项后」的 filters：
+               面板/页面点击时发的就是这个结构，WQOskey 是题组 ID。 */
+            const own = this._parseQuizFilters(puzzle.url);
+            const quizId = puzzle.quizId || own.WQOskey || "";
+            const q = own.__q || "";
+            const filtersDecoded = [
+                'mgzv3configlist:"BingQA_Quiz_layout"',
+                'dw_answerstobesuppressed:"ConversationalSearch"',
+                'IsConversation:"True"',
+                quizId ? `WQOskey:"${quizId}"` : "",
+                'WQId:"1"',
+                'WQQI:"0"',
+                'WQCI:"0"',
+                'ShowTimesTaskPaneTrigger:"false"',
+                'WQSCORE:"1"'
+            ].filter(Boolean).join(" ");
+
+            /* ① 记录这次作答（页面点击选项时发的就是它） */
+            if (puzzle.recordUrl) {
+                try {
+                    await Utils.xhr({
+                        method: "POST",
+                        url: puzzle.recordUrl,
+                        headers: {
+                            "content-type": "application/json; charset=utf-8",
+                            "accept": "*/*",
+                            "user-agent": RewardsAuto.ua.pc,
+                            "referer": puzzle.url
+                        },
+                        data: JSON.stringify({
+                            q,
+                            filters: filtersDecoded,
+                            answerId: puzzle.answerId,
+                            questionId: puzzle.questionId,
+                            quizId,
+                            correctAnswer: puzzle.answerId
+                        }),
+                        timeout: 20000
+                    });
+                } catch (_) { /* 记录失败不致命，下面还有 reportActivity */ }
+            }
+
+            /* ② 带 quiz 参数打 reportActivity —— 这才是记账那一步 */
+            const params = new URLSearchParams();
+            params.set("q", q);
+            params.set("filters", filtersDecoded);
+            const reportUrl = `https://${host}/rewardsapp/reportActivity?${params.toString()}`;
+            let text = "";
+            try {
+                text = await Utils.xhr({
+                    method: "POST",
+                    url: reportUrl,
+                    headers: {
+                        "content-type": "application/x-www-form-urlencoded",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": puzzle.url
+                    },
+                    data: `url=${encodeURIComponent(puzzle.url)}&V=web`,
+                    timeout: 20000
+                });
+            } catch (e) {
+                return { ok: false, reason: `reportActivity 失败：${e.message}` };
+            }
+            const authed = /"IsAuthenticated":true/.test(String(text || ""));
+            const increment = (String(text || "").match(/"RewardsIncrement":(\d+)/) || [])[1];
+            return {
+                ok: authed && Number(increment) > 0,
+                isAuthenticated: authed,
+                increment: Number(increment) || 0,
+                reason: authed ? "" : "reportActivity 未识别登录态"
+            };
+        },
+
+        /* 从任意响应里尽力读出「余额 / 是否有错」。
+           面板接口在不同通道下会回三种东西：
+             · {IsRewardsUser:…, Balance:{Available:…}, ErrorCode:0}   正常记账
+             · {OfferComplete:…, EarnedCredits:…, ErrorDetail:{…}}     这次没算上
+             · HTML（登录/校验页）                                     通道被拒
+           「响应不是 JSON」不是失败判据 —— 早期就是只看 JSON，于是
+           后台通道回了 HTML 就整张卡判死，其实服务端可能已经记账了。 */
+        _readReport(text) {
+            const data = Utils.parseJSON(text);
+            if (!data) return { json: false, text: String(text || "").slice(0, 200) };
+            const bal = (() => {
+                const b = data.Balance;
+                if (typeof b === "number") return b;
+                if (b && typeof b === "object") return Number(b.Available) || 0;
+                return 0;
+            })();
+            const detail = data.ErrorDetail || {};
+            const code = Number(detail.ErrorCode ?? data.ErrorCode ?? 0) || 0;
+            const message = String(detail.Message || data.ErrorMessage || "").trim();
+            return {
+                json: true,
+                balance: bal,
+                earned: Number(data.EarnedCredits ?? data.PointsEarned ?? 0) || 0,
+                errorCode: code,
+                message,
+                retryable: detail.Retryable === true,
+                offerComplete: data.OfferComplete === true || data.ActivityComplete === true,
+                isRewardsUser: data.IsRewardsUser !== false
+            };
+        },
+
+        /* 交卷：带 hash 调面板接口。返回 {ok, points, balance, reason}
+           通道顺序（都被真实网络验证过，谁先通用谁在前）：
+             ① GM_xhr + text/plain：面板自己的 XHR 也没设 content-type，
+                默认就是 text/plain；带 application/json 反而容易被网关挡成 HTML。
+             ② GM_xhr + JSON 头：保留原行为兜底。
+             ③ 页面代发通道：在 bing 页面上跑脚本时由页面同源 fetch 发出，
+                这是唯一能保证 Origin/Referer 与面板完全一致的通道。
+           三通道都失败时由调用方用「面板回读」定胜负，不在这里硬判死。 */
+        async report(panel, card) {
+            /* Quiz 卡走专用通道：面板 reportactivity 对它无效（实测），
+               必须真打开落地页作答 + 带 quiz 参数打 rewardsapp/reportActivity。 */
+            if (card.isQuiz && card.destination) {
+                const r = await this._solveQuiz(panel.host, card.destination);
+                if (r.ok) {
+                    return { ok: true, via: "quiz", points: card.points, balance: 0 };
+                }
+                /* Quiz 失败就不要再退回面板通道了：那条路对它本来就不通，
+                   继续试只会多打几次请求。直接把原因交给上层。 */
+                return { ok: false, outcome: "unknown", reason: `quiz: ${r.reason}` };
+            }
+            const body = {
+                ActivityType: card.activityType,
+                ActivitySubType: "",
+                OfferId: card.offerId,
+                Channel: panel.identity.channel,
+                PartnerId: panel.identity.partnerId,
+                UserId: panel.identity.userId,
+                AuthKey: card.hash,
+                ActivityCount: 1
+            };
+            const payload = JSON.stringify(body);
+            const url = `https://${panel.host}${this.REPORT_PATH}`;
+            const base = {
+                "accept": "application/json, text/plain, */*",
+                "user-agent": RewardsAuto.ua.pc,
+                "referer": `https://${panel.host}/`
+            };
+            /* 面板自己用的是 XHR，且没显式设 content-type（默认 text/plain）。
+               扩展后台发出的请求和页面同源请求特征不一样，这里把「带不带 Origin」
+               也作为一维来试 —— 有些网关看到扩展源的 Origin 就直接 302 到登录页。 */
+            /* 通道排序按「实测成功率」：
+               ① native：不手工拼 cookie，用浏览器自己的 cookie jar —— 登录态最完整
+               ② plain+origin：实测能过（Origin/Referer 与面板一致）
+               余下几条是兜底。 */
+            const origin = `https://${panel.host}`;
+            const variants = [
+                { name: "native", cookie: false, headers: { ...base, "content-type": "text/plain;charset=UTF-8", "origin": origin } },
+                { name: "plain+origin", headers: { ...base, "content-type": "text/plain;charset=UTF-8", "origin": origin } },
+                { name: "native+json", cookie: false, headers: { ...base, "content-type": "application/json", "origin": origin } },
+                { name: "json+origin", headers: { ...base, "content-type": "application/json", "origin": origin } },
+                { name: "form", headers: { ...base, "content-type": "application/x-www-form-urlencoded", "origin": origin }, data: new URLSearchParams(body).toString() }
+            ];
+
+            const reasons = [];
+            /* 三种结局，必须分清楚：
+                 accepted  服务端明确回了 ErrorCode=0 且没被跳走 —— 可以去复核
+                 rejected  服务端明确报错（ErrorCode≠0）
+                 unknown   通道层失败（HTML/301/网络），该换通道 */
+            let outcome = "unknown";
+            /* 同一 URL 的 301 是服务端在下发 Cookie 后让你重放一次（面板自己也会这样
+               被浏览器自动跟随）。GM 层跟随不了，就手动重放一次，别把它当失败换形态。 */
+            const isSelfRedirect = (loc) => {
+                if (!loc) return false;
+                try {
+                    const a = new URL(loc);
+                    const b = new URL(url);
+                    return a.host === b.host && a.pathname === b.pathname;
+                } catch (_) { return false; }
+            };
+            for (const v of variants) {
+                let res = null;
+                try {
+                    /* redirect:"manual"：不跟随 302。被跳走时 status=3xx 且带 Location，
+                       这样日志能直接说出「被带去登录页」，而不是只报一句
+                       「响应不是 JSON」——那正是这次要修的可观测性问题。 */
+                    res = await Utils.xhrFull({
+                        method: "POST",
+                        url,
+                        headers: v.headers,
+                        data: v.data || payload,
+                        timeout: 20000,
+                        redirect: "manual",
+                        ...(v.cookie === false ? { cookie: false } : {})
+                    });
+                } catch (e) {
+                    reasons.push(`${v.name}: ${e.message}`);
+                    continue;
+                }
+                let status = Number(res && res.status) || 0;
+                let text = String((res && res.text) || "");
+                let location = String((res && res.location) || "");
+                /* 同址 301：重放一次（这次 Cookie 已经在了） */
+                if (status >= 300 && status < 400 && isSelfRedirect(location)) {
+                    try {
+                        const again = await Utils.xhrFull({
+                            method: "POST",
+                            url,
+                            headers: v.headers,
+                            data: v.data || payload,
+                            timeout: 20000,
+                            redirect: "manual",
+                            ...(v.cookie === false ? { cookie: false } : {})
+                        });
+                        status = Number(again && again.status) || 0;
+                        text = String((again && again.text) || "");
+                        location = String((again && again.location) || "");
+                    } catch (e) {
+                        reasons.push(`${v.name}: 重放失败 ${e.message}`);
+                        continue;
+                    }
+                }
+                if (status >= 300 && status < 400) {
+                    reasons.push(`${v.name}: HTTP ${status} 被重定向${location ? `→${location.slice(0, 70)}` : ""}`);
+                    continue;
+                }
+                const r = this._readReport(text);
+                if (!r.json) {
+                    reasons.push(`${v.name}: HTTP ${status} 非 JSON（${text.slice(0, 60).replace(/\s+/g, " ")}）`);
+                    continue;
+                }
+                if (r.errorCode) {
+                    reasons.push(`${v.name}: ErrorCode=${r.errorCode} ${r.message}`);
+                    outcome = "rejected";
+                    continue;
+                }
+                /* ErrorCode=0 但 IsRewardsUser=false：服务端压根没认出登录态，
+                   回的是「游客」那份模板（Balance 全 0）。这不是「已做过」，
+                   而是「这次没带上登录态」—— 必须判失败并换通道重试。 */
+                if (r.isRewardsUser === false) {
+                    reasons.push(`${v.name}: 服务端未识别登录态（游客响应）`);
+                    continue;
+                }
+                /* ErrorCode=0 + OfferComplete=false + 已识别登录：服务端说
+                   「收到但这次没算上」，多半是这张卡今天已经做过了。
+                   不能据此判成功，交给面板回读定夺。 */
+                if (r.offerComplete === false) {
+                    reasons.push(`${v.name}: 已受理但未标记完成（${r.message || "no message"}）`);
+                    outcome = "accepted";
+                    continue;
+                }
+                return { ok: true, via: v.name, points: r.earned, balance: r.balance };
+            }
+
+            /* 兜底：页面代发通道（仅在 bing 页面上跑脚本时可用）。
+               同源发出的请求 Origin/Referer 与面板完全一致，是最可靠的一条。 */
+            if (typeof API !== "undefined" && API._pageChannelAlive && API._pageChannelAlive()) {
+                try {
+                    const out = await API.viaPageChannel(url, { ...base, "content-type": "text/plain;charset=UTF-8" }, payload, 20000, "POST");
+                    const r = this._readReport((out && out.text) || "");
+                    if (r.json && !r.errorCode && r.isRewardsUser !== false && r.offerComplete !== false) {
+                        return { ok: true, via: "page", points: r.earned, balance: r.balance };
+                    }
+                    if (r.json && !r.errorCode && r.isRewardsUser !== false) {
+                        outcome = "accepted";
+                        reasons.push("page: 已受理但未标记完成");
+                    } else {
+                        reasons.push(`page: HTTP ${(out && out.status) || 0} ${r.json ? `ErrorCode=${r.errorCode}` : "返回非 JSON"}`);
+                    }
+                } catch (e) {
+                    reasons.push(`page: ${e.message}`);
+                }
+            }
+            return { ok: false, outcome, reason: reasons.join("；") || "全部通道失败" };
+        },
+
+        /* 主流程：取面板 → 挑卡 → 逐张交卷 → 复核。
+           返回 {found, done, pending, points}；面板里没有这组活动时 found=0。 */
+        /* gap / deadline 由调用方传入，复用 SEARCH_PACER 的节拍（Config.span）：
+           国际版卡片也是打微软的接口，打太快同样有风控风险，
+           所以不给自己留「1.5~3 秒连打 5 张」这种口子。 */
+        async run({ reason = "国际版每日活动", gap = 0, deadline = 0 } = {}) {
+            if (!GM_getValue("Tasks.intlDaily", true)) return null;
+            /* 这里不校验 Token：面板走的是 bing.com 的登录 Cookie，
+               而不是 prod.rewardsplatform 的 OAuth Token，没有 Token 也能做。 */
+
+            let panel = null;
+            for (const host of this.hosts()) {
+                panel = await this.fetchPanel(host);
+                if (panel) break;
+            }
+            if (!panel) return null;
+
+            const cards = this.pickCards(panel);
+            if (cards.length === 0) {
+                Utils.log("🟡", "国际版面板里没有找到每日活动卡片（该账号可能没有这组活动）");
+                return { found: 0, done: 0, pending: 0, points: 0 };
+            }
+
+            const doneIds = new Set(cards.filter(c => c.complete).map(c => c.offerId));
+            const todo = cards.filter(c => !c.complete);
+            if (todo.length === 0) {
+                Utils.log("✅", `国际版每日活动已完成（${cards.length} 张）`);
+                return { found: cards.length, done: cards.length, pending: 0, points: 0 };
+            }
+            Utils.log("🌍", `${reason}：发现 ${todo.length} 张待完成（共 ${cards.length} 张）`);
+
+            const balanceBefore = panel.balance;
+            let ok = 0;
+            let lastReason = "";
+            /* 日志口径：一张卡只打最终结论一行。
+               中间的重试原因全部攒起来，只在「最终真的没成」时合并成一行 ——
+               之前一张卡失败能刷 6 行（每种形态各一行），完全没法看。 */
+            const failed = [];
+            const pacer = (typeof SEARCH_PACER !== "undefined") ? SEARCH_PACER : null;
+            /* 节拍基准：没传就按 Config.span（最低 60 秒）走，绝不定死成几秒 */
+            let beatGap = Number(gap) > 0 ? Number(gap) : (pacer ? pacer.startGap() : 60 * 1000);
+            let outOfTime = false;
+            let idx = 0;
+            for (const card of todo) {
+                const name = card.title || card.offerId;
+                /* 到点就交班：剩下的卡片留给下一轮，不在同一轮里硬挤。
+                   用 idx 直接数「还剩几张」，别用 ok/failed 反推 ——
+                   accepted 那张既不算成功也不算失败，反推会算错。 */
+                if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) {
+                    outOfTime = true;
+                    Utils.log("🟡", `国际版每日活动到点交班，剩余 ${todo.length - idx} 张留给下一轮`);
+                    break;
+                }
+                idx++;
+                let last = null;
+                for (let attempt = 1; attempt <= this.MAX_ATTEMPTS; attempt++) {
+                    last = await this.report(panel, card);
+                    if (last.ok) break;
+                    lastReason = last.reason || "未知原因";
+                    /* 同一张卡的内部重试也拉开间隔，避免连续打同一张 */
+                    if (attempt < this.MAX_ATTEMPTS) {
+                        await Utils.randomDelay(Math.min(5000, Math.round(beatGap / 12) + 2000),
+                            Math.min(12000, Math.round(beatGap / 6) + 3000));
+                    }
+                }
+                if (last && last.ok) {
+                    ok++;
+                    doneIds.add(card.offerId);
+                    Utils.log("🟢", `国际版卡片已完成：${name} +${card.points}p`);
+                } else if (last && last.outcome === "accepted") {
+                    /* 服务端收了但没新增记账：通常这张卡今天已经做过，不吵 */
+                    Utils.log("  ", `国际版卡片已受理（未新增记账）：${name}`);
+                } else {
+                    failed.push({ name, reason: lastReason });
+                }
+                /* 卡片间隔 = 与搜索/阅读同一套节拍（Config.span，最低 60 秒）。
+                   原来这里是 1.5~3 秒 —— 5 张卡十几秒内打完，属于明显的机器行为。 */
+                const isLast = idx >= todo.length;
+                if (pacer) {
+                    beatGap = pacer.nextGap(beatGap, !!last && last.ok);
+                    if (!isLast) {
+                        if (deadline > 0 && !pacer.fits(deadline, beatGap)) {
+                            outOfTime = true;
+                            Utils.log("🟡", `国际版每日活动到点交班，剩余 ${todo.length - idx} 张留给下一轮`);
+                            break;
+                        }
+                        Utils.log("  ", `国际版卡片间隔 ${Math.round(pacer.minMs() / 1000)} 秒（与搜索同一节拍）`);
+                        await pacer.beat(beatGap);
+                    }
+                } else if (!isLast) {
+                    await Utils.randomDelay(1500, 3000);
+                }
+            }
+            if (failed.length > 0) {
+                Utils.log("🟠", `国际版卡片交卷未受理 ${failed.length} 张：`
+                    + failed.map(f => f.name).join("、")
+                    + `（${String(failed[0].reason).split("；")[0]}）`);
+            }
+
+            /* 最终判据：面板回读。
+               交卷响应「不是 JSON」时服务端也可能已经记账（尤其是被网关改写成
+               HTML 的情况下），所以这里以面板的 complete 标记为准，而不是响应体。
+
+               重要：服务端对 reportactivity 的入账是**异步**的，而且连打会被
+               短暂降速 —— 现象就是回了 ErrorCode=0 但 OfferComplete 还是 false，
+               过一会儿再看却是完成的。所以复核一次不够，要「复核 → 补做 → 再复核」。 */
+            let gained = 0;
+            let confirmed = 0;
+            const readBack = async () => {
+                let after = await this.fetchPanel(panel.host);
+                if (!after) {
+                    await Utils.delay(4000);
+                    after = await this.fetchPanel(panel.host);
+                }
+                if (!after) return null;
+                const nowCards = this.pickCards(after);
+                for (const c of nowCards) if (c.complete) doneIds.add(c.offerId);
+                gained = Math.max(gained, after.balance - balanceBefore);
+                return { cards: nowCards, confirmed: nowCards.filter(c => c.complete).length, balance: after.balance };
+            };
+
+            try {
+                await Utils.delay(2500);
+                const first = await readBack();
+                if (first) {
+                    confirmed = first.confirmed;
+                    const newlyAcked = first.cards.filter(c => c.complete
+                        && todo.some(t => t.offerId === c.offerId)).length;
+                    if (newlyAcked > 0) ok = Math.max(ok, newlyAcked);
+                }
+
+                /* 补做轮：还有没记账的，隔一个节拍再来一次。
+                   最多再补 2 轮，且必须在一轮的截止时间之内 —— 不硬挤、不无限重试。 */
+                const MAX_EXTRA_PASSES = 2;
+                for (let pass = 1; pass <= MAX_EXTRA_PASSES; pass++) {
+                    let still = cards.filter(c => !doneIds.has(c.offerId));
+                    if (still.length === 0) break;
+                    if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) {
+                        Utils.log("🟡", `国际版每日活动到点：还剩 ${still.length} 张，交给下一轮`);
+                        break;
+                    }
+                    Utils.log("  ", `国际版补做第 ${pass} 轮：${still.length} 张未记账，${Math.round(pacer ? pacer.minMs() / 1000 : 60)} 秒后重试`);
+                    if (pacer) await pacer.beat(beatGap);
+                    else await Utils.randomDelay(30000, 45000);
+                    /* 补做轮自己的预算：最多再花 3 分钟 / 5 次交卷，
+                       免得把本轮的「领取积分 / 二次扫描」挤掉。 */
+                    const passDeadline = Date.now() + 3 * 60 * 1000;
+                    let sent = 0;
+                    for (const card of still) {
+                        if (Date.now() > passDeadline || sent >= 5) {
+                            Utils.log("  ", "国际版补做轮预算用完，剩余交给下一轮");
+                            break;
+                        }
+                        if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) break;
+                        const name = card.title || card.offerId;
+                        sent++;
+                        const last = await this.report(panel, card);
+                        if (last && last.ok) {
+                            ok++;
+                            doneIds.add(card.offerId);
+                            Utils.log("🟢", `国际版卡片补做成功：${name} +${card.points}p`);
+                        }
+                        if (pacer) await pacer.beat(beatGap);
+                    }
+                    await Utils.delay(2500);
+                    const again = await readBack();
+                    if (again) confirmed = again.confirmed;
+                }
+            } catch (_) {}
+
+            const pending = cards.filter(c => !doneIds.has(c.offerId)).length;
+            if (pending === 0) {
+                Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`
+                    + (gained > 0 ? `（余额 +${gained}）` : ""));
+            } else {
+                const names = cards.filter(c => !doneIds.has(c.offerId)).map(c => c.title || c.day).join("、");
+                Utils.log("🟡", `国际版每日活动还差 ${pending} 张：${names}`
+                    + `（${lastReason || "服务端本次未记账"}，下一轮继续）`);
+            }
+            return {
+                found: cards.length,
+                done: cards.length - pending,
+                pending,
+                points: (gained > 0 ? gained : ok * (cards[0].points || 5)),
+                /* 汇总里要能说清「为什么还差」：只取第一句原因，别把 5 条通道全塞进去 */
+                reason: pending === 0 ? "" : (outOfTime
+                    ? "本轮时间不够，剩下的下一轮继续"
+                    : String(lastReason || "").split("；")[0].slice(0, 60))
+            };
+        }
+    };
+
     const EdgeStreak = {
         _running: false,
 
@@ -6416,8 +7124,12 @@ const __scBgKeepAlive = (function() {
     };
 
     try {
+        /* 代发服务在两个域上都启动：
+             · rewards.bing.com —— 老用途（待领积分 / Server Action 交卷）
+             · bing.com         —— 国际版每日活动面板接口就在这个域下，
+                                   只有同源页面 fetch 才能带对 Origin/Referer */
         if (Utils.hasDOM() && typeof location !== "undefined"
-            && /(^|\.)rewards\.bing\.com$/i.test(String(location.hostname || ""))) {
+            && /(^|\.)(rewards\.)?bing\.com$/i.test(String(location.hostname || ""))) {
             API.startPageServer();
             Utils.log("🖥️", `代发服务已启动（页面上下文：${location.hostname}）`);
         }
@@ -7201,6 +7913,48 @@ const __scBgKeepAlive = (function() {
             Utils.log("🟡", lines.join("\n"));
         },
 
+        /* 国际版每日活动（必应面板里那 5 张拼图/问答/每日一句）。
+           和 DailySet 完全两条链路：这里不发 rewards.bing.com 的交卷，
+           也不开标签页，只调 bing 面板的 reportactivity。
+           它是「锦上添花」的 5×5 分，任何异常都不该影响主流程。 */
+        async doIntlDaily(roundDeadline) {
+            /* 这里用 allow() 不用 guard()：国际版只是额外 25 分，
+               出口探测抖动不该把整轮任务打断（guard 会抛 RegionBlockedError）。 */
+            if (!(await RegionGuard.allow())) {
+                Utils.log("🟡", "出口探测未通过，国际版每日活动本轮跳过");
+                return false;
+            }
+            /* 节拍与搜索/阅读共用 Config.span（最低 60 秒）：
+               5 张卡之间各隔一个节拍，而不是十几秒内连着打完。 */
+            const gap = SEARCH_PACER.startGap();
+            const today = Utils.getTodayNum();
+            const key = "Config.intlDailyDate";
+            const st = GM_getValue(key, null);
+            /* 服务端已确认做完就当天封盘，省掉这轮的面板请求 */
+            if (st && Number(st.date) === today && Number(st.pending) === 0) {
+                Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
+                return true;
+            }
+            let res = null;
+            try {
+                res = await IntlDaily.run({ reason: "国际版每日活动", gap, deadline: roundDeadline });
+            } catch (e) {
+                Utils.log("🟡", `国际版每日活动异常：${e.message}（不影响其它任务）`);
+                return false;
+            }
+            if (!res) return false;
+            if (res.found === 0) {
+                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0 });
+                return true;
+            }
+            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending });
+            RewardsAuto.state.intlFound = res.found;
+            RewardsAuto.state.intlDone = res.done;
+            RewardsAuto.state.intlPending = res.pending;
+            RewardsAuto.state.intlReason = res.reason || "";
+            return res.pending === 0;
+        },
+
         async doStreak() {
             await RegionGuard.guard("连签检测");
             Utils.log("📅", "开始检测连签任务...");
@@ -7407,6 +8161,16 @@ const __scBgKeepAlive = (function() {
                     await Utils.randomDelay();
                     dailySetRes = await withRetry(() => this.doDailySet(roundDeadline), "每日活动");
                 }
+                /* 国际版每日活动：必应面板里那 5 张卡，纯接口完成，不占 CDP 也不开标签页 */
+                let intlDailyRes = null;
+                if (!GM_getValue("Tasks.intlDaily", true)) {
+                    Utils.log("  ", "国际版每日活动已关闭（任务开关）");
+                } else if (roundExpired()) {
+                    skipByDeadline("国际版每日活动");
+                } else {
+                    await Utils.randomDelay();
+                    intlDailyRes = await this.doIntlDaily(roundDeadline);
+                }
                 try {
                     await this.doClaimPoints();
                 } catch (e) {
@@ -7478,6 +8242,9 @@ const __scBgKeepAlive = (function() {
                     const searchOk = info.pc.progress >= info.pc.max;
                     const promosOk = this.promosDate === today;
                     const dailyOk = !!dailySetRes;
+                    /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
+                       intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
+                    const intlOk = !GM_getValue("Tasks.intlDaily", true) || intlDailyRes !== false;
                     const edge = EdgeStreak.summary();
                     const edgeOk = !edge || edge.done || edge.skipped;
                     const mob = info.mobile || {};
@@ -7542,6 +8309,17 @@ const __scBgKeepAlive = (function() {
                         : "⏭️ 已关闭"));
                     row("🧩 活动卡片", promosOn, promosOk, "");
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
+                    /* 国际版 5 张卡是「额外加分」项：
+                       · 关掉 → 显示「⏭️ 已关闭」（和别的任务一致，别让人以为漏做）
+                       · 开着但这账号没有这组活动（found=0）→ 不显示这一行 */
+                    const intlOn = GM_getValue("Tasks.intlDaily", true);
+                    const intlFound = Number(RewardsAuto.state.intlFound) || 0;
+                    if (!intlOn) {
+                        row("🌍 国际版每日活动", false, true, "");
+                    } else if (intlFound > 0) {
+                        const intlDone = Number(RewardsAuto.state.intlDone) || 0;
+                        row("🌍 国际版每日活动", intlOn, intlOk && intlDone >= intlFound, intlDone + "/" + intlFound);
+                    }
                     row("🖥️ 桌面专属任务", desktopOn, desktopPending === 0 && desktopFailed === 0,
                         desktopPending > 0 ? `${desktopPending} 张未记账`
                             : (desktopFailed > 0 ? `${desktopFailed} 个入口读取失败` : ""));
@@ -7569,17 +8347,31 @@ const __scBgKeepAlive = (function() {
 
                     /* 标题不带图标：推送图标由 Utils.log 第一参数统一加，
                        否则会拼成「🎉 🎉 今日任务已全部完成！」 */
+                    /* 国际版每日活动是「额外加分」项，不进 goals 分母，
+                       但它没做完时标题就不该说「已完成」，否则表格自相矛盾
+                       （曾出现「达标 6/6 + 今日任务已完成 + 🌍 3/5 ⏳」）。 */
+                    const intlShort = intlOn && intlFound > 0
+                        && (Number(RewardsAuto.state.intlDone) || 0) < intlFound;
+                    if (intlShort) {
+                        const why = String(RewardsAuto.state.intlReason || "").trim();
+                        blocked.push(`🌍 国际版每日活动 ${Number(RewardsAuto.state.intlDone) || 0}/${intlFound} 张`
+                            + (why ? `（${why}）` : "（下一轮继续）"));
+                    }
                     const head = allDone
                         ? (blocked.length > 0
-                            ? "今日任务已完成"
+                            ? (intlShort ? "今日主要任务已完成（国际版还差一点）" : "今日任务已完成")
                             : "今日任务已全部完成！")
                         : "本轮结果 · 还差 " + (goals.length - doneCount) + " 项";
                     let logMsg = head + "\n\n" + rows.join("\n")
                         + "\n\n✅ 达标 " + doneCount + "/" + goals.length + " · ⏱️ 用时 " + totalTime + " 秒";
                     if (blocked.length > 0) {
                         logMsg += "\n\n⏳ 受限制未完成：\n"
-                            + blocked.map(s => "· " + s).join("\n")
-                            + "\n💡 上面三项要自动完成，需用 Chrome 浏览器运行脚本";
+                            + blocked.map(s => "· " + s).join("\n");
+                        /* 只有「需要 Chrome / CDP」的那几条才提浏览器；国际版不在此列 */
+                        const needChrome = (desktopOn && (desktopPending > 0 || desktopFailed > 0)) || claimPending;
+                        if (needChrome) {
+                            logMsg += "\n💡 「桌面专属任务 / 首页待领取」需要 Chrome，或按第三节配好 CDP";
+                        }
                     }
 
                     /* 通知策略：常规任务全达标才推一条汇总；中间轮次只写日志。
@@ -7805,7 +8597,7 @@ const __scBgKeepAlive = (function() {
         /* ── 今日任务进度（tasks 里含 signDate/readDate/promosDate/searchDate） ── */
         "Config.tasks", "Config.signPoint",
         "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
-        "Config.edge", "Config.monthlyState",
+        "Config.edge", "Config.monthlyState", "Config.intlDailyDate",
         /* ── 搜索相关的运行痕迹（配置项的 span 不动） ── */
         "Config.searchGap", "Config.searchLast", "Config.searchPending",
         "Config.searchGuard", "Config.restrictedTimes", "Config.lastSearchProgress",
@@ -8379,6 +9171,8 @@ const __scBgKeepAlive = (function() {
                 /* 先回收死掉的轮次，再算计划和补跑：
                    顺序反了的话 watchdog / fire 会对着一条死记录反复跳过。 */
                 this.reapDeadRound(now);
+                /* 冷却一到点就先重置运行状态并立即恢复（详见 autoRecoverFromCooldown） */
+                this.autoRecoverFromCooldown(now);
                 const next = this.plan(now);
                 this.watchdog(now);
                 EdgePacer.maybeReport().catch(() => {});
@@ -8405,6 +9199,68 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔴", `常驻调度异常：${e && e.message ? e.message : e}`);
             }
             this.arm(false);
+        },
+
+        /* ══ 冷却到期自动恢复 ══════════════════════════════════════════
+           诉求：进入「搜索冷却」之后，一到点就把运行状态重置成刚装脚本
+           的样子（释放运行锁、清认领、清今日进度与冷却计数），然后立刻
+           重新开跑 —— 而不是干等下一轮。
+
+           为什么必须是「重置」而不只是清冷却：
+             被冷却打断的那一轮往往留下了半截状态（claim/runState/心跳），
+             光清 cooldownUntil 的话，下一轮可能还卡在旧锁或旧认领上，
+             用户看到的现象就是「到点了却什么都没发生」。
+
+           安全性：直接复用 doSoftReset()，它的白名单
+           （SOFT_RESET_KEYS）从来不含授权键和配置项，
+           所以授权码、Token、span、winTime、任务开关、通知设置全都不动。
+
+           只在这里触发，不在别处：本函数由 tick() 每 20 秒调用一次，
+           靠一个持久化的标记位保证「同一次冷却只自动重置一次」。 */
+        autoRecoverFromCooldown(now) {
+            let guard;
+            try { guard = API.searchGuard(); } catch (_) { return false; }
+            if (!guard || !guard.cooldownUntil) return false;
+            /* 还没到期就什么都不做 */
+            if (now < guard.cooldownUntil) return false;
+
+            /* 同一次冷却只处理一次：把 cooldownUntil 的值当作这次冷却的身份，
+               处理过就记下来，避免心跳反复重跑重置。 */
+            const stampKey = "Config.searchAutoReset";
+            const done = Number(GM_getValue(stampKey, 0)) || 0;
+            if (done === guard.cooldownUntil) return false;
+            GM_setValue(stampKey, guard.cooldownUntil);
+
+            const span = Math.round((now - guard.cooldownUntil) / 60000);
+            Utils.log("🔄", `搜索冷却已到期（${guard.reason || "连续多轮未记账"}${span > 0 ? `，迟到 ${span} 分钟` : ""}），`
+                + "开始自动重置运行状态并立即恢复任务");
+
+            /* 重置成「刚装脚本」的运行状态，但保留授权与配置 */
+            let result = null;
+            try {
+                result = doSoftReset({ rearm: false });
+            } catch (e) {
+                Utils.log("🟡", `自动重置异常：${e && e.message ? e.message : e}，改为只解除冷却`);
+                try { API.clearSearchGuard(true); } catch (_) {}
+            }
+            if (result) {
+                Utils.log("✅", `自动重置完成：清理 ${Array.isArray(result.cleared) ? result.cleared.length : (Number(result.cleared) || 0)} 项运行状态，`
+                    + `授权${result.authIntact ? "完整保留" : "状态异常，请检查"}`);
+            }
+
+            /* 重置已把 Config.cronNextRun 清空，这里显式排一个「马上」的下次触发。
+               注意还要绕开运行时段：若此刻在时段外，就顺延到下一个窗口起点。 */
+            const fireAt = this.alignToWindow(now);
+            this.saveNext(fireAt);
+            this.clearClaim();
+            GM_setValue("Config.runState", null);
+            if (fireAt > now + 1000) {
+                Utils.log("🌙", `当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），`
+                    + `重置已就绪，${this.fmt(fireAt)} 到点开跑`);
+            } else {
+                Utils.log("🚀", "重置已就绪，下一轮立即开始");
+            }
+            return true;
         },
 
         /* 关键修复：一轮要是被挂死了（请求卡住 / 上下文被冻结），
