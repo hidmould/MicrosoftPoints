@@ -585,6 +585,22 @@ const __scBgKeepAlive = (function() {
             return h;
         },
 
+        /* 只写日志的节流版：同 key + 同文案在 ttl 内只记一行。
+           与 logOnce 的区别是**绝不弹通知、绝不推 webhook** ——
+           用于「已知且不影响任务」的噪音（如接口 401、面板暂时不可用），
+           用户只想要完成通知，这类过程状态不该打扰。 */
+        logSilenced(icon, msg, key, ttlMs = 6 * 60 * 60 * 1000) {
+            const storeKey = `Log.silent.${key}`;
+            const now = Date.now();
+            let rec = null;
+            try { rec = GM_getValue(storeKey, null); } catch (_) {}
+            const lastAt = rec ? (Number(rec.at) || 0) : 0;
+            if (rec && now - lastAt < ttlMs) return false;   /* 静默，连日志都不写 */
+            try { GM_setValue(storeKey, { at: now }); } catch (_) {}
+            GM_log(`${icon} ${msg}`);
+            return true;
+        },
+
         /* hashText 可选：只用于判断「是不是同一件事」，让带数字变化的同类提示也能合并 */
         logOnce(icon, msg, key, ttlMs = 12 * 60 * 60 * 1000, hashText) {
             GM_log(`${icon} ${msg}`);
@@ -4128,14 +4144,34 @@ const __scBgKeepAlive = (function() {
                         }
                     }
                 } catch (e) {
-
+                    /* getuserinfo 现在（2026-11）对已登录账号也常年回 401，
+                       属于**已知的接口下线**，不是需要每轮提醒的故障。
+                       以前这里每轮打一行 🟡，日志里刷得满屏都是，
+                       反而掩盖了真正的问题。改成每 12 小时最多提一次。 */
                     const noCookie = /\b(401|403)\b/.test(String(e.message));
-                    Utils.log("🟡", `${noCookie ? "getuserinfo 无会话（不影响 Server Action 交卷）" : "getuserinfo 活动解析跳过"}: ${e.message}`);
+                    if (noCookie) {
+                        /* 只写日志、**不弹通知**：这是接口下线，不是「任务完成」，
+                           用户明确要求通知只在真的做完时出现。
+                           用静默节流：12 小时内只记一行，避免每轮刷屏。 */
+                        Utils.logSilenced("  ", "getuserinfo 已失效（401）：活动卡片改用 earn 页解析，不影响任务",
+                            "getuserinfo401", 12 * 60 * 60 * 1000);
+                    } else {
+                        Utils.log("🟡", `getuserinfo 活动解析跳过: ${e.message}`);
+                    }
                 }
 
                 try {
                     const flightItems = this._flightItems(this._flightText(html));
-                    if (flightItems.length > 0) sources.flight = true;
+                    /* ⚠️ 这里必须同时标记 sourceAnswered：
+                       以前只写了 sources.flight，而决定「是『没有待办卡』还是
+                       『根本没读到』」的判据是 sourceAnswered，
+                       于是 earn 页明明解析出十几条卡，日志却报
+                       「数据源全部不可用」—— 用户看到的就是这条刷屏。
+                       只要 flight 解析出条目，就说明服务端答了话。 */
+                    if (flightItems.length > 0) {
+                        sources.flight = true;
+                        sourceAnswered = true;
+                    }
                     for (const item of flightItems) {
                         if (!item.offerId || !item.hash) continue;
                         if (item.isCompleted === true || item.hidden === true) continue;
@@ -5081,7 +5117,7 @@ const __scBgKeepAlive = (function() {
                 const completedCards = cards.filter(c => c.isCompleted).length;
                 /* 子项和进度文案至少拿到一样才算「解析成功」，否则换下一个身份兜底 */
                 if (cards.length === 0 && totalByText === 0) {
-                    lastReason = "未解析到子项（页面结构可能已变更）";
+                    lastReason = "未解析到子项";
                     continue;
                 }
                 if (idn.name !== identities[0].name) {
@@ -8550,7 +8586,10 @@ const __scBgKeepAlive = (function() {
                 const src = cards.sources || {};
                 const answered = !!(src.getuserinfo || src.flight);
                 if (!answered) {
-                    Utils.log("🟠", "活动卡片：数据源不可用，本轮无法确认是否已完成（不标记完成，下一轮会重试）");
+                    /* 同一类噪音：数据源都不可用时如实说「无法确认」，
+                       但不弹通知、也不每轮刷（6 小时最多一行）。 */
+                    Utils.logSilenced("🟠", "活动卡片：数据源不可用，本轮无法确认是否已完成（不标记完成，下一轮会重试）",
+                        "promosSourceDown", 6 * 60 * 60 * 1000);
                     RewardsAuto.state.promosUnknown = true;
                     return false;
                 }
