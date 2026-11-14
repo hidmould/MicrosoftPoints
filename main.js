@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.3
+// @version      1.5.4
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -555,22 +555,101 @@ const __scBgKeepAlive = (function() {
         get msg() { return p.body(new Date().toLocaleString(), RewardsAuto.state.sendMSG); }
     }));
 
+    /* ── 推送策略（整脚本唯一出口） ─────────────────────────────────────
+       用户口径：平时完全静默，只有两种情况才打扰 ——
+         ① 任务真的做完了（全天达标 / 某个整块任务首次完成）→ 推 1 次；
+         ② 出异常、需要人介入（授权失效、出口被拦、本轮异常终止等）→ 推，
+            但同类异常 6 小时内只推 1 次，全局每小时最多 3 条。
+       过程状态（进度、交卷失败下一轮继续、接口 401、请手动点一次……）
+       一律只写日志：那些每 20 分钟一轮就会复现，推一次就是骚扰一次。 */
+    const NOTICE = {
+        DONE_TTL: 20 * 60 * 60 * 1000,
+        ANOMALY_TTL: 6 * 60 * 60 * 1000,
+        ANOMALY_PER_HOUR: 3,
+    };
+
+    /* 「没配 CDP」永远不该变成推送：用户明确要求这类环境提示静默。
+       作为网关级兜底 —— 任何路径想把 CDP 相关文案推出去都会被压回日志。 */
+    const CDP_NOTICE_RE = /CDP|调试端口|remote-debugging|remote-allow-origins|Rewards Edge/;
+
     const Utils = {
+        /* 纯日志：**永不推送**。
+           第三个参数只是为了兼容旧调用点，传什么都不再触发通知 ——
+           以前 `log(..., true)` / `log(..., pending === 0 && ok > 0)` 这类写法
+           是「每次检测都通知」的根源（子任务一做完就推一条）。
+           需要推送时必须显式走 notifyDone()（完成）或 notifyAnomaly()（异常）。 */
         log(icon, msg, push = false) {
             GM_log(`${icon} ${msg}`);
-            if (push && GM_getValue("Notice.bro", true)) {
+            if (push) GM_log("🔇 该提示属于过程状态，只写日志（不推送）");
+        },
+
+        /* 真正发出去（浏览器通知 + webhook）。只允许 notifyDone / notifyAnomaly 调用 */
+        deliver(icon, msg) {
+            if (GM_getValue("Notice.bro", true)) {
                 try {
                     GM_notification({
                         title: GM_info.script.name + ` ${icon}`,
                         text: msg,
                         onclick: () => GM_openInTab("https://rewards.bing.com/dashboard", { active: true })
                     });
-                } catch(_) {}
+                } catch (_) {}
             }
-            if (push) {
-                RewardsAuto.state.sendMSG = `${icon} ${msg}`;
-                this.sendWebhook();
+            RewardsAuto.state.sendMSG = `${icon} ${msg}`;
+            this.sendWebhook();
+        },
+
+        /* 记录一次推送并返回「剩余冷却分钟数」；0 = 现在可以推 */
+        _claimNotice(kind, key, ttlMs) {
+            const storeKey = `Notice.sent.${kind}.${key}`;
+            const now = Date.now();
+            let rec = null;
+            try { rec = GM_getValue(storeKey, null); } catch (_) {}
+            const lastAt = rec ? (Number(rec.at) || 0) : 0;
+            if (rec && now - lastAt < ttlMs) return Math.max(1, Math.ceil((ttlMs - (now - lastAt)) / 60000));
+            try { GM_setValue(storeKey, { at: now }); } catch (_) {}
+            return 0;
+        },
+
+        /* 完成类：同一件事（同一 key）在 ttl 内只推一次 */
+        notifyDone(icon, msg, key, ttlMs = NOTICE.DONE_TTL) {
+            GM_log(`${icon} ${msg}`);
+            const left = this._claimNotice("done", key, ttlMs);
+            if (left > 0) {
+                GM_log(`🔁 「${key}」的完成通知已在 ${left} 分钟内推过，本次静默（只写日志）`);
+                return false;
             }
+            this.deliver(icon, msg);
+            return true;
+        },
+
+        /* 异常类：同类 6 小时内只推一次，全局每小时限量，超了只写日志 */
+        notifyAnomaly(icon, msg, key, ttlMs = NOTICE.ANOMALY_TTL) {
+            GM_log(`${icon} ${msg}`);
+            /* 「没配 CDP」不算异常：用户明确要求这类环境提示绝不推送。
+               网关级兜底 —— 就算某个异常文案里带了 CDP 字样，也压回日志。 */
+            if (CDP_NOTICE_RE.test(String(msg || ""))) {
+                GM_log("🔇 这条属于 CDP 环境提示，只写日志（不推送）");
+                return false;
+            }
+            return this._anomaly(icon, msg, key, ttlMs);
+        },
+
+        _anomaly(icon, msg, key, ttlMs = NOTICE.ANOMALY_TTL) {
+            const hourKey = `Notice.budget.${Math.floor(Date.now() / 3600000)}`;
+            let used = 0;
+            try { used = Number(GM_getValue(hourKey, 0)) || 0; } catch (_) {}
+            if (used >= NOTICE.ANOMALY_PER_HOUR) {
+                GM_log(`🔇 本小时异常推送已达上限（${NOTICE.ANOMALY_PER_HOUR} 条），本条只写日志`);
+                return false;
+            }
+            const left = this._claimNotice("anomaly", key, ttlMs);
+            if (left > 0) {
+                GM_log(`🔁 同类异常已在 ${left} 分钟内推过，本次静默（只写日志）`);
+                return false;
+            }
+            try { GM_setValue(hourKey, used + 1); } catch (_) {}
+            this.deliver(icon, msg);
+            return true;
         },
 
         /*
@@ -585,10 +664,9 @@ const __scBgKeepAlive = (function() {
             return h;
         },
 
-        /* 只写日志的节流版：同 key + 同文案在 ttl 内只记一行。
-           与 logOnce 的区别是**绝不弹通知、绝不推 webhook** ——
-           用于「已知且不影响任务」的噪音（如接口 401、面板暂时不可用），
-           用户只想要完成通知，这类过程状态不该打扰。 */
+        /* 只写日志的节流版：同 key 在 ttl 内只记一行。
+           用于「已知且不影响任务」的噪音（如接口 401、面板暂时不可用、
+           请手动点一次、CDP 未连接）—— 这些每轮都会复现，连日志都不必刷屏。 */
         logSilenced(icon, msg, key, ttlMs = 6 * 60 * 60 * 1000) {
             const storeKey = `Log.silent.${key}`;
             const now = Date.now();
@@ -601,38 +679,19 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
-        /* hashText 可选：只用于判断「是不是同一件事」，让带数字变化的同类提示也能合并 */
-        logOnce(icon, msg, key, ttlMs = 12 * 60 * 60 * 1000, hashText) {
+        /* 已废弃：保留 API 只为兼容，永不推送。
+           过去它是最好的「节流推送」工具，结果被大量过程状态当成推送入口，
+           于是同一件事每轮复现一次就要打扰一次。现在只记日志。 */
+        logOnce(icon, msg) {
             GM_log(`${icon} ${msg}`);
-            const storeKey = `Notice.once.${key}`;
-            const now = Date.now();
-            const hash = this._noticeHash(hashText == null ? msg : hashText);
-            let rec = null;
-            try { rec = GM_getValue(storeKey, null); } catch (_) {}
-            const lastAt = rec ? (Number(rec.at) || 0) : 0;
-            if (rec && rec.hash === hash && now - lastAt < ttlMs) {
-                const leftMin = Math.max(1, Math.ceil((ttlMs - (now - lastAt)) / 60000));
-                GM_log(`🔁 同类通知 ${leftMin} 分钟内已推送过，本次静默（只写日志）`);
-                return false;
-            }
-            try { GM_setValue(storeKey, { at: now, hash, msg: String(msg).slice(0, 200) }); } catch (_) {}
-            if (GM_getValue("Notice.bro", true)) {
-                try {
-                    GM_notification({
-                        title: GM_info.script.name + ` ${icon}`,
-                        text: msg,
-                        onclick: () => GM_openInTab("https://rewards.bing.com/dashboard", { active: true })
-                    });
-                } catch (_) {}
-            }
-            RewardsAuto.state.sendMSG = `${icon} ${msg}`;
-            this.sendWebhook();
-            return true;
+            return false;
         },
 
         /* 状态恢复正常时重置节流记录，保证下次真出问题时还能提醒一次 */
         resetOnce(key) {
             try { GM_setValue(`Notice.once.${key}`, null); } catch (_) {}
+            try { GM_setValue(`Notice.sent.done.${key}`, null); } catch (_) {}
+            try { GM_setValue(`Notice.sent.anomaly.${key}`, null); } catch (_) {}
         },
 
         async sendWebhook() {
@@ -903,15 +962,15 @@ const __scBgKeepAlive = (function() {
                 return;
             }
 
-            Utils.log("🔑", "首次运行：请求 Cookie 读取权限，若弹出授权框请点「允许」", true);
+            Utils.log("🔑", "首次运行：请求 Cookie 读取权限，若弹出授权框请点「允许」");
             const r = await this.loginCookies();
             GM_setValue("Config.cookieProbed", true);
 
             if (r === null) {
                 Utils.log("🟡", "Cookie 读取被拒绝或超时：脚本仍可正常运行，只是读不到登录态诊断。"
-                    + "如需放权，去脚本管理器的「脚本详情 → 权限」里允许 Cookie 访问，然后重新运行。", true);
+                    + "如需放权，去脚本管理器的「脚本详情 → 权限」里允许 Cookie 访问，然后重新运行。");
             } else if (r.hasSession) {
-                Utils.log("🔑", "Cookie 权限正常，已登录：" + (r.names || []).slice(0, 6).join(","), false);
+                Utils.log("🔑", "Cookie 权限正常，已登录：" + (r.names || []).slice(0, 6).join(","));
             } else {
                 Utils.log("🔑", "Cookie 权限正常，但读出的是未登录状态（请确认已在该浏览器登录 rewards）");
             }
@@ -1132,11 +1191,9 @@ const __scBgKeepAlive = (function() {
         _cache: null,
         _inflight: null,
         _lastState: "",
-        _lastNotifyAt: 0,
         TTL_OK: 120 * 1000,
         TTL_BLOCK: 45 * 1000,
         PROBE_TIMEOUT: 8000,
-        NOTIFY_GAP: 10 * 60 * 1000,
 
         enabled() {
             return !!GM_getValue("Config.lock", true);
@@ -1324,13 +1381,16 @@ const __scBgKeepAlive = (function() {
                     if (verdict.ip) RewardsAuto.state.ip = verdict.ip;
                     if (verdict.ipInfo) RewardsAuto.state.ipInfo = verdict.ipInfo;
                     const stateChanged = this._lastState !== "block";
-                    const push = stateChanged || (Date.now() - this._lastNotifyAt > this.NOTIFY_GAP);
+                    /* 出口被拦是「需要人介入」的异常：只在状态刚变成 block
+                       的那一次推一条，同一次阻塞期内不再重复（恢复后再拦才算新事件）。 */
                     if (stateChanged || fresh) {
-                        Utils.log(push ? "🔴" : "🟡",
-                            `检测到代理/VPN 或非大陆出口，已暂停上报\n${verdict.reasons.join("\n")}\n出口 IP：${verdict.ip || "未知"}\n${verdict.ipInfo || ""}`,
-                            push);
+                        const text = `检测到代理/VPN 或非大陆出口，已暂停上报\n${verdict.reasons.join("\n")}\n出口 IP：${verdict.ip || "未知"}\n${verdict.ipInfo || ""}`;
+                        if (stateChanged) {
+                            Utils.notifyAnomaly("🔴", text, "regionBlock");
+                        } else {
+                            Utils.log("🟡", text);
+                        }
                     }
-                    if (push) this._lastNotifyAt = Date.now();
                     this._lastState = "block";
                 }
                 return verdict;
@@ -1521,9 +1581,9 @@ const __scBgKeepAlive = (function() {
                 if (keep) {
                     GM_setValue("Config.codeUsed", true);
                     GM_setValue("Config.codeFingerprint", String(code).slice(-32));
-                    Utils.log("🟢", "授权码换取 Token 成功（授权码已保留）", true);
+                    Utils.log("🟢", "授权码换取 Token 成功（授权码已保留）");
                 } else {
-                    Utils.log("🟢", "授权码换取 Token 成功，已保存", true);
+                    Utils.log("🟢", "授权码换取 Token 成功，已保存");
                     this.clear();
                 }
                 return true;
@@ -1616,8 +1676,8 @@ const __scBgKeepAlive = (function() {
             const err = params.get("error");
             if (err) {
                 const desc = params.get("error_description") || "";
-                Utils.log("🔴", `授权页返回错误：${err} - ${desc}`, true);
-                try { GM_notification({ title: "🔴 授权失败", text: `${err}：${desc}`, timeout: 0 }); } catch (_) {}
+                /* 与出口拦截同一套：只走网关，避免「浏览器通知 + 网关」双份 */
+                Utils.notifyAnomaly("🔴", `授权页返回错误：${err} - ${desc}`, "authCallback");
                 return;
             }
             if (!params.get("code")) {
@@ -1625,14 +1685,12 @@ const __scBgKeepAlive = (function() {
             }
             const hit = this.collectCode(false) || await this.waitForAnyCode(12000);
             if (!hit) {
-                Utils.log("🔴", "自动捕获授权码失败：地址栏、document.referrer、启动快照里都没有 code", true);
-                try {
-                    GM_notification({
-                        title: "🔴 自动捕获授权码失败",
-                        text: "F12 → 网络 → 点 oauth20_desktop.srf?removed=true → 标头 → 请求标头 → 复制 Referer 右侧完整链接，再用「📋 粘贴授权码」",
-                        timeout: 0
-                    });
-                } catch (_) {}
+                /* 直接把「怎么办」写进这一条：只推一次，正文就能照着做，
+                   不再额外弹第二个浏览器通知（那是重复打扰）。 */
+                Utils.notifyAnomaly("🔴",
+                    "自动捕获授权码失败：地址栏、document.referrer、启动快照里都没有 code\n"
+                    + "F12 → 网络 → 点 oauth20_desktop.srf?removed=true → 标头 → 请求标头 → 复制 Referer 右侧完整链接，再用「📋 粘贴授权码」",
+                    "authCapture");
                 return;
             }
             const code = hit.code;
@@ -1640,10 +1698,11 @@ const __scBgKeepAlive = (function() {
             this.save(hit.raw || code);
             const ok = await this.exchange(code);
             if (ok) {
+                /* 手动授权流程的即时回执：用户正看着这个页面，弹一条告诉他可以关页 */
                 try { GM_notification({ title: "🟢 授权成功", text: "Token 已保存，可以关闭此页了", timeout: 6000 }); } catch (_) {}
                 setTimeout(() => { try { window.close(); } catch (_) {} }, 2000);
             } else {
-                try { GM_notification({ title: "🔴 授权失败", text: "授权码换取 Token 失败，请查看脚本日志后重新授权", timeout: 0 }); } catch (_) {}
+                Utils.notifyAnomaly("🔴", "授权码换取 Token 失败，请查看脚本日志后重新授权", "authCallbackExchange");
             }
         },
 
@@ -3124,7 +3183,7 @@ const __scBgKeepAlive = (function() {
             if (got.tokenReady) return true;
             if (got.code) {
                 if (await Auth.exchange(got.code)) return true;
-                Utils.log("🔴", "授权码换取 Token 失败，请重新「🔑 手动授权」", true);
+                Utils.notifyAnomaly("🔴", "授权码换取 Token 失败，请重新「🔑 手动授权」", "authExchange");
             }
             return false;
         },
@@ -5042,8 +5101,9 @@ const __scBgKeepAlive = (function() {
             GM_setValue("Config.monthlyState", st);
         },
 
-        /* 同一件事每天只写一条日志/推一条通知：cron 每 20 分钟一轮，不加节流会刷屏 */
-        monthlyLog(st, icon, msg, push = false) {
+        /* 同一件事每天只写一条日志：cron 每 20 分钟一轮，不加节流会刷屏。
+           月度计划的进度属于过程状态，**不推送**——完成与否统一由轮末汇总发一条。 */
+        monthlyLog(st, icon, msg) {
             const today = Utils.getTodayNum();
             if (Number(st.logDate) === today) {
                 Utils.log(icon, msg);
@@ -5051,7 +5111,7 @@ const __scBgKeepAlive = (function() {
             }
             st.logDate = today;
             this.saveMonthlyState(st);
-            Utils.log(icon, msg, push);
+            Utils.log(icon, msg);
             return true;
         },
 
@@ -5314,7 +5374,7 @@ const __scBgKeepAlive = (function() {
                 }
                 if (!snap.ok || snap.cards.length === 0) {
                     if (!snap.ok) Utils.log("🟡", `月度计划：${parentId} ${snap.reason}`);
-                    else Utils.log("🟡", `月度计划：${parentId} 未解析到子项（页面结构可能已变更）`);
+                    else Utils.log("🟡", `月度计划：${parentId} 未解析到子项`);
                     /* 解析不到不等于完成了，但只要没有待办就不该反复拉页面 */
                     const q = {
                         ...cached, done: cached.done || 0, total: cached.total || 0,
@@ -5424,10 +5484,10 @@ const __scBgKeepAlive = (function() {
                 st.pausedAt = Date.now();
                 this.saveMonthlyState(st);
                 this.monthlyLog(st, "🔵",
-                    `月度计划本月全部完成（${reports.join("，")}），${Math.round(MONTHLY.DONE_RECHECK_MS / 3600000)} 小时后再复查一次`, true);
+                    `月度计划本月全部完成（${reports.join("，")}），${Math.round(MONTHLY.DONE_RECHECK_MS / 3600000)} 小时后再复查一次`);
             } else if (anyProgress) {
                 this.monthlyLog(st, "📆",
-                    `月度计划已推进：本次完成 1 个子项（${reports.join("，")}）`, true);
+                    `月度计划已推进：本次完成 1 个子项（${reports.join("，")}）`);
             } else {
                 this.monthlyLog(st, "📆", `月度计划进度：${reports.join("，") || "无"}`);
             }
@@ -8671,15 +8731,19 @@ const __scBgKeepAlive = (function() {
             }
             const manualCards = (RewardsAuto.state.manualCards || []);
             if (manualCards.length > 0) {
-                Utils.log("🖐️", "以下 " + manualCards.length + " 张卡已自动上报搜索，请在 earn 页手动点一次："
-                    + manualCards.map(m => m.name).join("、"), true);
+                /* 过程状态：每轮都会重现同一批卡，推送只会变成噪音 */
+                Utils.logSilenced("🖐️", "以下 " + manualCards.length + " 张卡已自动上报搜索，请在 earn 页手动点一次："
+                    + manualCards.map(m => m.name).join("、"), "manualCards", 12 * 60 * 60 * 1000);
             }
             if (lockedNow > 0) {
                 Utils.log("🔒", `另有 ${lockedNow} 张卡片处于锁定状态，不计入剩余量（满足条件后会自动重试）`);
             }
+            /* 活动卡片做完 ≠ 今天全部做完：这里必须只写日志。
+               以前第三个参数是 `pending === 0 && ok > 0`，等于「每轮卡片清空就推一条」，
+               一天最多推 3 次（promosTimes 上限就是 2），正是用户说的「每次检测都通知」。
+               完成通知统一由轮末汇总发一条。 */
             Utils.log(pending === 0 ? "🔵" : "🟡",
-                `活动完成: ${ok}成功/${fail}失败${pending > 0 ? `，仍剩 ${pending} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`,
-                pending === 0 && ok > 0);
+                `活动完成: ${ok}成功/${fail}失败${pending > 0 ? `，仍剩 ${pending} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`);
             return pending === 0;
         },
 
@@ -8908,8 +8972,10 @@ const __scBgKeepAlive = (function() {
             const hitRate = attempts > 0 ? Math.round((credits / attempts) * 100) : 0;
             if (finalInfo && progress >= max) {
                 markDone();
+                /* 单个任务做完 ≠ 今天全做完：这里只写日志，
+                   真正的完成通知由轮末汇总（notifyDone）统一发一条。 */
                 Utils.log("🔵",
-                    `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s）`, true);
+                    `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s）`);
             } else {
                 SEARCH_PACER.setPending(true);
                 API.recordSearchRound(attempts, credits, progress, max);
@@ -9041,9 +9107,10 @@ const __scBgKeepAlive = (function() {
             else if (remain > 0) GM_setValue("Config.dailySetDoneDate", 0);
 
             if (totalOk > 0 || totalFail > 0 || remain > 0) {
+                /* 每日活动做完 ≠ 今天全部做完：只写日志。
+                   以前这里是 `remaining === 0`，于是每轮跑完日常活动就推一条。 */
                 Utils.log(remain === 0 ? "🔵" : "🟡",
-                    `每日活动完成: ${totalOk}成功/${totalFail}失败${remain > 0 ? `，仍剩 ${remain} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`,
-                    remain === 0);
+                    `每日活动完成: ${totalOk}成功/${totalFail}失败${remain > 0 ? `，仍剩 ${remain} 张未完成` : ""}（服务端已确认）${outOfTime ? "；本轮到点，剩余卡片下一轮继续" : ""}`);
             } else if (remain === 0) {
                 Utils.log("✅", "每日活动已全部完成（服务端已确认）");
             }
@@ -9316,8 +9383,8 @@ const __scBgKeepAlive = (function() {
                 Utils.log("📊", `初始积分: ${startBalance}`);
                 let isTokenOK = await API.renewToken();
                 if (!isTokenOK) {
-                    /* Token 失效会每轮都命中，6 小时内只提醒一次 */
-                    Utils.logOnce("🟡", "Token失败，跳过签入/阅读", "tokenFail", 6 * 60 * 60 * 1000);
+                    /* Token 失效 = 需要人重新授权，属于异常：6 小时内只提醒一次 */
+                    Utils.notifyAnomaly("🟡", "Token失败，跳过签入/阅读", "tokenFail");
                 } else {
                     Utils.resetOnce("tokenFail");
                 }
@@ -9621,8 +9688,8 @@ const __scBgKeepAlive = (function() {
                     }
 
                     if (canNotify) {
-                        const dayKey = `roundDone:${today}`;
-                        Utils.logOnce("🎉", logMsg, dayKey, 20 * 60 * 60 * 1000, `${dayKey}:full`);
+                        /* 全天达标：一天只推一条，key 按日期固定 */
+                        Utils.notifyDone("🎉", logMsg, `roundDone:${today}`);
                     } else {
                         /* 没全做完：一律只写日志，不弹通知、不推 webhook */
                         Utils.log("📊", logMsg);
@@ -9633,11 +9700,12 @@ const __scBgKeepAlive = (function() {
                 if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
             } catch (e) {
                 if (e && e.regionBlocked) {
-                    Utils.log("🛑", `本轮已中止：${e.message}`);
+                    /* 出口被拦 = 需要人介入：推一条，但 6 小时内同类只推一次 */
+                    Utils.notifyAnomaly("🛑", `本轮已中止：${e.message}`, "regionBlocked");
                 } else if (this.aborted()) {
                     Utils.log("🛑", "本轮已超时收尾，剩余任务交给下一轮");
                 } else {
-                    Utils.log("🔴", `本轮任务异常终止: ${e.message}`);
+                    Utils.notifyAnomaly("🔴", `本轮任务异常终止: ${e.message}`, "roundCrash");
                 }
             } finally {
                 /* 被强制收尾后可能已经有新的一轮接上来了：
@@ -9736,7 +9804,7 @@ const __scBgKeepAlive = (function() {
         }
         text += "\n判定口径：余额上涨 > 待领池清空 > 待领金额下降；"
             + "页面/服务端任一侧表示「没有待领」即为成功；真拿不到证据才记「无法确认」。";
-        if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`, true);
+        if (pool.claimed > 0) Utils.log("🎁", `诊断中已自动领取 ${pool.claimed} 积分`);
         return text;
     };
 
@@ -9998,8 +10066,9 @@ const __scBgKeepAlive = (function() {
     });
 
     GM_registerMenuCommand("📢 测试通知", () => {
-        RewardsAuto.state.sendMSG = "🧪 这是一条测试消息\n如果你看到这条消息，说明通知接口配置成功！";
-        Utils.log("📢", "测试通知已发送", true);
+        /* 手动测试不看节流，直接走 deliver，确保能验证通道通不通 */
+        Utils.log("📢", "测试通知已发送");
+        Utils.deliver("🧪", "这是一条测试消息\n如果你收到这条消息，说明通知接口配置成功");
         Utils.uiAlert("测试消息已发送，请检查各通知渠道！");
     });
 
@@ -10026,6 +10095,11 @@ const __scBgKeepAlive = (function() {
         status += `飞书: ${feishu ? "✅ 已配置" : "❌ 未配置"}\n`;
         status += `PushMe: ${pushme ? "✅ 已配置" : "❌ 未配置"}\n`;
         status += `Bark: ${bark ? "✅ 已配置" : "❌ 未配置"}\n`;
+        status += "\n📌 推送策略（平时静默）：\n";
+        status += "· 完成：当天全部达标只推 1 条（20 小时内不重复）\n";
+        status += `· 异常：需人工介入才推，同类 ${NOTICE.ANOMALY_TTL / 3600000} 小时内只推 1 次\n`;
+        status += `· 限流：每小时最多 ${NOTICE.ANOMALY_PER_HOUR} 条异常推送，超出只写日志\n`;
+        status += "· 过程状态（进度/下一轮继续/接口 401 等）只写日志\n";
         Utils.uiAlert(status);
     });
 

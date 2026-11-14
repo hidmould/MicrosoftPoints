@@ -83,6 +83,16 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 
 ---
 
+## 四、常见问题
+
+1. 在一个浏览器内不要切换账号，cookie和缓存会串
+
+2. 搜索任务完不不成（解决：清除一下浏览器数据，重新登陆）
+
+&nbsp;
+
+---
+
 ## 说明
 - 代码主要改自微软积分（全能任务版），主要自己留存备份使用。
 - 感谢ScriptCat001 DuskLight 潘矩森 大大 ，以及其他更多的大大。
