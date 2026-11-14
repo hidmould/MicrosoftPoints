@@ -351,6 +351,8 @@ const __scBgKeepAlive = (function() {
             intlFound: 0,
             intlDone: 0,
             intlPending: 0,
+            /* 面板上有、但脚本处理不了的卡（缺 hash 等）。>0 时不能报「全部完成」 */
+            intlDropped: 0,
             /* 三个「为什么没有这一行」的标记，互斥：
                intlAbsent = 账号面板里确实没有这组卡（地区/账号不支持）
                intlCached = 今天已封盘，本轮没再拉面板（数值来自缓存）
@@ -6543,6 +6545,9 @@ const __scBgKeepAlive = (function() {
         pickCards(panel, { weekdays = null } = {}) {
             const want = Array.isArray(weekdays) && weekdays.length ? new Set(weekdays) : null;
             const seen = new Map();
+            /* 被过滤掉的卡（没 hash / 重复 / 按星期排除）：不能静默丢，
+               要能对外说清楚「面板上有这张卡，但脚本没处理」。 */
+            const dropped = [];
             for (const p of panel.promos) {
                 const name = String(p.name || p.offerId || "");
                 const matched = name.match(this.OFFER_RE);
@@ -6565,8 +6570,19 @@ const __scBgKeepAlive = (function() {
                    直接跳过会让它永远不完成，这才是之前「带锁卡不动」的原因。 */
                 const lock = CardLock.probe({ ...attr, name, State: p.State || attr.State });
                 const needApp = !!lock.appExclusive || lock.appOnly === true;
-                if (!p.hash) continue;              /* 没有 hash 就交不了卷，别占位 */
-                if (seen.has(offerId)) continue;
+                /* ⚠️ 这里**不能**静默丢弃：以前 `continue` 一走了之，
+                   既不算进 found、也不打日志，于是面板上明明还有卡，
+                   汇总却显示「4/4 全部完成」—— 用户看到的就是
+                   「前面的任务现在完不成了，还提示已完成」。
+                   现在把丢掉的卡记进 dropped，由调用方如实汇报。 */
+                if (!p.hash) {
+                    dropped.push({ offerId, title: attr.title || p.title || offerId, why: "面板未下发 hash（无法交卷）" });
+                    continue;
+                }
+                if (seen.has(offerId)) {
+                    dropped.push({ offerId, title: attr.title || p.title || offerId, why: "重复 offerId" });
+                    continue;
+                }
                 /* complete 的三种形态都要认，别只判断布尔 true：
                      · p.complete      —— 面板给的是布尔
                      · attr.complete   —— 面板给的是**字符串** "True"/"False"
@@ -6607,7 +6623,13 @@ const __scBgKeepAlive = (function() {
                     needApp
                 });
             }
-            return [...seen.values()];
+            const out = [...seen.values()];
+            /* 把被过滤掉的卡挂上去，让调用方能如实汇报「面板上还有几张没处理」。
+               用属性而不是改返回类型，避免动所有调用点。 */
+            Object.defineProperty(out, "dropped", {
+                value: dropped, enumerable: false, configurable: true, writable: true
+            });
+            return out;
         },
 
         /* ── 交互式 Quiz（「Do you know the answer?」）专用通道 ──────────────
@@ -7007,18 +7029,51 @@ const __scBgKeepAlive = (function() {
              ③ 页面代发通道：在 bing 页面上跑脚本时由页面同源 fetch 发出，
                 这是唯一能保证 Origin/Referer 与面板完全一致的通道。
            三通道都失败时由调用方用「面板回读」定胜负，不在这里硬判死。 */
-        /* 只走「面板 reportactivity」这一条路，不做 quiz 的特殊分流。
-           抽出来是为了让 quiz 卡能在「答题」之前先试一次面板交卷
-           （实测：答题卡用面板交卷就能拿满分，根本不必答题）。
-           实现要点：临时把 isQuiz 置 false，让 report() 跳过 quiz 分支直接走面板；
-           isPuzzle 保持不变 —— 面板失败后拼图卡仍能回退到 CDP 真拼。 */
-        async _reportViaPanel(panel, card) {
-            const savedQuiz = card.isQuiz;
-            card.isQuiz = false;
+        /* 单发一次面板交卷：只用「实测最可靠」的那一种形态
+           （text/plain + Origin，与面板自己的 XHR 一致），不穷举变体、不开 CDP。
+           给 quiz 卡做「先试一次」用 —— 穷举交给主通道，这里要的是快。 */
+        async _reportOnce(panel, card) {
+            const body = {
+                ActivityType: card.activityType,
+                ActivitySubType: "",
+                OfferId: card.offerId,
+                Channel: panel.identity.channel,
+                PartnerId: panel.identity.partnerId,
+                UserId: panel.identity.userId,
+                AuthKey: card.hash,
+                ActivityCount: 1
+            };
+            const url = `https://${panel.host}${this.REPORT_PATH}`;
             try {
-                return await this.report(panel, card);
-            } finally {
-                card.isQuiz = savedQuiz;
+                const res = await Utils.xhrFull({
+                    method: "POST",
+                    url,
+                    headers: {
+                        "accept": "application/json, text/plain, */*",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": `https://${panel.host}/`,
+                        "content-type": "text/plain;charset=UTF-8",
+                        "origin": `https://${panel.host}`
+                    },
+                    data: JSON.stringify(body),
+                    timeout: 15000,
+                    redirect: "manual"
+                });
+                const status = Number(res && res.status) || 0;
+                if (status < 200 || status >= 300) {
+                    return { ok: false, reason: `HTTP ${status}` };
+                }
+                const r = this._readReport(String((res && res.text) || ""));
+                if (!r.json) return { ok: false, reason: "响应不是 JSON" };
+                if (r.errorCode) return { ok: false, reason: `ErrorCode=${r.errorCode}` };
+                if (r.isRewardsUser === false) return { ok: false, reason: "未识别登录态" };
+                /* 判据与主通道一致：EarnedCredits / ActivityComplete 才算真加分 */
+                if (r.earned > 0 || r.activityComplete === true || r.offerComplete === true) {
+                    return { ok: true, points: r.earned, balance: r.balance };
+                }
+                return { ok: false, reason: "已受理但未新增记账" };
+            } catch (e) {
+                return { ok: false, reason: e.message };
             }
         },
 
@@ -7040,12 +7095,17 @@ const __scBgKeepAlive = (function() {
                reportActivity 对「交互式答题」无效这件事，指的是**只答题不交卷**，
                不是「交卷对答题卡无效」。 */
             if (card.isQuiz && card.destination) {
-                const viaPanel = await this._reportViaPanel(panel, card);
-                if (viaPanel && viaPanel.ok) {
-                    return Object.assign({}, viaPanel, { via: "quiz-panel" });
+                /* 只试「一发就成」的主通道，不做多通道穷举：
+                   以前这里调 _reportViaPanel，而它内部会把 5 种 content-type
+                   变体 + 页面代发 + 拼图 CDP 兜底全跑一遍，全失败才退回答题。
+                   结果单张答题卡要打十几条路径，一轮 4 张就吃掉十几分钟，
+                   后面的任务全被挤出时间窗（日志里用时 763 秒就是这么来的）。
+                   这里直接发一次标准请求：成功就走，失败立刻退回答题通道，
+                   两条路都是「一次定胜负」，不再层层穷举。 */
+                const quick = await this._reportOnce(panel, card);
+                if (quick && quick.ok) {
+                    return Object.assign({}, quick, { via: "quiz-panel" });
                 }
-                /* 面板通道没成再退回真答题（顺序修正后这里是兜底） */
-                Utils.log("  ", `国际版答题卡面板通道未成就（${(viaPanel && viaPanel.reason) || "未知"}），改用答题通道`);
                 const r = await this._solveQuiz(panel.host, card.destination);
                 if (r.ok) {
                     return { ok: true, via: "quiz", points: card.points, balance: 0, verified: false };
@@ -7240,9 +7300,18 @@ const __scBgKeepAlive = (function() {
             if (!panel) return null;
 
             const cards = this.pickCards(panel);
+            /* 被 pickCards 过滤掉的卡必须说出来：以前直接 `continue` 丢掉，
+               面板上还有卡、汇总却是「4/4 全部完成」，等于骗人。
+               这些卡不参与 pending 判定（缺 hash 确实交不了卷），
+               但要在日志里点名，让人知道「为什么显示全完成却还有卡亮着」。 */
+            const droppedCards = (cards && cards.dropped) || [];
+            if (droppedCards.length > 0) {
+                Utils.log("🟠", `国际版面板里有 ${droppedCards.length} 张卡无法处理：`
+                    + droppedCards.map(c => `${c.title}（${c.why}）`).join("、"));
+            }
             if (cards.length === 0) {
                 Utils.log("🟡", "国际版面板里没有找到每日活动卡片（该账号可能没有这组活动）");
-                return { found: 0, done: 0, pending: 0, points: 0 };
+                return { found: 0, done: 0, pending: 0, points: 0, dropped: droppedCards.length };
             }
 
             const doneIds = new Set(cards.filter(c => c.complete).map(c => c.offerId));
@@ -7440,26 +7509,40 @@ const __scBgKeepAlive = (function() {
                的那些「受理即完成」的项要剔除），拿不到就如实说「无法确认」。 */
             const pending = cards.filter(c => !confirmedIds.has(c.offerId)).length;
             const confirmedCount = cards.length - pending;
-            if (pending === 0) {
+            /* 被 pickCards 过滤掉的卡（没 hash 等）也算「没做完」：
+               它们交不了卷，但如果瞒着不报，用户就会看到「4/4 全部完成」
+               而面板上还亮着卡 —— 那正是这次被指出的「提示已完成却没完成」。 */
+            const droppedNote = droppedCards.length > 0
+                ? `；另有 ${droppedCards.length} 张无法处理（${droppedCards.map(c => c.title).join("、")}）`
+                : "";
+            if (pending === 0 && droppedCards.length === 0) {
                 Utils.log("✅", `国际版每日活动全部完成（${cards.length} 张）`
                     + (gained > 0 ? `（余额 +${gained}）` : "（服务端已确认）"));
+            } else if (pending === 0 && droppedCards.length > 0) {
+                /* 脚本能做的都做完了，但还有卡因「没 hash」做不了 —— 不能说全完成 */
+                Utils.log("🟡", `国际版每日活动：可处理的 ${cards.length} 张已全部确认到账`
+                    + `${droppedNote}（面板未下发 hash，脚本无法交卷）`);
             } else if (confirmedCount === 0) {
                 /* 一张都没确认：别说「还差几张」，要说清「一张都没到账」。
                    ⚠️ 这里**不推送**（第二个参数 false）：未完成只是过程状态，
                    通知只该在真的做完时出现，否则等于每轮都来骚扰一次。 */
                 Utils.log("🟠", `国际版每日活动：${cards.length} 张均未确认到账`
                     + `（交卷已发，但服务端回读仍是未完成；余额 +${gained}）`
-                    + `${lastReason ? `：${String(lastReason).split("；")[0]}` : ""}`);
+                    + `${lastReason ? `：${String(lastReason).split("；")[0]}` : ""}`
+                    + droppedNote);
             } else {
                 const names = cards.filter(c => !confirmedIds.has(c.offerId)).map(c => c.title || c.day).join("、");
                 Utils.log("🟡", `国际版每日活动：确认到账 ${confirmedCount}/${cards.length} 张`
                     + `（余额 +${gained}），还差 ${pending} 张：${names}`
-                    + `${lastReason ? `（${String(lastReason).split("；")[0]}）` : ""}，下一轮继续`);
+                    + `${lastReason ? `（${String(lastReason).split("；")[0]}）` : ""}，下一轮继续`
+                    + droppedNote);
             }
             return {
                 found: cards.length,
                 done: confirmedCount,
                 pending,
+                /* 把握不了（没 hash 等）的卡数，上层用它决定能否封盘 */
+                dropped: droppedCards.length,
                 /* 分数只报**实测余额增量**，不拿「名义分值 × 交卷次数」估算 ——
                    那正是以前虚报 +35 而实际只有 +20 的原因。 */
                 points: gained > 0 ? gained : 0,
@@ -9043,12 +9126,16 @@ const __scBgKeepAlive = (function() {
             }
             RewardsAuto.state.intlAbsent = false;
             RewardsAuto.state.intlCached = false;
-            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending });
+            /* 把 dropped 也存进去：只有「没有待办 + 没有把握不了的卡」才允许封盘。
+               否则那些没 hash 的卡会被永久跳过（封盘后当天不再重试）。 */
+            const droppedN = Number(res.dropped) || 0;
+            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending, dropped: droppedN });
             RewardsAuto.state.intlFound = res.found;
             RewardsAuto.state.intlDone = res.done;
             RewardsAuto.state.intlPending = res.pending;
+            RewardsAuto.state.intlDropped = droppedN;
             RewardsAuto.state.intlReason = res.reason || "";
-            return res.pending === 0;
+            return res.pending === 0 && droppedN === 0;
         },
 
         async doStreak() {
@@ -9459,16 +9546,22 @@ const __scBgKeepAlive = (function() {
                         + " · 总积分 " + totalPoints);
 
                     const intlShort = intlOn && intlFound > 0
-                        && (Number(RewardsAuto.state.intlDone) || 0) < intlFound;
+                        && ((Number(RewardsAuto.state.intlDone) || 0) < intlFound
+                            || (Number(RewardsAuto.state.intlDropped) || 0) > 0);
                     if (intlShort) {
                         const why = String(RewardsAuto.state.intlReason || "").trim();
+                        const droppedN = Number(RewardsAuto.state.intlDropped) || 0;
                         blocked.push(`🌍 国际版每日活动 ${Number(RewardsAuto.state.intlDone) || 0}/${intlFound} 张`
-                            + (why ? `（${why}）` : "（下一轮继续）"));
+                            + (droppedN > 0 ? `（另有 ${droppedN} 张面板未下发 hash，脚本无法交卷）` : "")
+                            + (!droppedN ? (why ? `（${why}）` : "（下一轮继续）") : ""));
                     }
 
 
+                    /* intlDropped > 0 = 面板上还有卡脚本处理不了（如没下发 hash）。
+                       这种不算「全部完成」，否则就是骗人：面板亮着卡、却说全完了。 */
+                    const intlDroppedN = Number(RewardsAuto.state.intlDropped) || 0;
                     const intlComplete = !intlOn || intlFound === 0
-                        || (Number(RewardsAuto.state.intlDone) || 0) >= intlFound;
+                        || ((Number(RewardsAuto.state.intlDone) || 0) >= intlFound && intlDroppedN === 0);
                     const canNotify = allDone && blocked.length === 0 && intlComplete;
                     const head = allDone
                         ? (canNotify ? "今日任务已全部完成！" : "今日主要任务已完成")
