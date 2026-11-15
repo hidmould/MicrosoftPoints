@@ -9315,7 +9315,8 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async runAll() {
+        async runAll(opts) {
+            const force = !!(opts && opts.force);
             this.lastRunStarted = false;
             if (this.running) {
                 /* 本上下文内存标记还立着：只有心跳/进展都停了才算残留。
@@ -9340,6 +9341,18 @@ const __scBgKeepAlive = (function() {
             }
             Utils.log("▶️", `本轮进入执行流程（${Utils.hasDOM() ? "页面" : "后台"}上下文）`);
             this.abortRound = false;
+            /* 运行时段是最后一道闸门，必须放在 runAll 里而不是只放在 init：
+               只要有一个调用方忘了先判窗口，任务就会在深夜照跑。
+               手动「🚀 立即运行」传 force=true 明确表示「我知道现在不在时段内，就要跑」。 */
+            if (!force && !Sched.inWindow(Date.now())) {
+                const wc = Sched.winCfg();
+                const span = wc.allDay ? "全天不限" : `${Sched.fmtHM(wc.startMin)}~${Sched.fmtHM(wc.endMin)}`;
+                Utils.log("🌙", `当前不在运行时段（${span}），本轮不发请求；要强行跑请用菜单「🚀 立即运行」`);
+                Sched.saveNext(Sched.alignToWindow(Date.now()));
+                Sched.clearClaim();
+                Sched.state("waiting", { runAt: Sched.alignToWindow(Date.now()), inWindow: false });
+                return;
+            }
             if (!Utils.acquireLock("Config.runLock", RUN_LOCK_TTL)) {
                 const hold = Utils.lockInfo("Config.runLock");
                 Utils.log("⏳", `另一个上下文正在运行任务（锁 ${hold ? Math.round((Date.now() - hold.ts) / 1000) + " 秒前更新" : "未知"}），本次跳过（避免并发重复上报）`);
@@ -9348,6 +9361,17 @@ const __scBgKeepAlive = (function() {
             this.running = true;
             this.runningSince = Date.now();
             this.lastRunStarted = true;
+            /* 每轮开跑时把「实际生效的运行时段」写进日志：
+               面板里填了什么、脚本真正解析成了什么、此刻在不在窗口内，一次看全。
+               以前时段相关的困扰（填了 10 点却像 9 点就跑）只能靠翻代码猜，
+               有了这一行就能直接判断是「没保存成功」「解析失败退回默认」
+               还是「根本没走调度、被手动触发绕过」。 */
+            try {
+                const wc = Sched.winCfg();
+                const rawWin = GM_getValue("Config.winTime", null);
+                const span = wc.allDay ? "全天不限" : `${Sched.fmtHM(wc.startMin)}~${Sched.fmtHM(wc.endMin)}`;
+                Utils.log("🕘", `本轮生效时段：${span}（配置值 ${rawWin == null ? "未设置" : JSON.stringify(rawWin)}，当前${Sched.inWindow(Date.now()) ? "在" : "不在"}时段内）`);
+            } catch (_) {}
             this.roundSeq++;
             this.roundId = this.roundSeq;
             const myRound = this.roundId;
@@ -9902,7 +9926,7 @@ const __scBgKeepAlive = (function() {
             return;
         }
         Promise.resolve()
-            .then(() => TaskManager.runAll())
+            .then(() => TaskManager.runAll({ force: true }))
             .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
             /* runAll 因为拿不到锁而直接返回时 lastRunStarted 仍是 false：
                用它区分「真的跑了一轮」和「没跑起来」，后者 2 分钟后就重试。 */
@@ -10205,6 +10229,9 @@ const __scBgKeepAlive = (function() {
                 const last = this.lastRun();
                 ts = last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
             }
+            /* 这里刻意不「修正过去时间」：plan() 每 20 秒被心跳调用一次，
+               必须在同一份配置下返回同一个值，否则窗口内该跑的一轮会被反复推走。
+               过期计划由 fire() 处理 —— 时段内就地开跑，时段外把计划推到窗口起点。 */
             /* 落在运行时段之外就顺延到下一个窗口起点：窗口外绝不开新的一轮。
                alignToWindow 只依赖日期和配置，同一天算出来的值恒定，所以
                每 20 秒调用一次也不会漂移。 */
@@ -10498,6 +10525,13 @@ const __scBgKeepAlive = (function() {
             if (!claim || !claim.at) return;
             if (this.isBusy(now)) return;
             if (now - claim.at <= CRON_STALL) return;
+            /* 时段外的认领不是「卡住」，只是本轮本来就不该跑：
+               直接放掉并排到窗口起点，不要在深夜反复补跑。 */
+            if (!this.inWindow(now)) {
+                this.clearClaim();
+                this.saveNext(this.alignToWindow(now));
+                return;
+            }
             Utils.log("♻️", `上次触发（${claim.ctx || "未知"}）${Math.round((now - claim.at) / 60000)} 分钟内没有真正开始执行，现在补跑`);
             this.clearClaim();
             this.fire(now);
@@ -10512,12 +10546,21 @@ const __scBgKeepAlive = (function() {
                 this.reapDeadRound(now);
                 /* 冷却一到点就先重置运行状态并立即恢复（详见 autoRecoverFromCooldown） */
                 this.autoRecoverFromCooldown(now);
+                /* 时段外先把过期计划归位：存下来的 cronNextRun 可能是昨天的时间
+                   （关了一夜浏览器再打开就会这样），此时日志里「已排到 X 开始」
+                   会显示成过去时刻，看起来像一直在排一个永远不会到的时间。
+                   归位到下一个窗口起点后，心跳与诊断面板显示的都是真实的下次开跑时间。 */
+                if (!this.inWindow(now) && this.plan(now) <= now) {
+                    this.saveNext(this.alignToWindow(now));
+                }
                 const next = this.plan(now);
                 this.watchdog(now);
                 EdgePacer.maybeReport().catch(() => {});
                 const stopped = !GM_getValue("Config.keep", true)
                     && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
-                if (!stopped && now >= next && !this.getClaim()) {
+                /* 加 inWindow 闸门：窗口外连认领都不要留，否则 watchdog 会把它
+                   当成「触发了没跑起来」反复补跑，正是整夜刷屏的来源。 */
+                if (!stopped && now >= next && !this.getClaim() && this.inWindow(now)) {
                     this.fire(now);
                 } else if (now - this.lastHbLog >= ((stopped || !this.inWindow(now)) ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
                     this.lastHbLog = now;
@@ -10600,6 +10643,18 @@ const __scBgKeepAlive = (function() {
                 const s = this.getState() || {};
                 this.saveNext(now + 2 * 60 * 1000);
                 Utils.log("🟡", `上一轮任务还在执行中（${s.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - (s.at || now)) / 60000))} 分钟前），本次触发跳过`);
+                return;
+            }
+            /* 时段外直接不开轮：以前这里照样认领，而任务入口 init() 发现时段外
+               只打个日志就 return，认领永远不清 —— watchdog 3 分钟后又判定
+               「没有真正开始执行」再补跑一次，于是整夜循环刷屏。
+               现在时段外只把计划推到窗口起点，连认领都不留。 */
+            if (!this.inWindow(now)) {
+                const next = this.alignToWindow(now);
+                this.saveNext(next);
+                const cfg = this.winCfg();
+                const span = cfg.allDay ? "全天不限" : `${this.fmtHM(cfg.startMin)}~${this.fmtHM(cfg.endMin)}`;
+                Utils.log("🌙", `当前不在运行时段（${span}），本轮跳过，已排到 ${this.fmt(next)} 开始`);
                 return;
             }
             this.claim();
@@ -10687,10 +10742,14 @@ const __scBgKeepAlive = (function() {
         }
 
         if (!Sched.inWindow(Date.now())) {
-            const next = Sched.plan(Date.now());
+            const next = Sched.alignToWindow(Date.now());
             const cfg = Sched.winCfg();
             const span = cfg.allDay ? "全天不限" : `${Sched.fmtHM(cfg.startMin)}~${Sched.fmtHM(cfg.endMin)}`;
             Utils.log("🌙", `当前不在运行时段（${span}），已排到 ${Sched.fmt(next)} 开始，窗口外不会跑任务`);
+            /* 走这个分支说明本轮什么也没做：计划排到窗口起点，并且把认领放掉，
+               否则 watchdog 会以为「触发了但没跑起来」，3 分钟后无限补跑。 */
+            Sched.saveNext(next);
+            Sched.clearClaim();
             Sched.state("waiting", { runAt: next, inWindow: false });
             return;
         }
