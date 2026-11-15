@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.4
+// @version      1.5.5
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -3326,12 +3326,23 @@ const __scBgKeepAlive = (function() {
                             return apiResult;
                         }
                     }
-                    let readProgress = RewardsAuto.state.readProgress ?? 0;
-                    let readMax = RewardsAuto.state.readMax ?? 30;
+                    let readProgress = Number(RewardsAuto.state.readProgress) || 0;
+                    let readMax = Number(RewardsAuto.state.readMax) || 30;
                     const readInfo = await this.getReadProgress();
                     if (readInfo) {
-                        readProgress = readInfo.progress;
-                        readMax = readInfo.max;
+                        const p = Number(readInfo.progress);
+                        const m = Number(readInfo.max) || 30;
+                        /* 服务端读到 0 未必是真的 0：活动卡片翻页、回读抖动、
+                           跨实例刚写完标记时都可能返回 0。若把 0 写回 state，
+                           之后任何一次查询失败都会让摘要退回「0/30」——
+                           正是「阅读明显做完了却显示 0/30」的成因。
+                           已确认完成的那天只升不降。
+                           TaskManager 在本文件里定义得更晚，用 typeof 兜底。 */
+                        const tm = (typeof TaskManager !== "undefined") ? TaskManager : null;
+                        const doneToday = !!tm && tm.readDate === RewardsAuto.state.dateNowNum;
+                        const cur = Number.isFinite(p) ? p : readProgress;
+                        readProgress = doneToday ? Math.max(cur, readProgress) : cur;
+                        readMax = m;
                         RewardsAuto.state.readProgress = readProgress;
                         RewardsAuto.state.readMax = readMax;
                     } else {
@@ -8495,6 +8506,12 @@ const __scBgKeepAlive = (function() {
             Utils.log("📖", `阅读进度: ${cur}/${max}`);
             if (cur >= max) {
                 this.readDate = RewardsAuto.state.dateNowNum;
+                /* 把服务端读到的进度写回 state：汇总里的「📋 阅读 x/y」读的是
+                   state.readProgress，早先这里只写了 readDate，于是出现
+                   「阅读已完成、也打了 30/30 的日志，但摘要显示 0/30」——
+                   汇总那次查询一旦失败/没覆盖到，就会退回 state 里那个 0。 */
+                RewardsAuto.state.readProgress = cur;
+                RewardsAuto.state.readMax = max;
                 this.save();
                 Utils.log("✅", "阅读任务已完成");
                 return;
@@ -8565,6 +8582,9 @@ const __scBgKeepAlive = (function() {
             const verify = await API.getReadProgress();
             if (verify && verify.progress >= verify.max) {
                 this.readDate = RewardsAuto.state.dateNowNum;
+                /* 同上：完成时把服务端进度落到 state，避免摘要退回旧的 0 */
+                RewardsAuto.state.readProgress = verify.progress;
+                RewardsAuto.state.readMax = verify.max;
                 this.save();
                 Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`);
             } else {
@@ -9547,11 +9567,25 @@ const __scBgKeepAlive = (function() {
                 const info = await API.getRewardsInfo();
                 if (info) {
                     const today = RewardsAuto.state.dateNowNum;
-                    const readProg = info.readProgress ?? RewardsAuto.state.readProgress ?? 0;
-                    const readMaxProg = info.readMax ?? RewardsAuto.state.readMax ?? 30;
+                    /* 阅读进度取值要小心 0：
+                       `info.readProgress ?? state.readProgress` 这种写法里，0 不是 nullish，
+                       所以服务端某次回读到 0（活动翻页/回读抖动/查询失败被当成 0）
+                       会直接盖掉本轮已经确认过的 30/30 —— 于是出现
+                       「日志明明写了阅读进度已满 30/30，摘要却显示 0/30」。
+                       凡是本轮已确认完成（readDate===today），显示就以满进度为准，
+                       因为那个标记只有在服务端回读 >= max 时才会写。 */
+                    const readDone = this.readDate === today;
+                    let readProg = Number(info.readProgress);
+                    if (!Number.isFinite(readProg)) readProg = Number(RewardsAuto.state.readProgress) || 0;
+                    let readMaxProg = Number(info.readMax) || Number(RewardsAuto.state.readMax) || 30;
+                    if (readMaxProg <= 0) readMaxProg = 30;
+                    if (readDone && readProg < readMaxProg) {
+                        const known = Number(RewardsAuto.state.readProgress) || 0;
+                        readProg = Math.max(readProg, known, readMaxProg);
+                    }
                     const signOk = this.signDate === today;
                     /* 进度已满也算达标：标记位可能因刷新/跨实例丢失，服务端进度才是事实 */
-                    const readOk = this.readDate === today || (readMaxProg > 0 && readProg >= readMaxProg);
+                    const readOk = readDone || (readMaxProg > 0 && readProg >= readMaxProg);
                     const searchOk = info.pc.progress >= info.pc.max;
                     const promosOk = this.promosDate === today;
                     const promosUnknown = !!RewardsAuto.state.promosUnknown && !promosOk;
