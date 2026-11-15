@@ -10168,6 +10168,10 @@ const __scBgKeepAlive = (function() {
     const CRON_HEARTBEAT_LOG = 10 * 60 * 1000;
     const CRON_HEARTBEAT_LOG_IDLE = 60 * 60 * 1000;
     const CRON_STALL = 3 * 60 * 1000;
+    /* 完全停止（关了持续检测 + 今天已完成）后的空闲心跳。
+       这个状态下不发任何请求、也不写任何日志，只是为了跨天时能自己恢复，
+       所以没必要保持 20 秒一跳。 */
+    const CRON_STOPPED_TICK = 10 * 60 * 1000;
     /* 「心跳」判据：真正在跑的上下文每 20 秒刷一次 aliveAt。
        超过 RUN_STALE 两个时间都没动，就判定它已经死了。
        以前只按「开始时间」算且窗口是 40 分钟，于是一轮卡住后
@@ -10513,6 +10517,16 @@ const __scBgKeepAlive = (function() {
             if (this.timer) clearTimeout(this.timer);
             const now = Date.now();
             const next = this.plan(now);
+            /* 关了持续检测且今天已完成 = 完全停止：不用再每 20 秒醒一次。
+               醒着也不做事（不发请求、不写日志），只会无谓占用后台定时器，
+               在 ScriptCat 的 service worker 里还会让实例一直被唤醒。
+               改成 10 分钟一跳，只为跨天时把「明天自动恢复」接上。 */
+            const stopped = !GM_getValue("Config.keep", true)
+                && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
+            if (stopped && !immediate) {
+                this.timer = setTimeout(() => this.tick(), CRON_STOPPED_TICK);
+                return;
+            }
             let wait;
             if (next > now) wait = Math.min(next - now, CRON_HEARTBEAT);
             else if (immediate) wait = 0;
@@ -10555,26 +10569,33 @@ const __scBgKeepAlive = (function() {
                 }
                 const next = this.plan(now);
                 this.watchdog(now);
-                EdgePacer.maybeReport().catch(() => {});
                 const stopped = !GM_getValue("Config.keep", true)
                     && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
+                /* 关掉「持续检测」且今天已经全部完成后，连 Edge 连签心跳都不该再发请求：
+                   以前这里无条件调 maybeReport()，于是即便「检测已停止」，
+                   每 30 分钟仍会打一次网络请求和相关日志，看起来像脚本没停。 */
+                if (!stopped) {
+                    EdgePacer.maybeReport().catch(() => {});
+                }
                 /* 加 inWindow 闸门：窗口外连认领都不要留，否则 watchdog 会把它
                    当成「触发了没跑起来」反复补跑，正是整夜刷屏的来源。 */
                 if (!stopped && now >= next && !this.getClaim() && this.inWindow(now)) {
                     this.fire(now);
-                } else if (now - this.lastHbLog >= ((stopped || !this.inWindow(now)) ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
+                } else if (!stopped && now - this.lastHbLog >= ((!this.inWindow(now)) ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
+                    /* stopped（关了持续检测且今天已完成）时整条心跳都不打：
+                       这条日志除了刷屏没有任何作用 —— 用户已经明确表示不想再检测，
+                       而且该状态下 tick 不再发请求，也就没有「状态」需要汇报。
+                       之前它每小时还是写一条，日志看起来就像脚本没停过。 */
                     this.lastHbLog = now;
                     GM_setValue("Config.heartbeatAt", now);
                     const st = this.getState() || {};
                     const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0);
-                    const tip = stopped
-                        ? "，今日任务已全部完成、检测已停止，明天自动恢复"
-                        : this.isBusy(now)
-                            ? `，本轮正在执行中（最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前）`
-                            : this.getClaim() ? "，本轮已触发，正在等它跑起来"
-                            : (!this.inWindow(now)
-                                ? `，当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），${this.fmt(next)} 开始`
-                                : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`);
+                    const tip = this.isBusy(now)
+                        ? `，本轮正在执行中（最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前）`
+                        : this.getClaim() ? "，本轮已触发，正在等它跑起来"
+                        : (!this.inWindow(now)
+                            ? `，当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），${this.fmt(next)} 开始`
+                            : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`);
                     Utils.log("💓", `常驻调度心跳：后台实例已存活 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
                 }
             } catch (e) {
