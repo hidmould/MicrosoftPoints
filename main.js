@@ -111,6 +111,16 @@ Tasks:
         title: 桌面应用每周专属任务
         type: checkbox
         default: true
+    desktopWeeklyCatchUp:
+        title: 桌面周任务补做
+        type: checkbox
+        default: true
+        description: 之前没开机漏掉的周几，在之后的运行中自动补做（不动未来的卡）
+    desktopWeeklyForceUnlock:
+        title: 桌面周任务强制解锁（慎用）
+        type: checkbox
+        default: false
+        description: 开启后不认服务端解锁态，会把整周卡片一次性做完
     monthly:
         title: 月度计划
         type: checkbox
@@ -4977,15 +4987,16 @@ const __scBgKeepAlive = (function() {
             /* 桌面周任务子项的 offerId 里直接带星期：
                  WW_pcchild2_urlreward_Sunday_...weekly_Exclusive_Novw2_2026_punchcard
                  WW_pcchild3_urlreward_Monday_ ...
-               服务端按「周一算一周开始」逐日解锁：周日是第 7 天（索引 6），周一回到索引 0。
+               服务端的新一周从周日下午开始（太平洋时间 0 点 ≈ 北京周日 16:00），
+               当天只解锁第 0 张，即 offerId 里的 Sunday；之后每天放一张。
                这是不依赖 UA 渲染的强信号 —— 网页端对非应用 UA 会把所有子项都渲染成
                isLocked=true（实测 7/7 全锁），只靠 isLocked 数会把「今天该做的那一张」
                也算进未解锁里，于是出现「网站说 6 张未解锁、脚本报 7 张」。 */
             weekdayTokens: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
 
-            /* 从 offerId 里取「周内第几天」（周一=0 … 周日=6）；取不到返回 -1。
-               注意 weekdayTokens 是 Date 的周日优先顺序，这里统一换算成周一优先，
-               否则周日会被当成第 0 天，和周任务实际顺序正好错开一天。 */
+            /* 从 offerId 里取「本周第几天」（周日=0 … 周六=6）；取不到返回 -1。
+               weekdayTokens 顺序与服务端一致：周日是第 0 张。
+               （旧版换算成「周一优先」，周日算出索引 6，才引出下面的全解锁事故） */
             weekdayIndex(offerId) {
                 const m = String(offerId || "").match(/_pcchild\d+_[A-Za-z0-9]*?_(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)_/i);
                 const name = m ? m[1] : String(offerId || "").match(/(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)/i)?.[1];
@@ -4993,12 +5004,12 @@ const __scBgKeepAlive = (function() {
                 const lower = name.toLowerCase();
                 const sundayBased = this.weekdayTokens.findIndex(w => w.toLowerCase() === lower);
                 if (sundayBased < 0) return -1;
-                return (sundayBased + 6) % 7;
+                return sundayBased;
             },
 
-            /* 今天在周内的位置（周一=0 … 周日=6），与 weekdayIndex 同一套口径。 */
+            /* 今天在本周的位置（周日=0 … 周六=6），与 weekdayIndex 同一套口径。 */
             todayIndex(now = new Date()) {
-                return (now.getDay() + 6) % 7;
+                return now.getDay();
             }
         },
 
@@ -5060,23 +5071,44 @@ const __scBgKeepAlive = (function() {
             return { parentId, url, html, text, progress, cards: this._reconcileWeeklyLocks(cards) };
         },
 
+        /* 桌面周任务的解锁态对账。
+           ⚠ 原则：isLocked 以服务端为准，这里绝不改写它。
+           2026-11-15 事故：旧版用 idx <= today 去「校正」解锁态，而周日的 today 是 6，
+           恒真 —— 服务端只解锁了第 0 张，脚本却把剩下 6 张全标成已解锁，
+           22:58 一轮把整周 70 分全部交卷，卡片当天就 8/8 了。
+           服务端没解锁的卡，脚本没有资格替它解锁；这里只记录偏差方便排查。 */
         _reconcileWeeklyLocks(cards) {
-            const today = this.QUESTS.todayIndex();
-            let changed = 0;
-            const out = (cards || []).map(c => {
-                if (c.isCompleted) return c;
-                const idx = this.QUESTS.weekdayIndex(c.offerId);
-                if (idx < 0) return c;
-                const shouldUnlock = idx <= today;
-                if (shouldUnlock === !c.isLocked) return c;
-                changed++;
-                return { ...c, isLocked: !shouldUnlock, lockByWeekday: true };
-            });
-            if (changed > 0) {
-                Utils.log("🖥️", `桌面周任务：按星期校正了 ${changed} 张卡的解锁态`
-                    + `（网页渲染不可信，今天是周${"一二三四五六日".charAt(Math.min(6, Math.max(0, today)))}）`);
+            const list = (cards || []).slice();
+            if (GM_getValue("Tasks.desktopWeeklyForceUnlock", false)) {
+                /* 显式开启才保留旧行为：无视服务端锁，把「按星期本该解锁」的全部做完 */
+                const today = this.QUESTS.todayIndex();
+                let changed = 0;
+                const forced = list.map(c => {
+                    if (c.isCompleted) return c;
+                    const idx = this.QUESTS.weekdayIndex(c.offerId);
+                    if (idx < 0) return c;
+                    const shouldUnlock = idx <= today;
+                    if (shouldUnlock === !c.isLocked) return c;
+                    changed++;
+                    return { ...c, isLocked: !shouldUnlock, lockByWeekday: true };
+                });
+                if (changed > 0) {
+                    Utils.log("🟠", `桌面周任务：强制解锁已开启，改写了 ${changed} 张卡的解锁态（无视服务端锁，慎用）`);
+                }
+                return forced;
             }
-            return out;
+
+            const today = this.QUESTS.todayIndex();
+            const lockedOpen = list.filter(c => !c.isCompleted && c.isLocked);
+            const expected = lockedOpen.filter(c => {
+                const idx = this.QUESTS.weekdayIndex(c.offerId);
+                return idx >= 0 && idx <= today;
+            });
+            if (expected.length > 0) {
+                Utils.log("🖥️", `桌面周任务：服务端仍有 ${lockedOpen.length} 张锁定`
+                    + `（按星期推算其中 ${expected.length} 张本该已解锁，以服务端为准，不解锁）`);
+            }
+            return list;
         },
 
         /* ===== 月度计划（月度 punchcard）=====
@@ -5787,21 +5819,64 @@ const __scBgKeepAlive = (function() {
                     continue;
                 }
 
-                const unlocked = open.filter(c => !c.isLocked);
-                const lockedNow = open.length - unlocked.length;
+                /* 一天一张，未到日子绝不碰；但是「已经过去、当时没开机没做成」的那几张要补做。
+                   判定只用 offerId 里的星期，不看服务端的 isLocked —— 因为服务端对补做卡
+                   可能就是保持锁定态，靠它判断会把补做机会全部漏掉（2026-11-15 实测：
+                   服务端受理并记账了这批「过期但未解锁」的交卷）。
+                   规则：idx < todayIdx = 已经过去的日子 → 补做；idx >= todayIdx → 等它到点。
+                   周日本身是本周第 0 天，因此周日永远不会触发补做，一周仍从一张开始。 */
+                const todayIdx = this.QUESTS.todayIndex();
+                const catchUpOn = GM_getValue("Tasks.desktopWeeklyCatchUp", true);
+                const dayOf = (c) => {
+                    const i = this.QUESTS.weekdayIndex(c.offerId);
+                    return i >= 0 ? "周" + "日一二三四五六".charAt(i) : "";
+                };
+                const isOverdue = (c) => {
+                    if (!catchUpOn) return false;
+                    const i = this.QUESTS.weekdayIndex(c.offerId);
+                    return i >= 0 && i < todayIdx;
+                };
+                /* 补做记账：同一天、同一张卡只试一次。
+                   服务端对「过期但未解锁」的卡有时不再受理，没有这层记账会每轮重试、
+                   日志刷屏还白白触发风控。记账只保留当天，跨天自动清零。 */
+                const dayStamp = Utils.getTodayStr();
+                let attempted = GM_getValue("State.desktopWeekAttempted", null);
+                if (!attempted || typeof attempted !== "object" || String(attempted.date || "") !== dayStamp) {
+                    attempted = { date: dayStamp, ids: [] };
+                }
+                if (!Array.isArray(attempted.ids)) attempted.ids = [];
+                const triedToday = new Set(attempted.ids);
+
+                const openUnlocked = open.filter(c => !c.isLocked);
+                const unlockedIds = new Set(openUnlocked.map(c => c.offerId));
+                const catchUpCards = open.filter(c => !unlockedIds.has(c.offerId) && isOverdue(c));
+                const catchUpRun = catchUpCards.filter(c => !triedToday.has(c.offerId));
+                const futureLocked = open.filter(c => c.isLocked && !isOverdue(c));
+                const unlocked = openUnlocked.concat(catchUpRun);
                 if (unlocked.length === 0) {
                     Utils.log("🖥️", `桌面专属任务：${open.length} 张待办全部未解锁（未到对应星期），本轮不处理`);
                 } else {
-                    Utils.log("🖥️", `桌面奖励应用专属任务：${unlocked.length} 张已解锁待办`
-                        + `（另有 ${lockedNow} 张未解锁，不处理）（${parentId}）`);
-                    for (const c of unlocked) Utils.log("🖥️", `  · [已解锁] ${c.title}`);
+                    Utils.log("🖥️", `桌面奖励应用专属任务：${unlocked.length} 张待办`
+                        + `（服务端已解锁 ${openUnlocked.length} 张`
+                        + (catchUpCards.length ? `，补做错过的 ${catchUpCards.length} 张` : "")
+                        + `；另有 ${futureLocked.length} 张未到日期，不处理）（${parentId}）`);
+                    if (catchUpCards.length) {
+                        Utils.log("🖥️", `  补做：${catchUpCards.map(c => `${dayOf(c)}「${c.title}」`).join("、")}`);
+                    }
+                    if (catchUpCards.length > catchUpRun.length) {
+                        Utils.log("🖥️", `  其中 ${catchUpCards.length - catchUpRun.length} 张今天已经试过，不再重复交卷`);
+                    }
+                    for (const c of unlocked) {
+                        const d = dayOf(c);
+                        const tag = c.isLocked ? "补做" : "已解锁";
+                        Utils.log("🖥️", `  · [${tag}${d ? " " + d : ""}] ${c.title}`);
+                    }
                     /* 未解锁的也列出来并带上星期，方便对照「网站说 6 张、脚本说 7 张」这类偏差 */
-                    const pendingDays = open
-                        .filter(c => c.isLocked)
+                    const pendingDays = futureLocked
                         .map(c => this.QUESTS.weekdayIndex(c.offerId))
                         .filter(i => i >= 0)
                         .sort((a, b) => a - b)
-                        .map(i => "周" + "一二三四五六日".charAt(i));
+                        .map(i => "周" + "日一二三四五六".charAt(i));
                     if (pendingDays.length) {
                         Utils.log("🖥️", `  未解锁的：${pendingDays.join("、")}（到对应那天自动处理）`);
                     }
@@ -5809,6 +5884,11 @@ const __scBgKeepAlive = (function() {
 
                 let doneHere = 0, failedHere = 0;
                 for (const card of unlocked) {
+                    /* 补做卡先记账再交卷：不管受理与否，今天都不再重试这张 */
+                    if (isOverdue(card)) {
+                        attempted.ids.push(card.offerId);
+                        GM_setValue("State.desktopWeekAttempted", attempted);
+                    }
 
                     if (card.href && /^https?:/i.test(card.href)) {
                         try {
@@ -5879,7 +5959,14 @@ const __scBgKeepAlive = (function() {
                 } else {
 
                     const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !c.isLocked) : [];
-                    const leftLockedCards = verify ? verify.cards.filter(c => !c.isCompleted && c.isLocked) : [];
+                    /* 已过期但仍锁定的，是今天试过补做、服务端没受理的那几张；
+                       它们不算「还要等哪一天」，单独归到补做失败里 */
+                    const leftLockedCards = verify
+                        ? verify.cards.filter(c => !c.isCompleted && c.isLocked && !isOverdue(c))
+                        : [];
+                    const leftOverdue = verify
+                        ? verify.cards.filter(c => !c.isCompleted && c.isLocked && isOverdue(c)).length
+                        : 0;
                     const leftLocked = leftLockedCards.length;
                     if (leftUnlocked.length > 0) {
                         /* 记下待记账的标题，供收尾通知点名 */
@@ -5896,13 +5983,16 @@ const __scBgKeepAlive = (function() {
                         .map(c => this.QUESTS.weekdayIndex(c.offerId))
                         .filter(i => i >= 0)
                         .sort((a, b) => a - b)
-                        .map(i => "周" + "一二三四五六日".charAt(i));
+                        .map(i => "周" + "日一二三四五六".charAt(i));
                     Utils.log("🟡", `桌面应用每周专属任务：本次完成 ${doneHere} 张、失败 ${failedHere} 张`
                         + (leftUnlocked.length > 0
                             ? `，仍剩 ${leftUnlocked.length} 张已解锁未完成（${leftUnlocked.map(c => c.title).join("、")}）`
                             : (leftLocked > 0 ? "，今日已解锁的都处理完了" : ""))
                         + (leftLocked > 0
                             ? `（另有 ${leftLocked} 张未解锁${lockedDays.length ? "：" + lockedDays.join("、") : ""}，到对应那天自动处理）`
+                            : "")
+                        + (leftOverdue > 0
+                            ? `（还有 ${leftOverdue} 张补做未成功，服务端没受理，今天不再重试）`
                             : ""));
                 }
             }
