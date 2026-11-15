@@ -40,12 +40,12 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 [点击了解什么是CDP](https://blog.csdn.net/weixin_29008055/article/details/165897493)(网上关于CDP相关的文章较少，可以询问AI)
 
 
-| 任务 |  Chrome |  Edge |
-| --- | --- | --- |
-| 带锁 🔒 卡片(已解锁) | ✅  | ✅ 需先配好 CDP（见第三节） |
-| 桌面端任务 | ✅ | ✅ 需先配好 CDP（见第三节） |
-| 首页待领取 | ✅ | ✅ 需先配好 CDP（见第三节） |
-| 月度计划 | ✅ | ✅ 需先配好 CDP（见第三节） |
+| 任务                 | Chrome | Edge                        |
+|----------------------|--------|-----------------------------|
+| 带锁 🔒 卡片(已解锁) | ✅     | ✅ 需先配好 CDP（见第三节） |
+| 桌面端任务           | ✅     | ✅ 需先配好 CDP（见第三节） |
+| 首页待领取           | ✅     | ✅ 需先配好 CDP（见第三节） |
+| 月度计划             | ✅     | ✅ 需先配好 CDP（见第三节） |
 
 (使用CDP会打开新标签页，完成任务后会自动关闭)
 
@@ -85,7 +85,7 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 
 ## 四、常见问题
 
-1. 在一个浏览器内不要切换账号，cookie和缓存会串
+1. 在同一个浏览器内不要切换账号
 
 2. 搜索任务完不不成（解决：清除一下浏览器数据，重新登陆）
 
@@ -93,8 +93,8 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 
 ---
 
-## 说明
+## 声明
 - 代码主要改自微软积分（全能任务版），主要自己留存备份使用。
-- 感谢ScriptCat001 DuskLight 潘矩森 大大 ，以及其他更多的大大。
+- 感谢ScriptCat001 whq530 潘矩森 大大 ，以及其他更多的大大。
 - 仅供学习交流，账号风险自负，请遵守 Microsoft Rewards 服务条款。
 - MIT License。

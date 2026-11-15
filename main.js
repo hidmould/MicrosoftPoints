@@ -7489,14 +7489,33 @@ const __scBgKeepAlive = (function() {
             /* 这里不校验 Token：面板走的是 bing.com 的登录 Cookie，
                而不是 prod.rewardsplatform 的 OAuth Token，没有 Token 也能做。 */
 
+            /* 逐个主机试，直到「面板可用 **且** 里面有这组卡」为止。
+               以前是「第一个能返回 JSON 的主机就停」：cn.bing.com 的面板可能只回
+               一小组常用推广位，ENstar_ 那几张国际版活动根本不在里面，
+               于是脚本认定「此账号没有这组活动」并封盘——
+               而 www.bing.com 的面板里其实是有卡的。这就是「有时能检测到、有时说没有」
+               在主机维度上的第二个来源。 */
             let panel = null;
+            let lastPanel = null;
+            let cards = [];
             for (const host of this.hosts()) {
-                panel = await this.fetchPanel(host);
-                if (panel) break;
+                const p = await this.fetchPanel(host);
+                if (!p) continue;
+                if (!lastPanel) lastPanel = p;
+                const picked = this.pickCards(p);
+                if (picked.length > 0) {
+                    panel = p;
+                    cards = picked;
+                    break;
+                }
             }
-            if (!panel) return null;
-
-            const cards = this.pickCards(panel);
+            if (!panel) {
+                /* 所有主机都没卡：面板本身可用就按「这个账号没有这组活动」返回，
+                   面板全都不可用才返回 null（区分「没有活动」和「读不到」）。 */
+                if (!lastPanel) return null;
+                panel = lastPanel;
+                cards = this.pickCards(panel);
+            }
             /* 被 pickCards 过滤掉的卡必须说出来：以前直接 `continue` 丢掉，
                面板上还有卡、汇总却是「4/4 全部完成」，等于骗人。
                这些卡不参与 pending 判定（缺 hash 确实交不了卷），
@@ -9312,7 +9331,9 @@ const __scBgKeepAlive = (function() {
             const key = "Config.intlDailyDate";
             const st = GM_getValue(key, null);
 
-            if (st && Number(st.date) === today && Number(st.pending) === 0) {
+            /* found=0 的记录不能走这里：那只是「这一轮面板没卡」，不是「今天做完了」，
+               交给下面的重新检查分支处理 */
+            if (st && Number(st.date) === today && Number(st.pending) === 0 && Number(st.found) > 0) {
                 RewardsAuto.state.intlFound = Number(st.found) || 0;
                 RewardsAuto.state.intlDone = Number(st.done) || 0;
                 RewardsAuto.state.intlPending = 0;
@@ -9320,6 +9341,28 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.intlCached = true;
                 Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
                 return true;
+            }
+            /* 上一轮「面板里还没有卡」不代表今天就没有了：这组活动是必应面板
+               边栏里的推广位，服务端按账号/时段陆续下发，早上面板空、下午才出现
+               是常态。以前这里把「本轮 found=0」当成「今天没有这组活动」直接封盘，
+               于是日志显示「此账号由于地区/账号不支持，跳过」，当天再也不看——
+               现象就是「有时候能检测到、有时候又说没有」。
+               现在 found=0 的记录只在当天有效很短时间：下次跑还会重新拉面板。 */
+            if (st && Number(st.date) === today && Number(st.found) === 0) {
+                const stamped = Number(st.at) || 0;
+                const waited = Date.now() - stamped;
+                const RELOOK = 30 * 60 * 1000;
+                if (stamped > 0 && waited < RELOOK) {
+                    RewardsAuto.state.intlFound = 0;
+                    RewardsAuto.state.intlDone = 0;
+                    RewardsAuto.state.intlPending = 0;
+                    RewardsAuto.state.intlAbsent = true;
+                    RewardsAuto.state.intlCached = true;
+                    Utils.log("  ", `国际版每日活动：本轮面板里没有这组卡片`
+                        + `（${Math.max(1, Math.round((RELOOK - waited) / 60000))} 分钟后重新检查）`);
+                    return true;
+                }
+                Utils.log("  ", "国际版每日活动：上次没看到卡片，这次重新拉一次面板");
             }
             let res = null;
             try {
@@ -9332,7 +9375,7 @@ const __scBgKeepAlive = (function() {
             if (res.found === 0) {
                 /* 面板里一张都没有：这账号本来就没有这组活动（地区/账号不支持）。
                    和「代码没跑到」是两回事，日志里要能一眼区分，否则下次又得回来查。 */
-                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0 });
+                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0, at: Date.now() });
                 RewardsAuto.state.intlFound = 0;
                 RewardsAuto.state.intlDone = 0;
                 RewardsAuto.state.intlPending = 0;
@@ -9345,7 +9388,7 @@ const __scBgKeepAlive = (function() {
             /* 把 dropped 也存进去：只有「没有待办 + 没有把握不了的卡」才允许封盘。
                否则那些没 hash 的卡会被永久跳过（封盘后当天不再重试）。 */
             const droppedN = Number(res.dropped) || 0;
-            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending, dropped: droppedN });
+            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending, dropped: droppedN, at: Date.now() });
             RewardsAuto.state.intlFound = res.found;
             RewardsAuto.state.intlDone = res.done;
             RewardsAuto.state.intlPending = res.pending;
@@ -9765,7 +9808,11 @@ const __scBgKeepAlive = (function() {
                                 + (RewardsAuto.state.intlCached ? "（今日已封盘）" : ""));
                         }
                     } else if (RewardsAuto.state.intlAbsent) {
-                        rows.push("🌍 国际版每日活动 · ⏭️ 此账号无这项活动");
+                        /* 面板没有这组卡不再是「今天彻底没有」：可能是服务端还没下发，
+                           也可能只是这台主机这次没给，稍后会自动重查 */
+                        rows.push(RewardsAuto.state.intlCached
+                            ? "🌍 国际版每日活动 · ⏳ 面板暂未下发这组卡（稍后自动重查）"
+                            : "🌍 国际版每日活动 · ⏭️ 本次面板里没有这组卡（稍后自动重查）");
                     } else {
                         rows.push("🌍 国际版每日活动 · ⏳ 本轮未检查（下一轮再试）");
                     }
