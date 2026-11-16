@@ -5,7 +5,7 @@
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
-// @background
+// @crontab      */20 * * * *
 // @connect      bing.com
 // @connect      login.live.com
 // @connect      rewards.bing.com
@@ -8356,6 +8356,13 @@ const __scBgKeepAlive = (function() {
             this.heartbeat();
             this.hbTimer = setInterval(() => {
                 try { this.heartbeat(); } catch (_) {}
+                /* Edge 连签也挂在这个心跳上：原本是常驻上下文每 20 秒带一次，
+                   现在只有「本轮在执行」期间才有心跳，正好只在运行时上报。
+                   EdgePacer 自己按服务端给的 intervalMin 节流（通常 5 分钟），
+                   所以一轮 20 分钟里会推进 3~4 次，而不是每轮一次。
+                   单个上下文内 EdgePacer.nextAt 是内存态，跨轮不共享，
+                   所以每轮醒来都会先尝试一次。 */
+                try { EdgePacer.maybeReport().catch(() => {}); } catch (_) {}
             }, RUN_HEARTBEAT_GAP);
         },
 
@@ -10197,10 +10204,11 @@ const __scBgKeepAlive = (function() {
             Utils.log("🔴", "重置后发现授权状态有变化，请用「📊 Token状态」确认；如已失效请重新「🔑 手动授权」");
         }
 
-        /* 重置后立刻重新排一轮（带随机延长），不必等旧计划（旧计划已被清掉） */
+        /* 定时模式：重置后把「下一轮时间」直接置为现在，下一次定时唤醒就会开跑。
+           这里不再起任何计时器（没有常驻上下文可醒）。 */
         if (opts.rearm !== false) {
             try {
-                if (typeof Sched !== "undefined" && Sched.started) Sched.arm(true);
+                if (typeof Sched !== "undefined") Sched.rearmNow(0);
             } catch (_) {}
         }
         return { cleared, authIntact, before, after };
@@ -10327,22 +10335,24 @@ const __scBgKeepAlive = (function() {
         return text;
     };
 
+    /* ══ 定时（cron）模式 ══════════════════════════════════════════
+       @crontab 写在脚本头：每 20 分钟唤醒一次，全天 0-23 点。
+         · 一次唤醒 = 一轮，没有「叫醒了再判断到没到点」的第二层判断；
+         · 每轮开跑前随机等 0~5 分钟，起跑时刻自然错开，不落在整点；
+         · cron 里不能写 9-23 时段 —— 那是写死在元数据里的，
+           面板改运行时段后对不上。所以 cron 全天唤醒，由脚本按
+           Config.winTime 判断「现在是不是允许跑」，时段外立刻退出。
+       浏览器关掉时 cron 不会触发，这是浏览器的限制，不是脚本能改的。 */
+    const CRON_WAKE_MS = 20 * 60 * 1000;
     const CRON_PERIOD = 20 * 60 * 1000;
-    /* 调度随机延长：固定每 20 分钟整点起跑太像程序，长期看也容易被风控盯上。
-       现在每轮在基准之上再随机加 [0, CRON_JITTER) 分钟（脚本内部固定 10 分钟），
-       关键：随机值必须在「排下一轮」时摇一次并写进 Config.cronNextRun，
-       不能放在 plan() 里现算 —— plan() 每 20 秒被心跳调用一次，
-       现算的话下次触发时间会一直抖动，永远到不了。 */
-    const CRON_JITTER = 10 * 60 * 1000;
-    const CRON_HEARTBEAT = 20 * 1000;
+    /* 开跑前的随机等待上限：0~5 分钟。
+       ⚠ 注意它的作用：只是把「起跑时刻」在 20 分钟这个槽里往后挪，
+       两次开跑的间隔仍然是 20 分钟（cron 每 20 分钟叫醒一次）。
+       想要「20、22、24 分钟」这种间隔差，cron 必须比 20 分钟更密
+       （例如每 5 分钟一次），再用 Config.cronNextRun 做二次判断 —— 代价是空唤醒。 */
+    const CRON_JITTER = 5 * 60 * 1000;
     const CRON_FIRST_DELAY = 5 * 1000;
-    const CRON_HEARTBEAT_LOG = 10 * 60 * 1000;
-    const CRON_HEARTBEAT_LOG_IDLE = 60 * 60 * 1000;
     const CRON_STALL = 3 * 60 * 1000;
-    /* 完全停止（关了持续检测 + 今天已完成）后的空闲心跳。
-       这个状态下不发任何请求、也不写任何日志，只是为了跨天时能自己恢复，
-       所以没必要保持 20 秒一跳。 */
-    const CRON_STOPPED_TICK = 10 * 60 * 1000;
     /* 「心跳」判据：真正在跑的上下文每 20 秒刷一次 aliveAt。
        超过 RUN_STALE 两个时间都没动，就判定它已经死了。
        以前只按「开始时间」算且窗口是 40 分钟，于是一轮卡住后
@@ -10384,6 +10394,7 @@ const __scBgKeepAlive = (function() {
         timer: null,
         started: false,
         startedAt: 0,
+        /* 定时模式没有心跳日志节流了，字段保留以兼容旧诊断代码 */
         lastHbLog: 0,
         task: null,
 
@@ -10404,12 +10415,11 @@ const __scBgKeepAlive = (function() {
                 const last = this.lastRun();
                 ts = last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
             }
-            /* 这里刻意不「修正过去时间」：plan() 每 20 秒被心跳调用一次，
-               必须在同一份配置下返回同一个值，否则窗口内该跑的一轮会被反复推走。
-               过期计划由 fire() 处理 —— 时段内就地开跑，时段外把计划推到窗口起点。 */
+            /* plan() 只读不写，同一份配置下返回值恒定 —— 定时模式下每次唤醒都会读它，
+               一旦这里写入任何东西，「还没到点」的判断就会被自己改掉。
+               下次时间由 finish()（一轮跑完之后）或 rearmNow()（重置/手动）负责写。 */
             /* 落在运行时段之外就顺延到下一个窗口起点：窗口外绝不开新的一轮。
-               alignToWindow 只依赖日期和配置，同一天算出来的值恒定，所以
-               每 20 秒调用一次也不会漂移。 */
+               alignToWindow 只依赖日期和配置，同一天算出来的值恒定，多次调用不漂移。 */
             return this.alignToWindow(ts);
         },
 
@@ -10538,6 +10548,7 @@ const __scBgKeepAlive = (function() {
 
         saveNext(ts) { GM_setValue("Config.cronNextRun", ts); },
 
+
         ctxName() { return Utils.hasDOM() ? "页面" : "后台"; },
 
         getClaim() {
@@ -10593,188 +10604,143 @@ const __scBgKeepAlive = (function() {
             return s;
         },
 
+        /* 一轮结束：清认领、记时间、写「参考排期」供诊断面板显示。
+           定时模式下下一次开跑由 @crontab 决定（20 分钟后），这里不再
+           参与判断，所以没有 jitter / 冷却改期的逻辑了。 */
         finish(ok, ran = true) {
             const now = Date.now();
             const claim = this.getClaim();
             if (claim && claim.id && claim.id !== Utils.lockId()) return;
             const base = (claim && claim.at) || now;
-            /* ran=false 表示这一轮根本没拿到锁、什么也没做：
-               不要按 20 分钟排下一轮，否则一次抢锁失败就要干等一整轮。 */
             this.clearClaim();
             GM_setValue("Config.cronLastRun", now);
-            const next = base + CRON_PERIOD;
-            /* 只有「整轮正常跑完、没有走补跑/冷却分支」才叠加随机延长 */
-            let addJitter = ran;
-            let plan = next > now + 60 * 1000 ? next : now + 60 * 1000;
-            if (!ran) {
-                plan = Math.min(plan, now + 2 * 60 * 1000);
-                addJitter = false;
-            } else if (GM_getValue("Tasks.search", true) && SEARCH_PACER.isPending()) {
-                /* 冷却期内别按 5 分钟排下一轮（排了也是空跑），直接排到冷却结束那一刻 */
-                const coolLeft = API.searchCooldownLeft();
-                const sooner = now + Math.max(SEARCH_PACER.RETRY_GAP, coolLeft);
-                if (sooner < plan) {
-                    plan = sooner;
-                    addJitter = false;
-                    Utils.log("🔍", coolLeft > 0
-                        ? `PC 搜索冷却中，约 ${Math.ceil(coolLeft / 60000)} 分钟后自动续做`
-                        : `PC 搜索未满，${Math.round(SEARCH_PACER.RETRY_GAP / 60000)} 分钟后提前续做`);
-                }
-            }
-            /* 正常走完整轮（ran 且没有提前续做）时补上本次随机延长；
-               补跑/冷却这类「已经算好具体时刻」的分支不再叠加，免得计划越推越远。 */
-            if (addJitter) {
-                const jitter = this.rollJitter();
-                plan += jitter;
-                if (jitter > 0) Utils.log("🕒", `本轮随机延长 ${Math.round(jitter / 60000)} 分钟后进入下一轮`);
-            }
-            this.saveNext(plan);
+            this.saveNext(now + CRON_PERIOD);
             this.state(ok ? "done" : "idle");
-            if (!ran) {
-                Utils.log("🕒", `本轮没有真正开始（多半在等上一轮的锁），${Math.max(1, Math.round((plan - now) / 60000))} 分钟后重试`);
-            } else if (ok) {
-                Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟，上限 ${ROUND_BUDGET_MS / 60000} 分钟），下一轮 ${this.fmt(this.plan(now))}`);
+            if (ran) {
+                Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟，上限 ${ROUND_BUDGET_MS / 60000} 分钟），下一次唤醒在 20 分钟后`);
             }
         },
 
-        start(task) {
-            if (this.started) return;
+        /* 本次浏览器会话的标识：后台上下文每次唤醒都会重新执行脚本，
+           但同一次浏览器启动内 performance.timeOrigin 固定，重启后才会变。 */
+        bootId() {
+            try {
+                const origin = (typeof performance !== "undefined" && Number(performance.timeOrigin)) || 0;
+                if (origin > 0) return Math.round(origin);
+            } catch (_) {}
+            return 0;
+        },
+
+        /* 浏览器重启 / 长时间关机后，把上一段会话留下的运行痕迹清掉：
+           运行锁、认领、running 标记、旧排期。不清的话新一轮会被
+           「上一轮还在执行中」挡住，也就是「抢轮次」。 */
+        resetRoundState(reason) {
+            try { this.clearClaim(); } catch (_) {}
+            try { GM_setValue("Config.runLock", null); } catch (_) {}
+            try { GM_setValue("Config.runState", null); } catch (_) {}
+            try { GM_setValue("Config.cronNextRun", 0); } catch (_) {}
+            try { GM_setValue("Config.idleWakeLogAt", 0); } catch (_) {}
+            if (reason) Utils.log("♻️", reason);
+        },
+
+        /* ══ 定时模式唯一入口 ══════════════════════════════════════════
+           一次 @crontab 唤醒 = 一轮：能跑就随机等一会儿再跑，跑完退出。
+           没有第二层「到没到点」判断，也没有常驻循环。 */
+        async runOnce(task) {
             this.started = true;
             this.startedAt = Date.now();
             this.task = task;
+            const now = this.startedAt;
 
-            /* 新上下文启动时先看遗留记录。
-               执行者每 20 秒刷一次 aliveAt，所以「aliveAt 已经超过 ORPHAN_GRACE」
-               就足以证明那个上下文已经不在了（浏览器关过 / 脚本重载 / 页面被回收）。
-               这种情况下不用等满 RUN_STALE —— 用户关了浏览器再打开，
-               旧记录可能才过去几十秒，以前就是卡在这一步：
-               新实例看到「上一轮还在执行」直接不动，于是无论重开几次都一样。 */
-            const st = this.getState();
-            const staleRunning = st && st.phase === "running";
-            const lastAct = staleRunning ? Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0) : 0;
-            /* 有 aliveAt = 新版记录，心跳 20 秒一跳，45 秒没 Refresh 就肯定是残留；
-               没有 aliveAt = 老版本留下的记录，分不清它是不是还在跑，
-               保守一点，只按 RUN_STALE 判定。 */
-            const grace = (st && Number(st.aliveAt) > 0) ? ORPHAN_GRACE : RUN_STALE;
-            const ownerGone = staleRunning && (this.startedAt - lastAct) >= grace;
-            const lock = Utils.lockInfo("Config.runLock");
-            const lockGrace = (st && Number(st.aliveAt) > 0) ? ORPHAN_GRACE : RUN_LOCK_TTL;
-            const lockOrphan = lock && !lock.mine && (this.startedAt - lock.ts) >= lockGrace;
+            /* ① 换了一次开机：清掉上一段会话的锁与排期，从头开始 */
+            const boot = this.bootId();
+            const prevBoot = Number(GM_getValue("Config.bootId", 0)) || 0;
+            const prevAt = Math.max(Number(GM_getValue("Config.heartbeatAt", 0)) || 0, this.lastRun());
+            const offlineLong = prevAt > 0 && (now - prevAt) > 45 * 60 * 1000;
+            const bootChanged = boot > 0 && prevBoot > 0 && boot !== prevBoot;
+            if (bootChanged || offlineLong) {
+                this.resetRoundState("检测到新的浏览器会话（"
+                    + (bootChanged ? "浏览器重启过" : "离开超过 45 分钟")
+                    + "），已清除上一轮的运行锁与排期，本轮从头开始");
+            }
+            if (boot > 0) GM_setValue("Config.bootId", boot);
+            GM_setValue("Config.heartbeatAt", now);
 
-            if (ownerGone) {
-                this.state("done");
-                Utils.log("♻️", `上一轮（${st.ctx || "未知"}）的执行上下文已不存在（最后心跳 ${this.fmt(lastAct)}），继续沿用它的遗留标记并接手`);
-            } else if (staleRunning && this.isBusy(this.startedAt)) {
-                Utils.log("🕒", `检测到另一个上下文正在执行（${st.ctx || "未知"}，最后心跳 ${this.fmt(lastAct)}），本上下文只负责调度，不重复跑`);
-            }
-            if ((ownerGone || lockOrphan) && lock && !lock.mine) {
-                GM_setValue("Config.runLock", null);
-                Utils.log("♻️", `已清理上一轮遗留的运行锁（${this.fmt(lock.ts)} 写入）`);
-            }
-            if (ownerGone && this.getClaim()) this.clearClaim();
-            if (!staleRunning && !lockOrphan) {
-                /* 没有遗留执行痕迹：顺手把过期的认领也清掉 */
-                const claim = this.getClaim();
-                if (claim && claim.at && this.startedAt - claim.at >= ORPHAN_GRACE) this.clearClaim();
+            /* ② 回收确实死掉的轮次，清掉超时未开始的认领 */
+            try { this.reapDeadRound(now); } catch (_) {}
+            const staleClaim = this.getClaim();
+            if (staleClaim && staleClaim.at && !this.isBusy(now) && now - staleClaim.at > CRON_STALL) {
+                this.clearClaim();
+                Utils.log("♻️", `清理超时未开始的认领（${this.fmt(staleClaim.at)}）`);
             }
 
-            const next = this.plan(this.startedAt);
-            if (next > this.startedAt) this.saveNext(next);
-            Utils.log("🕒", `常驻调度已启动（${this.ctxName()}上下文）：v${(GM_info.script && GM_info.script.version) || "?"}，每 ${CRON_PERIOD / 60000} 分钟 + 随机 ${this.jitterMs() / 60000} 分钟一轮，下一轮 ${this.fmt(next)}`);
-            this.arm(true);
-        },
+            /* ③ 运行时段以面板 Config.winTime 为准：cron 全天唤醒，这里才是闸门 */
+            if (!this.inWindow(now)) {
+                const next = this.alignToWindow(now);
+                this.saveNext(next);
+                this.clearClaim();
+                this.state("waiting", { runAt: next, inWindow: false });
+                const cfg = this.winCfg();
+                const span = cfg.allDay ? "全天不限" : `${this.fmtHM(cfg.startMin)}~${this.fmtHM(cfg.endMin)}`;
+                const lastLog = Number(GM_getValue("Config.idleWakeLogAt", 0)) || 0;
+                if (now - lastLog >= 2 * 60 * 60 * 1000) {
+                    GM_setValue("Config.idleWakeLogAt", now);
+                    Utils.log("🌙", `当前不在运行时段（${span}，以面板 Config.winTime 为准），本次唤醒不跑任务`);
+                }
+                return { ran: false, reason: "window" };
+            }
 
-        arm(immediate) {
-            if (this.timer) clearTimeout(this.timer);
-            const now = Date.now();
-            const next = this.plan(now);
-            /* 关了持续检测且今天已完成 = 完全停止：不用再每 20 秒醒一次。
-               醒着也不做事（不发请求、不写日志），只会无谓占用后台定时器，
-               在 ScriptCat 的 service worker 里还会让实例一直被唤醒。
-               改成 10 分钟一跳，只为跨天时把「明天自动恢复」接上。 */
+            /* ④ 关了「持续检测」且今天已全部完成：醒来什么也不做，也不打日志 */
             const stopped = !GM_getValue("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
-            if (stopped && !immediate) {
-                this.timer = setTimeout(() => this.tick(), CRON_STOPPED_TICK);
-                return;
+            if (stopped) {
+                this.state("done");
+                return { ran: false, reason: "done" };
             }
-            let wait;
-            if (next > now) wait = Math.min(next - now, CRON_HEARTBEAT);
-            else if (immediate) wait = 0;
-            else wait = CRON_HEARTBEAT;
-            this.timer = setTimeout(() => this.tick(), wait);
-        },
 
-        watchdog(now) {
-            const claim = this.getClaim();
-            if (!claim || !claim.at) return;
-            if (this.isBusy(now)) return;
-            if (now - claim.at <= CRON_STALL) return;
-            /* 时段外的认领不是「卡住」，只是本轮本来就不该跑：
-               直接放掉并排到窗口起点，不要在深夜反复补跑。 */
-            if (!this.inWindow(now)) {
-                this.clearClaim();
-                this.saveNext(this.alignToWindow(now));
-                return;
+            /* ⑤ 搜索冷却到期就自动重置并立刻恢复 */
+            try { this.autoRecoverFromCooldown(now); } catch (_) {}
+
+            /* ⑥ 上一轮还没收尾（长任务超过一个唤醒周期）→ 让路，不改排期 */
+            if (this.isBusy(now)) {
+                const s = this.getState() || {};
+                const lastAct = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
+                Utils.log("🟡", `定时唤醒：上一轮还在执行中（${s.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前），本次跳过`);
+                return { ran: false, reason: "busy" };
             }
-            Utils.log("♻️", `上次触发（${claim.ctx || "未知"}）${Math.round((now - claim.at) / 60000)} 分钟内没有真正开始执行，现在补跑`);
-            this.clearClaim();
-            this.fire(now);
-        },
 
-        tick() {
-            this.timer = null;
+            /* ⑦ 随机等 0~5 分钟再开跑：唤醒在整 20 分钟刻度上，
+               起跑错开后实际间隔落在 20~25 分钟，不像定时器那样准点。 */
+            const waitMs = Utils.randomRange(0, CRON_JITTER);
+            if (waitMs > 5000) {
+                Utils.log("⏳", `定时唤醒：${Math.round(waitMs / 1000)} 秒后开跑（错开整点）`);
+                await Utils.delay(waitMs);
+                if (!this.inWindow(Date.now())) {
+                    this.clearClaim();
+                    return { ran: false, reason: "window" };
+                }
+            }
+
+            /* ⑧ 正式开跑：认领 → 交给 init() → 等它跑完再退出上下文 */
+            this.claim();
+            this.state("claimed");
+            Utils.log("⏰", `定时唤醒：开始本轮任务（${this.ctxName()}上下文）`);
             try {
-                const now = Date.now();
-                /* 先回收死掉的轮次，再算计划和补跑：
-                   顺序反了的话 watchdog / fire 会对着一条死记录反复跳过。 */
-                this.reapDeadRound(now);
-                /* 冷却一到点就先重置运行状态并立即恢复（详见 autoRecoverFromCooldown） */
-                this.autoRecoverFromCooldown(now);
-                /* 时段外先把过期计划归位：存下来的 cronNextRun 可能是昨天的时间
-                   （关了一夜浏览器再打开就会这样），此时日志里「已排到 X 开始」
-                   会显示成过去时刻，看起来像一直在排一个永远不会到的时间。
-                   归位到下一个窗口起点后，心跳与诊断面板显示的都是真实的下次开跑时间。 */
-                if (!this.inWindow(now) && this.plan(now) <= now) {
-                    this.saveNext(this.alignToWindow(now));
-                }
-                const next = this.plan(now);
-                this.watchdog(now);
-                const stopped = !GM_getValue("Config.keep", true)
-                    && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
-                /* 关掉「持续检测」且今天已经全部完成后，连 Edge 连签心跳都不该再发请求：
-                   以前这里无条件调 maybeReport()，于是即便「检测已停止」，
-                   每 30 分钟仍会打一次网络请求和相关日志，看起来像脚本没停。 */
-                if (!stopped) {
-                    EdgePacer.maybeReport().catch(() => {});
-                }
-                /* 加 inWindow 闸门：窗口外连认领都不要留，否则 watchdog 会把它
-                   当成「触发了没跑起来」反复补跑，正是整夜刷屏的来源。 */
-                if (!stopped && now >= next && !this.getClaim() && this.inWindow(now)) {
-                    this.fire(now);
-                } else if (!stopped && now - this.lastHbLog >= ((!this.inWindow(now)) ? CRON_HEARTBEAT_LOG_IDLE : CRON_HEARTBEAT_LOG)) {
-                    /* stopped（关了持续检测且今天已完成）时整条心跳都不打：
-                       这条日志除了刷屏没有任何作用 —— 用户已经明确表示不想再检测，
-                       而且该状态下 tick 不再发请求，也就没有「状态」需要汇报。
-                       之前它每小时还是写一条，日志看起来就像脚本没停过。 */
-                    this.lastHbLog = now;
-                    GM_setValue("Config.heartbeatAt", now);
-                    const st = this.getState() || {};
-                    const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0);
-                    const tip = this.isBusy(now)
-                        ? `，本轮正在执行中（最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前）`
-                        : this.getClaim() ? "，本轮已触发，正在等它跑起来"
-                        : (!this.inWindow(now)
-                            ? `，当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），${this.fmt(next)} 开始`
-                            : `，约 ${Math.round((next - now) / 60000)} 分钟后进入下一轮`);
-                    Utils.log("💓", `常驻调度心跳：后台实例已存活 ${Math.round((now - this.startedAt) / 60000)} 分钟${tip}`);
-                }
+                await this.task();
             } catch (e) {
-                Utils.log("🔴", `常驻调度异常：${e && e.message ? e.message : e}`);
+                Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
+                this.clearClaim();
+                return { ran: false, reason: "error" };
             }
-            this.arm(false);
+            return { ran: true, reason: "run" };
         },
-
+        /* 定时模式下没有常驻计时器：所有「下次什么时候跑」只写进 Config.cronNextRun，
+           由下一次 @crontab 唤醒时读取。arm/tick/watchdog 三个函数随之删除。 */
+        rearmNow(extraMs = 0) {
+            const ts = Date.now() + (Number(extraMs) || 0);
+            this.saveNext(ts);
+            return ts;
+        },
 
         autoRecoverFromCooldown(now) {
             let guard;
@@ -10830,46 +10796,8 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
-        fire(now) {
-            if (this.isBusy(now)) {
-                const s = this.getState() || {};
-                this.saveNext(now + 2 * 60 * 1000);
-                Utils.log("🟡", `上一轮任务还在执行中（${s.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - (s.at || now)) / 60000))} 分钟前），本次触发跳过`);
-                return;
-            }
-            /* 时段外直接不开轮：以前这里照样认领，而任务入口 init() 发现时段外
-               只打个日志就 return，认领永远不清 —— watchdog 3 分钟后又判定
-               「没有真正开始执行」再补跑一次，于是整夜循环刷屏。
-               现在时段外只把计划推到窗口起点，连认领都不留。 */
-            if (!this.inWindow(now)) {
-                const next = this.alignToWindow(now);
-                this.saveNext(next);
-                const cfg = this.winCfg();
-                const span = cfg.allDay ? "全天不限" : `${this.fmtHM(cfg.startMin)}~${this.fmtHM(cfg.endMin)}`;
-                Utils.log("🌙", `当前不在运行时段（${span}），本轮跳过，已排到 ${this.fmt(next)} 开始`);
-                return;
-            }
-            this.claim();
-            this.state("claimed");
-            Utils.log("⏰", `常驻调度：开始本轮任务（${this.ctxName()}上下文）`);
-            try {
-                const started = this.task();
-                /* 任务入口是 async 的：必须把返回的 Promise 接住，
-                   否则内部异常会变成未处理的 rejection，
-                   finished 永远不跑，claim 也就一直挂着。 */
-                if (started && typeof started.then === "function") {
-                    started.catch(e => {
-                        Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
-                        this.clearClaim();
-                        this.scheduleNext(Date.now());
-                    });
-                }
-            } catch (e) {
-                Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
-                this.clearClaim();
-                this.scheduleNext(now);
-            }
-        }
+        /* fire() 已删除：定时模式下 runOnce() 自己负责认领与开跑，
+           不存在「一个常驻上下文反复触发」的场景。 */
     };
 
     let bootstrapped = false;
@@ -10923,7 +10851,10 @@ const __scBgKeepAlive = (function() {
         if (prev !== today) Utils.log("💤", "今日任务已全部完成，已停止检测（明天自动恢复）");
     };
 
-    const init = () => {
+    /* 定时模式下 init 必须 await：runOnce() 要等这一轮真的结束才返回，
+       上下文随后正常退出。以前用 setTimeout 甩出去就不管了，常驻上下文里没问题，
+       定时上下文里会「任务还没跑完，执行体已经结束」。 */
+    const init = async () => {
         bootstrap();
 
         const isKeep = GM_getValue("Config.keep", true);
@@ -10938,8 +10869,6 @@ const __scBgKeepAlive = (function() {
             const cfg = Sched.winCfg();
             const span = cfg.allDay ? "全天不限" : `${Sched.fmtHM(cfg.startMin)}~${Sched.fmtHM(cfg.endMin)}`;
             Utils.log("🌙", `当前不在运行时段（${span}），已排到 ${Sched.fmt(next)} 开始，窗口外不会跑任务`);
-            /* 走这个分支说明本轮什么也没做：计划排到窗口起点，并且把认领放掉，
-               否则 watchdog 会以为「触发了但没跑起来」，3 分钟后无限补跑。 */
             Sched.saveNext(next);
             Sched.clearClaim();
             Sched.state("waiting", { runAt: next, inWindow: false });
@@ -10949,12 +10878,14 @@ const __scBgKeepAlive = (function() {
         const delay = Utils.randomRange(3000, 12000);
         Utils.log("⏳", `${(delay / 1000).toFixed(1)} 秒后启动...`);
         Sched.state("waiting", { runAt: Date.now() + delay });
-        setTimeout(() => {
-            Promise.resolve()
-                .then(() => TaskManager.runAll())
-                .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
-                .finally(() => Sched.finish(true, TaskManager.lastRunStarted));
-        }, delay);
+        await Utils.delay(delay);
+        try {
+            await TaskManager.runAll();
+        } catch (e) {
+            Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`);
+        } finally {
+            Sched.finish(true, TaskManager.lastRunStarted);
+        }
     };
 
     const isBingSearchPage = typeof location !== "undefined"
@@ -11003,7 +10934,9 @@ const __scBgKeepAlive = (function() {
     }
 
     bootstrap();
-    Sched.start(init);
+    if (Utils.hasDOM()) {
+        Utils.log("🖥️", `页面上下文已加载（${location.hostname}），任务轮交给定时唤醒`);
+    }
 
     const diagSchedStatus = () => {
         const now = Date.now();
@@ -11014,13 +10947,14 @@ const __scBgKeepAlive = (function() {
         const lock = Utils.lockInfo("Config.runLock");
         const phaseText = { claimed: "已触发，等待执行", waiting: "等待延时结束", running: "正在执行", done: "上一轮已完成", idle: "空闲" };
         const lastAct = st ? Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0) : 0;
-        let text = "🕒 常驻调度状态\n\n";
+        let text = "🕒 定时调度状态\n\n";
         const wcfg = Sched.winCfg();
         text += `运行时段：${wcfg.allDay
             ? "全天不限（开始=结束，已关闭时段限制）"
             : `${Sched.fmtHM(wcfg.startMin)}~${Sched.fmtHM(wcfg.endMin)}，每天 ${Sched.fmtHM(wcfg.startMin)} 开始`}\n`;
         text += `当前状态：${Sched.inWindow(now) ? "✅ 在运行时段内" : "🌙 时段外，窗口内不会开新的一轮"}\n`;
-        text += `调度间隔：${CRON_PERIOD / 60000} 分钟 + 随机 ${Math.round(Sched.jitterMs() / 60000)} 分钟（范围 ${CRON_PERIOD / 60000}~${(CRON_PERIOD + Sched.jitterMs()) / 60000} 分钟）\n`;
+        text += `唤醒节拍：每 ${CRON_WAKE_MS / 60000} 分钟一次（@crontab），一次唤醒跑一轮\n`;
+        text += `开跑偏移：唤醒后随机等 0~${Math.round(CRON_JITTER / 60000)} 分钟再开跑（错开整点）\n`;
         text += `最近结束：${Sched.fmt(last)}\n`;
         text += `下次触发：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
         text += `运行阶段：${st ? (phaseText[st.phase] || st.phase) : "未知"}${st && st.ctx ? `（${st.ctx}）` : ""}\n`;
@@ -11032,11 +10966,14 @@ const __scBgKeepAlive = (function() {
         else text += "运行锁：空闲\n";
         if (claim) text += `当前认领：${claim.ctx || "未知"}，${Sched.fmt(claim.at)}\n`;
         text += `本次上下文：${Sched.ctxName()}（已运行 ${Math.round((now - Sched.startedAt) / 60000)} 分钟）\n`;
-        text += `卡死阈值：心跳 ${RUN_STALE / 60000} 分钟 / 无进展 ${ROUND_STALL / 60000} 分钟 / 单轮硬上限 ${ROUND_HARD_LIMIT / 60000} 分钟\n\n`;
+        text += `卡死阈值：无动静 ${RUN_STALE / 60000} 分钟 / 无进展 ${ROUND_STALL / 60000} 分钟 / 单轮硬上限 ${ROUND_HARD_LIMIT / 60000} 分钟\n\n`;
         if (st && st.phase === "running" && !Sched.isBusy(now)) {
             text += `⚠️ 有一条 running 记录已经 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟没动静，下一次调度会自动回收它。\n\n`;
         }
-        text += "「运行阶段」一直停在「已触发」或「等待延时结束」，说明触发它的上下文被打断了，\n调度会自动补跑；也可以打开任意 rewards.bing.com 页面立刻救一轮。";
+        text += "定时模式：@crontab 每 20 分钟唤醒一次，醒来看运行时段（面板 Config.winTime），"
+            + "在时段内就跑一轮，不在就立刻退出。浏览器关闭期间不会唤醒。\n"
+            + "「运行阶段」长期停在「正在执行」而最后进展很久没动，说明那一轮卡住了，下一轮会回收它。\n"
+            + "想立刻跑一轮：脚本菜单「🚀 立即运行」。";
         return text;
     };
 
@@ -11045,8 +10982,8 @@ const __scBgKeepAlive = (function() {
         GM_setValue("Config.runState", null);
         GM_setValue("Config.cronNextRun", null);
         try { GM_setValue("Config.runLock", null); } catch (_) {}
-        Utils.log("🧹", "调度计划已重置（含运行锁），下一轮将立刻开始");
-        Sched.arm(true);
+        Utils.log("🧹", "调度计划已重置（含运行锁），下一次定时唤醒将立刻开跑");
+        Sched.rearmNow(0);
     };
 
 
@@ -11071,8 +11008,12 @@ const __scBgKeepAlive = (function() {
         } catch (_) {}
     }
 
+    /* 定时模式入口：只有后台（@crontab 唤醒）上下文才发起任务轮。
+       页面上下文只承担页面代发 / 菜单 / 授权，不再自己跑一轮。
+       runOnce 返回的是「这一轮跑完」的 Promise，跑完上下文就正常结束 ——
+       不再用「永不 resolve 的 Promise」挂住后台，避免每次唤醒都堆一个实例。 */
     if (!Utils.hasDOM()) {
-        return new Promise(() => {});
+        return Sched.runOnce(init);
     }
 })();
 
