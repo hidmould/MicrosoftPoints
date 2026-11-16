@@ -7815,19 +7815,13 @@ const __scBgKeepAlive = (function() {
             if (!l || typeof l !== "object" || l.date !== Utils.getTodayNum()) return null;
             return { attempts: Number(l.attempts) || 0, credits: Number(l.credits) || 0, peak: Number(l.peak) || 0, at: Number(l.at) || 0 };
         },
-        setPending(v) {
-            GM_setValue("Config.searchPending", v ? { date: Utils.getTodayNum() } : null);
-        },
-        isPending() {
-            const p = GM_getValue("Config.searchPending", null);
-            return !!(p && typeof p === "object" && p.date === Utils.getTodayNum());
-        },
+
         summary() {
             const min = Math.round(this.minMs() / 1000);
             return {
                 gap: min, min,
                 peak: Math.round(this.loadGapPeak() / 1000),
-                pending: this.isPending(),
+                pending: false,
                 last: this.getLast()
             };
         }
@@ -8437,7 +8431,6 @@ const __scBgKeepAlive = (function() {
                        PC 进度可用。不猜、不拿手机配额顶替，直接说清楚并收手 ——
                        盲目搜索只会重复「发了但不加分」的老问题。 */
                     Utils.log("🟡", "PC 搜索计数器读不到（面板/页面/DAPI 都没有），本轮不搜索，避免空转；下一轮自动重试");
-                    SEARCH_PACER.setPending(true);
                     return;
                 }
             } catch (_) {}
@@ -8449,7 +8442,6 @@ const __scBgKeepAlive = (function() {
             const markDone = () => {
                 this.searchDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                SEARCH_PACER.setPending(false);
                 API.clearSearchGuard(false);
             };
 
@@ -8464,10 +8456,7 @@ const __scBgKeepAlive = (function() {
             }
             /* 冷却中直接跳过：连配额请求都不发，到期由调度自动重试。
                这里不能写 searchDate —— 那等于把「今天还要搜的」标记成已完成。 */
-            if (await API.checkSearchRestricted()) {
-                SEARCH_PACER.setPending(true);
-                return;
-            }
+            if (await API.checkSearchRestricted()) return;
 
             const budgetMin = 20;
             const startedAt = Date.now();
@@ -8494,7 +8483,7 @@ const __scBgKeepAlive = (function() {
             const usedQueries = new Set();
             const pickPoolWord = () => RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
 
-            Utils.log("🔍", `单轮搜索 ${deadlineMin} 分钟（到点交班，未满的配额下一轮提前续做），间隔 ${Math.round(gap / 1000)}±${SEARCH_PACER.JITTER_MS / 1000} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
+            Utils.log("🔍", `单轮搜索 ${deadlineMin} 分钟（到点交班，未做完的配额留到下一次定时唤醒），间隔 ${Math.round(gap / 1000)}±${SEARCH_PACER.JITTER_MS / 1000} 秒，还差 ${Math.max(0, max - progress)} 分（约 ${needed} 次搜索）`);
 
             while (attempts < attemptCap && Date.now() < hardDeadline) {
                 /* 每轮搜索前确认这一轮还活着（超时就抛错退出，锁被接管也退出） */
@@ -8626,10 +8615,9 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔵",
                     `🔍 搜索任务完成！PC: ${progress}/${max}（本轮 ${attempts} 次搜索、记账 ${credits} 次，用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s）`);
             } else {
-                SEARCH_PACER.setPending(true);
                 API.recordSearchRound(attempts, credits, progress, max);
                 Utils.log("🟡",
-                    `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s，已安排提前续做`);
+                    `搜索未满 PC: ${progress}/${max}，本轮 ${attempts} 次搜索、记账 ${credits} 次（${hitRate}%），用时 ${elapsed}s，最大间隔 ${Math.round(peakGap / 1000)}s（剩余配额留到下一次定时唤醒）`);
                 this.save();
             }
         },
@@ -9573,9 +9561,8 @@ const __scBgKeepAlive = (function() {
         } else {
             text += `上一轮：还没有记录\n`;
         }
-        text += `单轮搜索上限：20 分钟（到点交班，未满的配额 5 分钟后提前续做）\n`;
+        text += `单轮搜索上限：20 分钟（到点交班，剩余配额留到下一次定时唤醒）\n`;
         text += `整轮墙钟预算：20 分钟（到点不再开新阶段，剩余任务交给下一轮）\n`;
-        text += `提前续做：${pacer.pending ? "已排程（本轮没搜满）" : "无"}\n`;
         text += `限流计数：${guard.streak}/${SEARCH_GUARD.STREAK_LIMIT}`
             + (coolLeft > 0 ? `（冷却中，约 ${Math.ceil(coolLeft / 60000)} 分钟后自动重试）` : "") + "\n";
         text += `任务标记：${TaskManager.searchDate === RewardsAuto.state.dateNowNum ? "今日已完成" : "今日未完成"}\n\n`;
@@ -9653,7 +9640,7 @@ const __scBgKeepAlive = (function() {
     const RUNTIME_KEYS = [
         "Config.runState", "Config.runLock", "Config.cronClaim",
         "Config.heartbeatAt", "Config.idleWakeLogAt", "Config.windowOpenAt",
-        "Config.searchGap", "Config.searchLast", "Config.searchPending",
+        "Config.searchGap", "Config.searchLast",
         "Config.restrictedTimes", "Config.lastSearchProgress", "Config.searchAutoReset",
         "Config.dpl", "Config.actionDpl", "Config.nextAction", "Config.nextActionScanAt",
         "Config.claimVariant", "Config.questVariant", "Config.uaEdge",
