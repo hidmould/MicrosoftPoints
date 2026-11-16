@@ -5,6 +5,11 @@
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
+// @homepage     https://scriptcat.org/script-show-page/8787
+// @homepageURL  https://scriptcat.org/script-show-page/8787
+// @website      https://scriptcat.org/script-show-page/8787
+// @supportURL   https://scriptcat.org/script-show-page/8787/issue/create
+// @source       https://github.com/hidmould/MicrosoftPoints
 // @crontab      */20 * * * *
 // @connect      bing.com
 // @connect      login.live.com
@@ -110,16 +115,6 @@ Tasks:
         title: 桌面应用每周专属任务
         type: checkbox
         default: true
-    desktopWeeklyCatchUp:
-        title: 桌面周任务补做
-        type: checkbox
-        default: true
-        description: 之前没开机漏掉的周几，在之后的运行中自动补做（不动未来的卡）
-    desktopWeeklyForceUnlock:
-        title: 桌面周任务强制解锁（慎用）
-        type: checkbox
-        default: false
-        description: 开启后不认服务端解锁态，会把整周卡片一次性做完
     monthly:
         title: 月度计划
         type: checkbox
@@ -4874,28 +4869,10 @@ const __scBgKeepAlive = (function() {
         },
 
         /* 解锁态对账：isLocked 以服务端为准，绝不改写。
-           2026-11-15 事故：旧版周日 idx<=today 恒真，一轮把整周 7 张全交卷。 */
+           2026-11-15 事故：旧版周日 idx<=today 恒真，一轮把整周 7 张全交卷。
+           （原来的「强制解锁」开关已移除：那正是造成上述事故的逻辑，不该留着。） */
         _reconcileWeeklyLocks(cards) {
             const list = (cards || []).slice();
-            if (GM_getValue("Tasks.desktopWeeklyForceUnlock", false)) {
-                /* 显式开启才保留旧行为：无视服务端锁，把「按星期本该解锁」的全部做完 */
-                const today = this.QUESTS.todayIndex();
-                let changed = 0;
-                const forced = list.map(c => {
-                    if (c.isCompleted) return c;
-                    const idx = this.QUESTS.weekdayIndex(c.offerId);
-                    if (idx < 0) return c;
-                    const shouldUnlock = idx <= today;
-                    if (shouldUnlock === !c.isLocked) return c;
-                    changed++;
-                    return { ...c, isLocked: !shouldUnlock, lockByWeekday: true };
-                });
-                if (changed > 0) {
-                    Utils.log("🟠", `桌面周任务：强制解锁已开启，改写了 ${changed} 张卡的解锁态（无视服务端锁，慎用）`);
-                }
-                return forced;
-            }
-
             const today = this.QUESTS.todayIndex();
             const lockedOpen = list.filter(c => !c.isCompleted && c.isLocked);
             const expected = lockedOpen.filter(c => {
@@ -5608,13 +5585,12 @@ const __scBgKeepAlive = (function() {
                    判据只用 offerId 里的星期，不看服务端 isLocked ——
                    服务端对过期卡可能保持锁定，靠它会漏掉全部补做机会。 */
                 const todayIdx = this.QUESTS.todayIndex();
-                const catchUpOn = GM_getValue("Tasks.desktopWeeklyCatchUp", true);
                 const dayOf = (c) => {
                     const i = this.QUESTS.weekdayIndex(c.offerId);
                     return i >= 0 ? "周" + "日一二三四五六".charAt(i) : "";
                 };
+                /* 补做恒开：漏掉的周几在这里找回来，不再提供开关 */
                 const isOverdue = (c) => {
-                    if (!catchUpOn) return false;
                     const i = this.QUESTS.weekdayIndex(c.offerId);
                     return i >= 0 && i < todayIdx;
                 };
@@ -9444,14 +9420,16 @@ const __scBgKeepAlive = (function() {
             ageStr = parts.join("");
         }
         const tokenDate = time > 0 ? new Date(time).toLocaleString("zh-CN") : "未知";
+        /* 这里只报「有没有、兑没兑换」，不打印授权码片段：
+           授权码是等价的登录凭据，弹窗里露出来没有意义。 */
         const rawCode = GM_getValue("Config.code", "");
         const parsed = rawCode ? Auth.parseCode(rawCode) : null;
         const codeUsed = !!(parsed && Auth.used(parsed));
         const codeStr = !rawCode
             ? "无"
             : (!parsed
-                ? `有但无法解析（长度 ${String(rawCode).length}）`
-                : `有（${Auth.preview(parsed)}${codeUsed ? "，已兑换为 Token，保留中" : "，尚未兑换"}）`);
+                ? "有（格式无法解析）"
+                : (codeUsed ? "有（已兑换为 Token，保留中）" : "有（尚未兑换）"));
         Utils.uiAlert(
             `Token: ${token ? "已保存" : "无"}\n` +
             `获取时间: ${tokenDate}\n` +
@@ -9588,7 +9566,7 @@ const __scBgKeepAlive = (function() {
        它唯一该被挡住的情况是「真的有一轮在跑」，否则会和那一轮并发上报。
        所以这里不能只看 isBusy() 的时间戳 —— 时间戳可能是死掉的上下文留下的，
        必须实测一次（probeOwnerAlive）再决定。 */
-    GM_registerMenuCommand("🚀 立即运行（不受时段限制）", async () => {
+    GM_registerMenuCommand("🚀 立即运行", async () => {
         Utils.log("🚀", "手动触发：立即运行一轮（忽略运行时段与 cron 节拍）");
         const now = Date.now();
         try { Sched.reapDeadRound(now); } catch (_) {}
