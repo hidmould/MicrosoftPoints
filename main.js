@@ -10,7 +10,6 @@
 // @connect      login.live.com
 // @connect      rewards.bing.com
 // @connect      prod.rewardsplatform.microsoft.com
-// @connect      hotapi.nntool.cc
 // @connect      hot.baiwumm.com
 // @connect      cnxiaobai.com
 // @connect      disp-qryapi.3g.qq.com
@@ -73,7 +72,7 @@ Config:
         title: 搜索词接口（offline为随机搜索词）
         type: select
         default: offline
-        values: [offline, hot.nntool.cc, hot.baiwumm.com, hot.cnxiaobai.com]
+        values: [offline, hot.baiwumm.com, hot.cnxiaobai.com]
     code:
         title: 授权码链接
         type: textarea
@@ -302,10 +301,7 @@ const __scBgKeepAlive = (function() {
                     url: "https://cnxiaobai.com/DailyHotApi/",
                     hot: ["weibo", "douyin", "baidu", "toutiao", "thepaper", "qq-news", "netease-news", "zhihu"],
                 }],
-                ["hot.nntool.cc", {
-                    url: "https://hotapi.nntool.cc/",
-                    hot: ["weibo", "douyin", "baidu", "toutiao", "thepaper", "qq-news", "netease-news", "zhihu"],
-                }],
+
             ],
             url: "",
             hot: [],
@@ -526,11 +522,8 @@ const __scBgKeepAlive = (function() {
         MAX_EXTRA_ROUNDS: 3,
     };
 
-    /* 月度计划（月度 punchcard）：
-       父任务形如 ENWW_pcparent_FY27_BingMonthlyPC_Nov_punchcard，页面上是「N/5 个任务」，
-       子项间隔解锁（子项 4/5 在子项 3 完成并且到点后才 isLocked=false），全部完成给一次 +50。
-       子项的进度只能靠回读详情页的「M/N 个任务」确认——交卷被受理不代表服务端记账。
-       cron 每 20 分钟一轮，这里按月维度节流：本月已判「不再推进」就不再去拉详情页。 */
+    /* 月度计划：父任务 ENWW_pcparent_*_punchcard，子项间隔解锁，全完成 +50。
+       进度只认回读的「M/N 个任务」——交卷被受理不代表记账。 */
     const MONTHLY = {
         RECHECK_MS: 90 * 60 * 1000,
         DONE_RECHECK_MS: 22 * 60 * 60 * 1000,
@@ -565,13 +558,9 @@ const __scBgKeepAlive = (function() {
         get msg() { return p.body(new Date().toLocaleString(), RewardsAuto.state.sendMSG); }
     }));
 
-    /* ── 推送策略（整脚本唯一出口） ─────────────────────────────────────
-       用户口径：平时完全静默，只有两种情况才打扰 ——
-         ① 任务真的做完了（全天达标 / 某个整块任务首次完成）→ 推 1 次；
-         ② 出异常、需要人介入（授权失效、出口被拦、本轮异常终止等）→ 推，
-            但同类异常 6 小时内只推 1 次，全局每小时最多 3 条。
-       过程状态（进度、交卷失败下一轮继续、接口 401、请手动点一次……）
-       一律只写日志：那些每 20 分钟一轮就会复现，推一次就是骚扰一次。 */
+    /* 推送策略（整脚本唯一出口）：平时完全静默，只有「任务真做完」和
+       「需要人介入的异常」才推；同类异常 6 小时一次、全局每小时最多 3 条。
+       过程状态一律只写日志。 */
     const NOTICE = {
         DONE_TTL: 20 * 60 * 60 * 1000,
         ANOMALY_TTL: 6 * 60 * 60 * 1000,
@@ -583,11 +572,8 @@ const __scBgKeepAlive = (function() {
     const CDP_NOTICE_RE = /CDP|调试端口|remote-debugging|remote-allow-origins|Rewards Edge/;
 
     const Utils = {
-        /* 纯日志：**永不推送**。
-           第三个参数只是为了兼容旧调用点，传什么都不再触发通知 ——
-           以前 `log(..., true)` / `log(..., pending === 0 && ok > 0)` 这类写法
-           是「每次检测都通知」的根源（子任务一做完就推一条）。
-           需要推送时必须显式走 notifyDone()（完成）或 notifyAnomaly()（异常）。 */
+        /* 纯日志，永不推送。第三个参数仅为兼容旧调用点；
+           要推送必须显式走 notifyDone() / notifyAnomaly()。 */
         log(icon, msg, push = false) {
             GM_log(`${icon} ${msg}`);
             if (push) GM_log("🔇 该提示属于过程状态，只写日志（不推送）");
@@ -662,17 +648,7 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
-        /*
-         * 同类通知节流：同一 key + 同一文案在 ttl 内只推送一次。
-         * 用于「每轮都会复现」的失败提示（例如领取积分通道被拒），
-         * 避免同一件事每隔几十分钟就弹一次通知 / 推一条 webhook。
-         */
-        _noticeHash(str) {
-            const s = String(str || "");
-            let h = 5381;
-            for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-            return h;
-        },
+        /* 同类通知节流：同一 key + 文案在 ttl 内只推一次。 */
 
         /* 只写日志的节流版：同 key 在 ttl 内只记一行。
            用于「已知且不影响任务」的噪音（如接口 401、面板暂时不可用、
@@ -692,10 +668,6 @@ const __scBgKeepAlive = (function() {
         /* 已废弃：保留 API 只为兼容，永不推送。
            过去它是最好的「节流推送」工具，结果被大量过程状态当成推送入口，
            于是同一件事每轮复现一次就要打扰一次。现在只记日志。 */
-        logOnce(icon, msg) {
-            GM_log(`${icon} ${msg}`);
-            return false;
-        },
 
         /* 状态恢复正常时重置节流记录，保证下次真出问题时还能提醒一次 */
         resetOnce(key) {
@@ -725,6 +697,19 @@ const __scBgKeepAlive = (function() {
 
         hasDOM() {
             return typeof document !== "undefined" && !!document && !!document.documentElement;
+        },
+
+        /* 是不是「后台（定时）上下文」。
+           ⚠ 不能只用 hasDOM()：ScriptCat 的后台跑在一个扩展页里
+           （chrome-extension://<id>/…），那里**有** document，
+           于是 hasDOM() 为 true、被误判成页面上下文 —— 任务轮永远不会发起，
+           日志只留下一句「页面上下文已加载（扩展ID）」。 */
+        isBackground() {
+            try {
+                const proto = String((typeof location !== "undefined" && location.protocol) || "");
+                if (/^(chrome-extension|moz-extension|safari-web-extension|ms-browser-extension):$/.test(proto)) return true;
+            } catch (_) {}
+            return !this.hasDOM();
         },
 
         waitForBody(timeoutMs = 8000) {
@@ -1100,52 +1085,7 @@ const __scBgKeepAlive = (function() {
         },
         delay(ms) { return new Promise(r => setTimeout(r, ms)); },
         randomDelay(min = 3000, max = 8000) { return this.delay(this.randomRange(min, max)); },
-        waitForElement(selector, timeout = 30000) {
-            return new Promise((resolve, reject) => {
-                const element = document.querySelector(selector);
-                if (element) return resolve(element);
-                const observer = new MutationObserver((_, obs) => {
-                    const el = document.querySelector(selector);
-                    if (el) { obs.disconnect(); resolve(el); }
-                });
-                observer.observe(document.body, { childList: true, subtree: true });
-                setTimeout(() => {
-                    observer.disconnect();
-                    const el = document.querySelector(selector);
-                    el ? resolve(el) : reject(new Error(`等待元素超时: ${selector}`));
-                }, timeout);
-            });
-        },
-        waitForElementsByText(containerSelector, textPatterns, timeout = 30000) {
-            return new Promise((resolve, reject) => {
-                const findElements = () => {
-                    const containers = document.querySelectorAll(containerSelector);
-                    const results = [];
-                    for (const container of containers) {
-                        const text = container.textContent || "";
-                        for (const pattern of textPatterns) {
-                            if (text.includes(pattern)) {
-                                results.push({ element: container, pattern });
-                                break;
-                            }
-                        }
-                    }
-                    return results;
-                };
-                const found = findElements();
-                if (found.length > 0) return resolve(found);
-                const observer = new MutationObserver((_, obs) => {
-                    const found = findElements();
-                    if (found.length > 0) { obs.disconnect(); resolve(found); }
-                });
-                observer.observe(document.body, { childList: true, subtree: true });
-                setTimeout(() => {
-                    observer.disconnect();
-                    const found = findElements();
-                    found.length > 0 ? resolve(found) : reject(new Error("等待文本元素超时"));
-                }, timeout);
-            });
-        },
+
 
         lockId() {
             if (!RewardsAuto.state.lockId) RewardsAuto.state.lockId = Utils.getRandomUUID();
@@ -1647,24 +1587,6 @@ const __scBgKeepAlive = (function() {
             return null;
         },
 
-        async waitForCode(since, timeoutMs = 180000) {
-            const step = 3000;
-            for (let waited = 0; waited < timeoutMs; waited += step) {
-                await Utils.delay(step);
-                const raw = GM_getValue("Config.code", "");
-                const t = Number(GM_getValue("Config.codeTime", 0)) || 0;
-                const code = raw ? this.parseCode(raw) : null;
-                const freshToken = () => GM_getValue("Config.token", false)
-                    && (Number(GM_getValue("Config.tokenTime", 0)) || 0) >= since;
-                if (code && t >= since) {
-                    await Utils.delay(2500);
-                    if (freshToken()) return { tokenReady: true };
-                    return { code };
-                }
-                if (freshToken()) return { tokenReady: true };
-            }
-            return {};
-        },
 
         async autoFetch(reason) {
             if (!GM_getValue("Config.autoAuth", true)) {
@@ -1716,25 +1638,6 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        async recoverFromPage() {
-            const hit = this.collectCode(true) || await this.waitForAnyCode(6000);
-            if (!hit) {
-                Utils.uiAlert(
-                    "🕵️ 没有在 Referer / 地址栏 / 页面内容里找到授权码。\n\n" +
-                    "请确认当前页就是授权跳转后的那一个（地址形如 /oauth20_desktop.srf?removed=true）。\n" +
-                    "若仍失败，按 F12 → 网络 → 点 oauth20_desktop.srf?removed=true → 标头 → 请求标头 →\n" +
-                    "复制 Referer 右侧的完整链接，再用「📋 粘贴授权码」粘贴。"
-                );
-                return false;
-            }
-            Utils.log("🟢", `从页面捕获授权码（来源：${hit.source}，${this.preview(hit.code)}），正在换取 Token...`);
-            this.save(hit.raw || hit.code);
-            const ok = await this.exchange(hit.code);
-            Utils.uiAlert(ok
-                ? "✅ 已用捕获到的授权码换取 Token 并保存。"
-                : "⚠️ 捕获到授权码，但换取 Token 失败（多半已过期或已被用过）。请重新「🔑 手动授权」。");
-            return ok;
-        },
 
         async pasteFlow(input) {
             let raw = input;
@@ -1853,12 +1756,8 @@ const __scBgKeepAlive = (function() {
             }
         },
 
-        /* ---------------- 静默标签页 ----------------
-           开：browser 级 Target.createTarget({background:true}) —— 新页在后台创建，
-               不激活、不抢焦点，你正在用的标签页/别的软件都不会被顶到前台。
-           关：Target.closeTarget，只关自己开的那几个（id 记在 _owned / Config.cdpOwned），
-               绝不碰你自己打开的 rewards 页。
-           闸门：先 available() 确认 CDP 真能用，才允许开页；当天 CDP 任务做完后不再开。 */
+        /* 静默标签页：background:true 建页不抢焦点；只关自己开的页（_owned）；
+           先 available() 确认 CDP 可用才允许开页。 */
         _bws: null,
         _bid: 0,
         _bpending: null,
@@ -1917,9 +1816,6 @@ const __scBgKeepAlive = (function() {
             return this.ownedStored().some(x => x.id === id);
         },
 
-        ownedIds() {
-            return [...new Set([].concat(this._owned, this.ownedStored().map(x => x.id)))];
-        },
 
         _rememberOwned(id) {
             if (!id) return;
@@ -2208,16 +2104,9 @@ const __scBgKeepAlive = (function() {
             return page;
         },
 
-        async earnPage() {
-            return await this.ensurePage("https://rewards.bing.com/earn");
-        },
 
-        /* 分辨「端口通但打不开页」到底是哪一种：
-           1) /json/version 就失败 —— 端口上根本没 CDP；
-           2) HTTP 通、WebSocket 握手失败 —— 启动参数缺 --remote-allow-origins=*，
-              DevTools 会对扩展源发起的握手直接回 403（新版 Edge 默认策略）；
-           3) 都通 —— 那就只是页面本身没打开/没登录。
-           以前这一律报「拿不到可用的 rewards 页」，等于把最关键的配置问题藏起来了。 */
+        /* 三种失败要分开：/json/version 失败=没 CDP；WS 握手 403=缺
+           --remote-allow-origins=*；都通=页面没打开或未登录。 */
         async whyNoPage() {
             const info = await this.browserInfo();
             if (!info) return "本地调试端口 " + this.PORT + " 上没有 CDP 服务";
@@ -2288,14 +2177,9 @@ const __scBgKeepAlive = (function() {
             return r && r.result ? r.result.value : undefined;
         },
 
-        /* ---------------- 真 UA 覆盖 ----------------
-           为什么必须用 CDP 覆盖：user-agent 和 cookie 都是**浏览器禁止脚本设置**的请求头，
-           写进 GM_xmlhttpRequest / fetch 的 headers 里会被静默丢弃。
-           而「奖励应用专属」卡片（offerId 带 RewardsApp）服务端只认桌面应用身份：
-           实测同样的 cookie、同样的 action、同样的 hash，只把 UA 换成
-           MSRewards/Desktop/1.13.0，进度才从 1/8 变成 2/8；用普通 Edge UA 一律
-           返回 true（受理）却不记账 —— 这正是「已受理但未记账」的真因。
-           只有 CDP 的 Network.setUserAgentOverride 能真正改变网络层 UA。 */
+        /* UA 只有 CDP 的 Network.setUserAgentOverride 能真正改：
+           GM_xhr / fetch 里设 user-agent 会被浏览器丢弃。
+           RewardsApp 专属卡只认桌面应用 UA，普通 Edge UA 会「受理但不记账」。 */
         _uaOverrideAt: 0,
 
         async setAppUA(on = true) {
@@ -2407,14 +2291,9 @@ const __scBgKeepAlive = (function() {
 
         async clickCard(href) {
             const h = JSON.stringify(href);
-            /* 背景标签页里 document.hidden=true，Chromium 完全不做布局，
-               所有卡片 getBoundingClientRect() 都是 0×0 @(0,0)，坐标点击等于点空白，
-               所以不依赖坐标，直接 element.click()。
-
-               但卡片的 <a> 全都带 target="_blank"（实测 7/7 张）：
-               直接 click() 会新开一个标签页，而这个页不在 _rememberOwned 名单里 ——
-               既不会被自动关掉，打开时还会把焦点抢走，于是每做一张卡就多留一个搜索页。
-               必须先摘掉 target，让导航发生在「本脚本自己开的那一个受管标签页」里。 */
+            /* 后台标签页 document.hidden=true，getBoundingClientRect 全是 0×0，
+               所以用 element.click() 不用坐标。卡片 <a> 都带 target="_blank"，先摘掉，
+               否则每张卡都会另开一个不受管的标签页。 */
             const clickExpr = [
                 "(function(){",
                 "  var sel = 'a[href*=\"PUBL=RewardsDO\"], a[href*=\"form=ML2\"]';",
@@ -2743,11 +2622,8 @@ const __scBgKeepAlive = (function() {
         KEY_EMPTY_AT: "Config.claimEmptyAt",
         EMPTY_TTL: 15 * 60 * 1000,
 
-        /* 页面上同时存在两个名字相近的字段，必须严格区分：
-             "pointClaim":{points:3,...}                  ← 待领对象（小写 p，要的就是它）
-             "PointClaim":{CategoryNames:{...}}           ← i18n 文案字典（大写 P，没有金额）
-           原来正则带了 /i，会先命中大写的字典，从里面读不到金额 → 判成 uncertain
-           → 每轮都"直接发一次领取请求再回读"，即使早就领完了也在刷日志和接口。 */
+        /* "pointClaim"（待领对象）与 "PointClaim"（i18n 字典）必须严格区分：
+           正则带 /i 会先命中字典，读不到金额。 */
         _CLAIM_KEY: /"pointClaim"\s*:\s*(null|\{|\[)/,
 
         parse(html) {
@@ -2910,13 +2786,8 @@ const __scBgKeepAlive = (function() {
             return `领取通道返回 HTTP ${status}（${tried}）`;
         },
 
-        /* 领完之后的定性。到账证据按可信度排序：
-             ① 余额真的涨了
-             ② 待领池被清空（标记没了 / 金额归 0）
-             ③ 待领金额变小
-           服务端 2xx + false 是「接口被调用且明确回答没有可领的」，单独一种情形：
-           此时若页面本来就显示不出可领金额，回读也显示不出来，那就是「待领为 0」——
-           按用户口径属于成功，不能报成「未成功」。 */
+        /* 到账证据按可信度：余额涨了 > 待领池清空 > 待领金额变小。
+           2xx + false = 接口明确回答「没有可领」，页面也显示无金额时算成功。 */
         async run({ name = "领取积分" } = {}) {
             const out = {
                 claimed: 0, before: 0, after: 0, empty: false, variant: "", reason: "",
@@ -3204,11 +3075,8 @@ const __scBgKeepAlive = (function() {
                     const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
                     const clean = html.replace(/\\"/g, '"');
                     let balance = 0;
-                    /* 今日已赚积分：earn 页 pointsCounters.totalPoints。
-                       这不是账号余额 —— 余额在别处（DAPI balance / availablePoints）。
-                       原来把它赋给了 balance，于是「今日获取」顶替了「总积分」，
-                       页面上就成了「今日获取 +15 · 总积分 155」两个数都对不上。
-                       null = 页面上没读到这个字段（真的 0 分要能和「读不到」区分开）。 */
+                    /* pointsCounters.totalPoints 是「今日已赚」，不是账号余额；
+                       原来赋给 balance，导致两个数都对不上。null = 没读到，区别于真 0。 */
                     let earnedToday = null;
                     let pcMax = 60, pcCur = 0, mobMax = 0, mobCur = 0;
                     let dailyOffer = 0;
@@ -3342,12 +3210,8 @@ const __scBgKeepAlive = (function() {
                     if (readInfo) {
                         const p = Number(readInfo.progress);
                         const m = Number(readInfo.max) || 30;
-                        /* 服务端读到 0 未必是真的 0：活动卡片翻页、回读抖动、
-                           跨实例刚写完标记时都可能返回 0。若把 0 写回 state，
-                           之后任何一次查询失败都会让摘要退回「0/30」——
-                           正是「阅读明显做完了却显示 0/30」的成因。
-                           已确认完成的那天只升不降。
-                           TaskManager 在本文件里定义得更晚，用 typeof 兜底。 */
+                        /* 服务端读到 0 未必真 0（翻页/抖动/刚写完标记）。
+                           已确认完成的那天只升不降。 */
                         const tm = (typeof TaskManager !== "undefined") ? TaskManager : null;
                         const doneToday = !!tm && tm.readDate === RewardsAuto.state.dateNowNum;
                         const cur = Number.isFinite(p) ? p : readProgress;
@@ -3465,7 +3329,6 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
-        _xhrFull(options) { return Utils.xhrFull(options); },
 
         async signPC() {
             try {
@@ -3746,10 +3609,6 @@ const __scBgKeepAlive = (function() {
             return `Config.unofferable.${Utils.getTodayNum()}.${offerId}`;
         },
 
-        _markUnoffered(offerId) {
-            if (!offerId) return;
-            try { GM_setValue(this._unofferableKey(offerId), true); } catch (_) {}
-        },
 
         isUnoffered(offerId) {
             if (!offerId) return false;
@@ -3760,16 +3619,6 @@ const __scBgKeepAlive = (function() {
             return `Config.manualCard.${Utils.getTodayNum()}.${offerId}`;
         },
 
-        _markManualCard(offerId, name) {
-            if (!offerId) return;
-            try {
-                GM_setValue(this._manualKey(offerId), true);
-                RewardsAuto.state.manualCards = RewardsAuto.state.manualCards || [];
-                if (!RewardsAuto.state.manualCards.some(x => x.offerId === offerId)) {
-                    RewardsAuto.state.manualCards.push({ offerId, name: name || offerId });
-                }
-            } catch (_) {}
-        },
 
         isManualCard(offerId) {
             if (!offerId) return false;
@@ -3924,16 +3773,9 @@ const __scBgKeepAlive = (function() {
             return false;
         },
 
-        /* 面板接口（Bing 首页右上角那个小浮窗的数据源）。
-           为什么单独加这一条：rewards.bing.com/api/getuserinfo 已经不稳了 ——
-           实测 2026-11 它对已登录的账号直接返回 HTML 错误页（「积分商城错误」），
-           Utils.isJSON 失败 → getSearchQuotaFromUserInfo 返回 false →
-           getPcQuota 两个来源全落空 → doSearch 里的「记账核对」整轮都在
-           verifyFails 分支上跑，永远看不到 progress 变化。
-           而面板接口一直正常，并且**直接给出 PCSearch 的 pointProgress/max**，
-           所以把它作为独立来源补进来。
-
-           注意字段名大小写不同：getuserinfo 是 pcSearch，面板是 PCSearch。 */
+        /* 面板接口（Bing 首页浮窗的数据源）。getuserinfo 实测 2026-11 对已登录账号
+           也可能返回 HTML 错误页，非 JSON 时 getPcQuota 会拿不到来源；面板接口稳定，
+           且直接给 PCSearch 进度。注意字段名：getuserinfo 是 pcSearch，面板是 PCSearch。 */
         async getSearchQuotaFromPanel(light = true) {
             const hosts = [];
             try {
@@ -4000,12 +3842,8 @@ const __scBgKeepAlive = (function() {
         },
 
         async getPcQuota() {
-            /* 三条通道，任一成功即可。顺序按「实测可靠度」排：
-                 ① 面板接口（一直可用，字段最直接）
-                 ② getuserinfo（近期常回 HTML 错误页 / 401）
-                 ③ DAPI（需要 token）
-               三条全废时返回 null，让上层如实记一次「核对失败」并收手，
-               由冷却 + 下一轮重新校正 —— 绝不拿手机配额冒充 PC 进度。 */
+            /* 三条通道任一成功即可，按实测可靠度排序：面板接口 > getuserinfo > DAPI。
+               全废返回 null，如实记一次核对失败，绝不拿手机配额冒充 PC。 */
             try {
                 const panel = await this.getSearchQuotaFromPanel(true);
                 if (panel && panel.pc && panel.pc.max > 0) {
@@ -4104,11 +3942,8 @@ const __scBgKeepAlive = (function() {
             const seenCardKeys = new Set();
             let earnHtml = "";
             const lockStat = { count: 0, points: 0, app: 0 };
-            /* 数据源可用性：只有「真的问过服务端、且它确实答了」才算读到。
-               用来区分「今天确实没有待办卡」和「我根本没读到数据」——
-               以前两者都落到「未发现卡片 → ✅ 完成」，于是接口一挂，
-               活动卡片就永远显示完成（实测踩到：getuserinfo 回 401，
-               面板里却还有一堆卡能点）。 */
+            /* 只有「真问过服务端且它答了」才算读到，用来区分「今天没卡」和
+               「根本没读到」——以前两者都落到「未发现卡片 → ✅ 完成」。 */
             const sources = { getuserinfo: false, flight: false };
             let sourceAnswered = false;
 
@@ -4242,12 +4077,8 @@ const __scBgKeepAlive = (function() {
 
                 try {
                     const flightItems = this._flightItems(this._flightText(html));
-                    /* ⚠️ 这里必须同时标记 sourceAnswered：
-                       以前只写了 sources.flight，而决定「是『没有待办卡』还是
-                       『根本没读到』」的判据是 sourceAnswered，
-                       于是 earn 页明明解析出十几条卡，日志却报
-                       「数据源全部不可用」—— 用户看到的就是这条刷屏。
-                       只要 flight 解析出条目，就说明服务端答了话。 */
+                    /* 必须同时标记 sourceAnswered：判「没卡」还是「没读到」用的是它，
+                       而不是 sources.flight。 */
                     if (flightItems.length > 0) {
                         sources.flight = true;
                         sourceAnswered = true;
@@ -4355,12 +4186,8 @@ const __scBgKeepAlive = (function() {
             return cached;
         },
 
-        /* 只有真正带「奖励应用搜索」签名的卡才需要走 CDP 真搜索。
-           判定一度把 PUBL=RewardsDO 也算成签名，可它只是通用跟踪参数 ——
-           「完成此拼图」「即时赢奖」等普通卡都带它，于是像
-           「你是否知道答案？」（form=ML2BF1）这种本该后台网页交卷就完成的 quiz 卡，
-           也被拽去走 CDP，反而做不完。
-           真正的应用搜索签名只有 form=ML2W4J / form=ML2Y2H。 */
+        /* 只有 form=ML2W4J / ML2Y2H 才是应用搜索签名卡；PUBL=RewardsDO 只是通用
+           跟踪参数，把它算进来会把普通 quiz 卡拽去走 CDP，反而做不完。 */
         _isAppSearchCard(card) {
             if (!card) return false;
             /* 互动类卡片（quiz/puzzle 等）不是「应用内搜索」，一律不走 CDP 真搜索。 */
@@ -4374,17 +4201,9 @@ const __scBgKeepAlive = (function() {
             return isBingSearch && hasSign;
         },
 
-        /* 应用内搜索上报。
-           关键修复：以前这里自带一个 "cookie" 头、里面只有 _Rwho，
-           而请求头的 cookie 是**整体覆盖**语义 —— 浏览器/扩展不会把你设的值和真实 cookie 合并，
-           于是登录态（MSPAuth / MUID / WLS 等）被整个顶掉，服务端认不出账号：
-           reportActivity 照样返回 200（所以看起来「已受理」），但响应里
-           IsAuthenticated=false、IsRewardUser=false，这张卡永远不记账。
-           实测三组对照（同一请求、只差 cookie 头）：
-             自动带完整 cookie   → IsAuthenticated=true  能记账
-             只发 _Rwho（旧做法）→ IsAuthenticated=false 不记账
-             _Rwho + 完整 cookie → IsAuthenticated=true  能记账
-           因此现在把 _Rwho 拼在真实 cookie **后面**，不再覆盖登录态。 */
+        /* 应用内搜索上报。请求头里的 cookie 是**整体覆盖**语义，只发 _Rwho 会把
+           MSPAuth / MUID 等登录态顶掉 → 服务端回 200 但 IsAuthenticated=false，
+           卡片永不记账。所以 _Rwho 一律拼在真实 cookie 之后。 */
         _rwhoCookie(deviceType = "d") {
             const today = new Date();
             const p2 = n => String(n).padStart(2, "0");
@@ -4578,13 +4397,8 @@ const __scBgKeepAlive = (function() {
                 return false;
             }
 
-            /* 关键顺序修正（实测 Edge 157 + 国内网络）：
-               · 只发 reportActivity 搜索上报 → IsAuthenticated=true、RewardsIncrement=1，
-                 但这张卡并不记账；
-               · 只发 Server Action 交卷（body 带 hash）→ 返回 `1:true`，卡片立即 isCompleted=true。
-               真正记账的是交卷，搜索上报只是陪跑。旧代码是「先上报再交卷」，
-               上报环节一出问题（例如跨域被拦、拿不到 IG）就直接 return false，
-               永远走不到真正能完成卡片的交卷那一步 —— 这就是带锁卡永远做不完的主因。 */
+            /* 真正记账的是 Server Action 交卷（body 带 hash），搜索上报只是陪跑。
+               旧代码先上报、上报失败就 return，永远走不到交卷那一步。 */
 
             /* 第一步：Server Action 交卷（决定成败的那一步，提到最前面） */
             let submitted = false;
@@ -4901,11 +4715,8 @@ const __scBgKeepAlive = (function() {
         },
 
         async _ensurePageChannel() {
-            /* 全局约定：只有走 CDP 的任务才允许打开标签页。
-               这条「页面代发通道」不属于 CDP —— 它开出来的页还得你在里面
-               再跑一次脚本才能用，收益低、还多留一个标签页，所以直接停用。
-               方法本身保留（别处仍会调用），现在恒定返回 null。
-               如需恢复旧行为，见 git 历史里的 v1.3.3 之前版本。 */
+            /* 页面代发通道已停用（开出来的页还要手动再跑一次脚本，收益低），
+               方法保留，恒定返回 null。 */
             if (!GM_getValue("Config.allowOpenTab", false)) return null;
             Utils.log("🖥️", "已跳过「打开页面代发通道」：只有 CDP 任务才允许开标签页");
             return null;
@@ -4959,12 +4770,8 @@ const __scBgKeepAlive = (function() {
             return settled ? result : null;
         },
 
-        /* 动作响应的三态判定：
-           "true"    服务端说这件事做成了
-           "false"   服务端明确说没做成 —— 领取接口在「池子里没有可领」时就是回 false，
-                     这是「没什么可做」，不是通道失败，两种含义必须分开
-           "unknown" 认不出来（错误帧 / HTML / 空响应），只能当没确认
-           以前只有真假两态，于是「池子本来就空」和「通道被拒」被混成同一句「未成功」。 */
+        /* 动作响应三态：true=做成了；false=明确没做成（领取池空也是 false，
+           不是通道失败）；unknown=认不出（错误帧/HTML/空响应）。 */
         _actionVerdict(res) {
             const text = String(res || "");
             if (!text) return "unknown";
@@ -4984,14 +4791,9 @@ const __scBgKeepAlive = (function() {
 
         QUESTS: {
             weeklyPrefix: /WW_pcparent_RewardsApp_weekly_Exclusive/i,
-            /* 桌面周任务子项的 offerId 里直接带星期：
-                 WW_pcchild2_urlreward_Sunday_...weekly_Exclusive_Novw2_2026_punchcard
-                 WW_pcchild3_urlreward_Monday_ ...
-               服务端的新一周从周日下午开始（太平洋时间 0 点 ≈ 北京周日 16:00），
-               当天只解锁第 0 张，即 offerId 里的 Sunday；之后每天放一张。
-               这是不依赖 UA 渲染的强信号 —— 网页端对非应用 UA 会把所有子项都渲染成
-               isLocked=true（实测 7/7 全锁），只靠 isLocked 数会把「今天该做的那一张」
-               也算进未解锁里，于是出现「网站说 6 张未解锁、脚本报 7 张」。 */
+            /* 桌面周任务子项 offerId 里带星期（WW_pcchild2_urlreward_Sunday_...）。
+               服务端新一周从周日下午开始（太平洋 0 点 ≈ 北京周日 16:00），当天只放第 0 张。
+               非应用 UA 会把子项全渲染成 isLocked=true，所以不能只靠 isLocked 判断。 */
             weekdayTokens: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
 
             /* 从 offerId 里取「本周第几天」（周日=0 … 周六=6）；取不到返回 -1。
@@ -5071,12 +4873,8 @@ const __scBgKeepAlive = (function() {
             return { parentId, url, html, text, progress, cards: this._reconcileWeeklyLocks(cards) };
         },
 
-        /* 桌面周任务的解锁态对账。
-           ⚠ 原则：isLocked 以服务端为准，这里绝不改写它。
-           2026-11-15 事故：旧版用 idx <= today 去「校正」解锁态，而周日的 today 是 6，
-           恒真 —— 服务端只解锁了第 0 张，脚本却把剩下 6 张全标成已解锁，
-           22:58 一轮把整周 70 分全部交卷，卡片当天就 8/8 了。
-           服务端没解锁的卡，脚本没有资格替它解锁；这里只记录偏差方便排查。 */
+        /* 解锁态对账：isLocked 以服务端为准，绝不改写。
+           2026-11-15 事故：旧版周日 idx<=today 恒真，一轮把整周 7 张全交卷。 */
         _reconcileWeeklyLocks(cards) {
             const list = (cards || []).slice();
             if (GM_getValue("Tasks.desktopWeeklyForceUnlock", false)) {
@@ -5111,13 +4909,8 @@ const __scBgKeepAlive = (function() {
             return list;
         },
 
-        /* ===== 月度计划（月度 punchcard）=====
-           与桌面专属任务同一个 quest 详情页结构，差别有三点：
-             1) 父任务 id 不含 RewardsApp，普通 PC UA 就能渲染出子项（不用应用 UA 也能拿到 hash/href）；
-             2) 子项个数更多（本月 5 个），按天解锁，一次只能推进一个；
-             3) 全部完成后父任务发一次 +50，进度只能回读「M/N 个任务」确认。
-           子项 href 指向 bing.com/search?form=ML2YBx&PUBL=RewardsDO 的，
-           必须先在奖励搜索页上报（reportAppSearchForCard）再交卷，否则服务端看不到那次搜索。 */
+        /* 月度计划：与桌面任务同一 quest 结构，差别是父 id 不含 RewardsApp、
+           子项更多且按天解锁、全完成 +50。进度只认「M/N 个任务」回读。 */
 
         MONTH_KEY() {
             const d = new Date();
@@ -5158,11 +4951,8 @@ const __scBgKeepAlive = (function() {
             return true;
         },
 
-        /* 月度子项的完成动作由 href 决定，和桌面任务那套一致：
-             · /redeem/ 开头 = 领取型，点开链接即完成（奖励多半走邮件）
-             · bing.com/search?form=ML2xx|PUBL=RewardsDO = 应用内搜索型，先上报搜索再交卷
-             · 其它 = 纯交卷型
-           返回 "redeem" | "search" | "plain" */
+        /* 子项动作由 href 决定：/redeem/=领取型；含 RewardsDO 搜索参数=先上报再交卷；
+           其它=纯交卷。返回 "redeem"|"search"|"plain"。 */
         monthlyChildKind(href) {
             const h = String(href || "");
             if (/\/redeem/i.test(h)) return "redeem";
@@ -5173,13 +4963,8 @@ const __scBgKeepAlive = (function() {
 
         /* 拉详情页并解析：进度 + 子项。进度只认「M/N 个任务」，
            没有这个文案时退化为数子项的 isCompleted，避免把「已解锁但没进度文案」当成 0 进度。 */
-        /* 拉详情页并解析：进度 + 子项。
-           身份：统一用 Rewards 应用 UA —— 参考实现的实测结论是「同一个 quest 在应用 UA 下才渲染
-           真实进度与真实解锁态，普通 UA 会渲染成 0/N 且子项全 isLocked=true」，
-           因此不能拿普通 UA 的结果当依据。只有应用 UA 连子项都解析不出来时，
-           才退到普通 PC UA 兜底（页面结构变更时至少还能认出子项）。
-           进度只认「M/N 个任务」文案，没有时退化为数子项 isCompleted。
-           返回的 identity 字段用于日志定位「到底哪份渲染被采纳了」。 */
+        /* 用应用 UA 拉详情页（普通 UA 会渲染成 0/N 且子项全锁）；
+           应用 UA 解析不出子项时才退普通 PC UA 兜底。identity 用于日志定位。 */
         async fetchMonthlyQuest(parentId) {
             const url = MONTHLY.PAGE_URL + encodeURIComponent(parentId);
             const identities = [
@@ -5819,12 +5604,9 @@ const __scBgKeepAlive = (function() {
                     continue;
                 }
 
-                /* 一天一张，未到日子绝不碰；但是「已经过去、当时没开机没做成」的那几张要补做。
-                   判定只用 offerId 里的星期，不看服务端的 isLocked —— 因为服务端对补做卡
-                   可能就是保持锁定态，靠它判断会把补做机会全部漏掉（2026-11-15 实测：
-                   服务端受理并记账了这批「过期但未解锁」的交卷）。
-                   规则：idx < todayIdx = 已经过去的日子 → 补做；idx >= todayIdx → 等它到点。
-                   周日本身是本周第 0 天，因此周日永远不会触发补做，一周仍从一张开始。 */
+                /* 一天一张，未到日子不碰；已经过去且没做成的要补做。
+                   判据只用 offerId 里的星期，不看服务端 isLocked ——
+                   服务端对过期卡可能保持锁定，靠它会漏掉全部补做机会。 */
                 const todayIdx = this.QUESTS.todayIndex();
                 const catchUpOn = GM_getValue("Tasks.desktopWeeklyCatchUp", true);
                 const dayOf = (c) => {
@@ -6320,19 +6102,9 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🟠", "搜索上报未被识别为登录态（IsAuthenticated=false），这次搜索可能不记账");
                     return false;
                 }
-                /* ── 上报「被受理」≠「已记账」────────────────────────────
-                   实测（2026-11，cn.bing.com）：同一个 IG 反复打 reportActivity，
-                   每次都会回 200 + IsAuthenticated:true + RewardsIncrement:1，
-                   但积分计数器一点都不涨。也就是说把 IsAuthenticated 当成功判据，
-                   等于给「已经刷到底/被限流」的账号发一张假的成功凭证：
-                   doSearch 看到上报成功就继续下一次，结果无限搜索、永不记账。
-
-                   这里不再声称自己知道有没有加分 —— 服务端在这次响应里没给
-                   可核对的分值。真正的判据交给 doSearch 的「配额回读」：
-                   只有积分计数器真的涨了才算 credited。返回值改为三态：
-                     true  = 请求确实发出去了（不代表加分）
-                     false = 明确的失败（未登录 / 网络异常）
-                   记账与否一律由调用方的 quota 回读决定。 */
+                /* 上报「被受理」≠「已记账」：同一个 IG 反复打 reportActivity，每次都回
+                   200 + IsAuthenticated:true + RewardsIncrement:1，计数器却不涨。
+                   这里只表示「请求发出去了」；到没到账由 doSearch 的配额回读判定。 */
                 return true;
             } catch (e) {
                 Utils.log("🟡", `搜索上报失败: ${e.message}`);
@@ -6349,11 +6121,8 @@ const __scBgKeepAlive = (function() {
             }
             const v = await RegionGuard.check({ fresh: true });
             if (v.ok) {
-                /* 出口确认是国内，必须把 host 落到 cn.bing.com：
-                   www.bing.com 在国内会被 302 到 cn.bing.com，而 reportActivity 是 POST，
-                   跟随 302 之后请求体被丢掉，服务端看到的就是「一次空上报」——
-                   照样回 200 + IsAuthenticated:true，但不计分。
-                   这就是「日志说记账了，rewards 面板没涨」的根因之一。 */
+                /* 国内必须把 host 落到 cn.bing.com：www 会 302 到 cn，
+                   POST 跟随后请求体丢失，服务端看到空上报，照样回 200 但不计分。 */
                 await this.syncSearchHost();
                 return true;
             }
@@ -6456,21 +6225,10 @@ const __scBgKeepAlive = (function() {
             return sentence;
         },
 
-        /* ── 搜索受限保护（v2）──────────────────────────────────────────
-           旧版三处硬伤，都真实踩到过：
-             ① 判据只有「两轮进入时的进度快照是否相同」。可 doSearch 排在
-                签到/阅读/活动卡片之后、共用 20 分钟预算，经常轮到搜索时预算
-                已经用完、一次搜索都没发 —— 这同样被记成「没记账」，三轮空转
-                就被判成限流。
-             ② 命中后直接 return 不搜索 → 进度不可能变 → 下一轮继续命中，
-                计数只增不减，当天彻底锁死，等多少轮都出不来。
-             ③ 计数只活在内存 RewardsAuto.state 里，页面上下文和后台上下文
-                各判各的：一个被锁死、另一个照常记账，日志看起来自相矛盾。
-           新版：
-             · 开场只判断「是否在冷却期」，一次网络请求都不发（冷却中整轮跳过）；
-             · 证据移到 doSearch 收尾，用本轮真实战果（搜了几次 / 记账几次）累计；
-             · 连续 STREAK_LIMIT 轮真实搜索零记账 → 冷却后自动重试，并清零计数；
-             · 状态写进 Config.searchGuard，跨上下文、跨脚本重载共享。 */
+        /* 搜索受限保护（v2）。旧版三处硬伤：只看两轮进度快照（预算耗尽也算没记账）、
+           命中后直接 return 导致计数只增不减、计数只在内存里跨上下文各判各的。
+           现在：开场只判冷却期不发请求；证据由 doSearch 收尾用真实战果累计；
+           连续 STREAK_LIMIT 轮零记账才冷却；状态写 Config.searchGuard 跨上下文共享。 */
         searchGuard() {
             const raw = GM_getValue("Config.searchGuard", null);
             const today = Utils.getTodayNum();
@@ -6570,16 +6328,8 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔍", `PC 搜索进入冷却：${new Date(until).toLocaleString("zh-CN")} 后自动重试`);
                 return this.searchGuard();
             }
-            /* ── 命中率判定（替换原来的「有记账就清零」）──────────────────
-               原来只要本轮成功过一次，就把限流计数和冷却档位全部清零。
-               实测问题是：通道半坏时（比如 6 次成功 1 次）每轮都能「清零」，
-               于是永远积累不到冷却条件，调度就无限重复 → 用户看到的现象
-               就是「一直卡在 9/60、反复搜索、反复卡住」。
-
-               现在按命中率分档：
-                 ≥ 50%      通道正常，计数清零
-                 < 50%      偏坏，累计一轮；够 3 轮就进冷却
-               这样「偶尔成功一次」不再能无限续命。 */
+            /* 命中率判定：旧版「有记账就清零」，半坏通道下永远达不到冷却条件。
+               现在 ≥50% 清零，<50% 累计，够 3 轮才冷却。 */
             if (got > 0) {
                 const hitRate = tried > 0 ? got / tried : 0;
                 if (hitRate >= 0.5) {
@@ -6616,24 +6366,11 @@ const __scBgKeepAlive = (function() {
     const IntlDaily = {
         PATH: "/rewards/panelflyout/getuserinfo?channel=BingFlyout&partnerId=BingRewards",
         REPORT_PATH: "/msrewards/api/v1/reportactivity",
-        /* 这一族 offer 的完整形态是 <PREFIX>star_Rewards_DailyGlobalOffer_<星期>，
-           PREFIX 会随「区域 + 活动版本」变化：
-             ENstar_  国际版（5 分）
-             ZHstar_  国内版（5 分）
-           实测还存在带锁的变体（面板显示 🔒 +10），命名也在这一族里，
-           所以这里不再写死单个前缀，改用正则统一识别。 */
-        /* 这一族 offer 的完整形态是
-             <PREFIX>star_Rewards_DailyGlobalOffer_[Evergreen_]<星期 或 变体名>
-           PREFIX 随「区域 + 活动版本」变化：ZHstar_（国内版）、ENstar_（国际版）。
-           第三段除了星期名，还会出现**变体名**顶替星期名的位置 —— 实测 2026-11：
-             ENstar_Rewards_DailyGlobalOffer_Evergreen_VerB_Locked_level2   （+10 带锁拼图）
-           它不是 "Evergreen_Monday" 这种，而是把 VerB_Locked_level2 直接写在第三段。
-           旧正则要求第三段必须是星期名且到此结尾，于是这张卡**永远匹配不到**，
-           pickCards 看不见它 —— 现象就是「+10 那张拼图一直不做」，
-           而日志里同名 +5 的 "Complete this puzzle" 却完成了。
-
-           现在第三段接受「星期名」或「变体名」，且允许后续还有 _ 分段。
-           星期名仍从第 2 组取（拿不到就用变体名兜底，不要因此丢卡）。 */
+        /* offer 前缀随区域变化（ENstar_ 国际版 / ZHstar_ 国内版），还有带锁变体，
+           所以不写死前缀，用正则统一识别。 */
+        /* offer 形态：<PREFIX>star_Rewards_DailyGlobalOffer_[Evergreen_]<星期|变体名>。
+           第三段也可能是变体名（如 VerB_Locked_level2，+10 带锁拼图），
+           旧正则要求必须是星期名，导致这张卡永远匹配不到。现在两者都接受。 */
         OFFER_RE: /^[A-Za-z]{2}star_Rewards_DailyGlobalOffer_(Evergreen_)?([A-Za-z0-9_]+)$/,
         /* 星期名本身：从第三段里再认一次，认不出就整段当变体名 */
         DAY_RE: /\b(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)\b/i,
@@ -6654,9 +6391,6 @@ const __scBgKeepAlive = (function() {
             return out;
         },
 
-        weekdayName(date = new Date()) {
-            return this.WEEKDAYS[date.getDay()] || "";
-        },
 
         /* 面板数据一次性取回：拿到卡片列表 + 请求体要用的身份字段。
            返回 null 表示「国际版面板不可用 / 没登录」，调用方要当无事发生。 */
@@ -6758,20 +6492,12 @@ const __scBgKeepAlive = (function() {
                 const day = dayMatch ? dayMatch[1] : String(matched[2] || "");
                 if (want && !want.has(day)) continue;
 
-                /* 带锁变体（面板左上角 🔒，如「Complete this puzzle +10」）：
-                   国内版的结论是「锁 ≠ 不能做，而是要换通道」（App / 真拼图）。
-                   所以这里**不跳过**，只打个标记，照常尝试：
-                     · 面板接口能过就过
-                     · 过不了再按渠道兜底（拼图走真拼、Quiz 走真作答）
-                   只有全部失败才记为「受限」，最后一并报出来 ——
-                   直接跳过会让它永远不完成，这才是之前「带锁卡不动」的原因。 */
+                /* 带锁变体不跳过：锁只代表要换通道（App / 真拼图），
+                   全部通道失败才记为「受限」并如实汇报。 */
                 const lock = CardLock.probe({ ...attr, name, State: p.State || attr.State });
                 const needApp = !!lock.appExclusive || lock.appOnly === true;
-                /* ⚠️ 这里**不能**静默丢弃：以前 `continue` 一走了之，
-                   既不算进 found、也不打日志，于是面板上明明还有卡，
-                   汇总却显示「4/4 全部完成」—— 用户看到的就是
-                   「前面的任务现在完不成了，还提示已完成」。
-                   现在把丢掉的卡记进 dropped，由调用方如实汇报。 */
+                /* 不能静默丢弃：丢掉的卡要记进 dropped，否则面板还有卡、
+                   汇总却显示「4/4 全部完成」。 */
                 if (!p.hash) {
                     dropped.push({ offerId, title: attr.title || p.title || offerId, why: "面板未下发 hash（无法交卷）" });
                     continue;
@@ -6780,13 +6506,8 @@ const __scBgKeepAlive = (function() {
                     dropped.push({ offerId, title: attr.title || p.title || offerId, why: "重复 offerId" });
                     continue;
                 }
-                /* complete 的三种形态都要认，别只判断布尔 true：
-                     · p.complete      —— 面板给的是布尔
-                     · attr.complete   —— 面板给的是**字符串** "True"/"False"
-                     · completeById    —— userInfo.promotions 里的权威值
-                   以前这里写的是 `p.complete === true`，字符串 "True" 直接漏过，
-                   只能靠 completeById 兜底；而 completeById 当时又掺了
-                   progress>=max，于是两个都不靠谱。 */
+                /* complete 有三种形态都要认：p.complete（布尔）、
+                   attr.complete（字符串 "True"）、completeById（权威值）。 */
                 const done = p.complete === true
                     || String(p.complete).toLowerCase() === "true"
                     || String(attr.complete).toLowerCase() === "true"
@@ -6829,47 +6550,15 @@ const __scBgKeepAlive = (function() {
             return out;
         },
 
-        /* ── 交互式 Quiz（「Do you know the answer?」）专用通道 ──────────────
-           这类卡和拼图/每日一句不是一回事：
-             · 拼图 / 每日一句：面板 reportactivity 一发就记账
-             · Quiz：必须真的打开落地页、点掉那道题，页面才会带着
-               WQOskey / WQId / WQQI 去打 rewardsapp/reportActivity
-           实测（2026-11 cn.bing.com）：
-             只调 msrewards/reportactivity  → 卡永远不完成
-             打开落地页 + 点正确选项        → 页面自己发 reportActivity，记账
-           所以这里按「取题 → 作答 → 用同样的参数上报」复刻整条链路。 */
+        /* 交互式 Quiz 通道：拼图 / 每日一句调面板 reportactivity 就记账；
+           Quiz 需要打开落地页点掉题目，页面才会带 WQOskey / WQId / WQQI 上报。
+           这里复刻「取题 → 作答 → 用同样参数上报」。 */
 
-        /* ── 拼图卡（Complete this puzzle / 周中拼图）专用通道 ────────────────
-           普通 +5 拼图调面板 reportactivity 就能记账；
-           但**带锁的 +10 变体**（面板左上角 🔒）走的是另一条路：
-           必须先在该拼图落地页里真的把图拼好，页面才会记账。
-           实测落地页（spotlight/imagepuzzle）结构：
-             · #tiles > div.tile[x][y]，空的那格没有子元素
-             · 每格里的 <img id="imgN">，N 就是该块的目标位置（0..rows*cols-1）
-             · 拼好时 #congrats 去掉 b_hide，并自动跳转 spotlight 页
-           所以这里用 BFS 求最短解，再模拟真实点击顺序。 */
+        /* 拼图通道：普通 +5 走面板接口；带锁 +10 必须在落地页真拼。
+           落地页结构：#tiles > div.tile[x][y]，每格 <img id="imgN">，N 是目标位置。
+           这里用 BFS 求最短解再模拟点击。 */
 
         /* 从落地页 HTML 解出拼图布局（row/col 与每格对应的图块编号） */
-        _parsePuzzle(html) {
-            const text = String(html || "");
-            const rows = Number((text.match(/puzzleSettings\.rows\s*=\s*(\d+)/) || [])[1]) || 0;
-            const cols = Number((text.match(/puzzleSettings\.columns\s*=\s*(\d+)/) || [])[1]) || 0;
-            if (!rows || !cols) return { ok: false, reason: "落地页里没有拼图配置" };
-            /* <div x="0" y="1" ... id="01" ...><div class="parentTile">...<img id="img1"> */
-            const tiles = [...text.matchAll(/<div\s+x="(\d+)"\s+y="(\d+)"[^>]*id="(\d+)"[^>]*>([\s\S]{0,600}?)<\/div>\s*<\/div>/g)]
-                .map(m => {
-                    const img = (m[4].match(/<img[^>]*id="img(\d+)"/) || [])[1];
-                    return { x: Number(m[1]), y: Number(m[2]), id: m[3], img: img === undefined ? null : Number(img) };
-                });
-            if (tiles.length !== rows * cols) {
-                /* 退一步：只按 tile 块 + img 配对，不依赖嵌套结构 */
-                const simple = [...text.matchAll(/id="(\d{2})"[^>]*>([\s\S]{0,500}?)<img[^>]*id="img(\d+)"/g)]
-                    .map(m => ({ x: Number(m[1][0]), y: Number(m[1][1]), id: m[1], img: Number(m[3]) }));
-                if (simple.length === rows * cols - 1) return { ok: true, rows, cols, tiles: simple, blank: rows * cols - 1 };
-                return { ok: false, reason: `拼图块数对不上（${tiles.length || simple.length}/${rows * cols}）` };
-            }
-            return { ok: true, rows, cols, tiles, blank: rows * cols - 1 };
-        },
 
         /* 通过 CDP 打开拼图页并把它真拼完。
            返回 {ok, moves, reason}。只有 CDP 可用时才有戏；不可用就如实返回原因。 */
@@ -6954,42 +6643,6 @@ const __scBgKeepAlive = (function() {
         },
 
         /* BFS 求最短解：返回点击顺序 [{x,y}...]（点的是空格旁边的块） */
-        _solvePuzzle(puzzle) {
-            const { rows, cols, tiles, blank } = puzzle;
-            const grid = [];
-            for (let x = 0; x < rows; x++) grid[x] = new Array(cols).fill(blank);
-            for (const t of tiles) {
-                if (t.img === null || t.img === undefined) continue;
-                if (t.x >= 0 && t.x < rows && t.y >= 0 && t.y < cols) grid[t.x][t.y] = t.img;
-            }
-            const goal = [];
-            for (let x = 0; x < rows; x++) { goal[x] = []; for (let y = 0; y < cols; y++) goal[x][y] = x * cols + y; }
-            const key = g => g.flat().join(",");
-            const goalKey = key(goal);
-            if (key(grid) === goalKey) return { ok: true, path: [] };
-            const q = [{ g: grid, m: [] }];
-            const seen = new Set([key(grid)]);
-            const dirs = [[-1, 0], [1, 0], [0, -1], [0, 1]];
-            let head = 0;
-            while (head < q.length) {
-                const cur = q[head++];
-                let bx = -1, by = -1;
-                for (let x = 0; x < rows; x++) for (let y = 0; y < cols; y++) if (cur.g[x][y] === blank) { bx = x; by = y; }
-                for (const [dx, dy] of dirs) {
-                    const nx = bx + dx, ny = by + dy;
-                    if (nx < 0 || nx >= rows || ny < 0 || ny >= cols) continue;
-                    const ng = cur.g.map(r => r.slice());
-                    const t = ng[bx][by]; ng[bx][by] = ng[nx][ny]; ng[nx][ny] = t;
-                    const k = key(ng);
-                    if (seen.has(k)) continue;
-                    seen.add(k);
-                    const nm = cur.m.concat([{ x: nx, y: ny }]);
-                    if (k === goalKey) return { ok: true, path: nm, states: seen.size };
-                    q.push({ g: ng, m: nm });
-                }
-            }
-            return { ok: false, reason: "拼图无解（可能是无解局面）" };
-        },
 
         /* 把落地页 URL 里的 filters 参数解析成键值（面板下发的是转义过的串） */
         _parseQuizFilters(destination) {
@@ -7033,13 +6686,8 @@ const __scBgKeepAlive = (function() {
             const choices = [...seg.matchAll(/\{\s*id:\s*"([^"]*)",\s*isCorrect:\s*"([^"]*)",\s*text:\s*"([^"]*)"\s*\}/g)]
                 .map(m => ({ id: m[1], correct: m[2] === "true", text: m[3] }));
             const correct = choices.find(c => c.correct);
-            /* 前两个 init 参数分别是答案 id 与题目 id。
-               实测真实调用（2026-11，cn.bing.com）：
-                 QuizQuestionPane.init( "0", "0", "In which Canadian province is ...?", choices, "https://www.bing.com/funapi/api/quiz/record" );
-               注意 WQId 在后面的 filters 里是 "1"（题组内第几题），
-               而这里的第二个参数才是 questionId，两者不是一回事。
-               旧代码写的是 ids[2] —— 那个正则只有两个捕获组，ids[2] 恒为
-               undefined，于是发给 quiz/record 的 questionId 一直是坏的。 */
+            /* QuizQuestionPane.init(答案id, 题目id, …)：第二个参数才是 questionId，
+               与 filters 里的 WQId 不是一回事；旧代码取 ids[2] 恒为 undefined。 */
             const initSeg = text.slice(initIdx, initIdx + 1200);
             const ids = initSeg.match(/init\(\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,/);
             const recordUrl = (initSeg.match(/"(https:[^"]*funapi\/api\/quiz\/record[^"]*)"/) || [])[1] || "";
@@ -7074,18 +6722,9 @@ const __scBgKeepAlive = (function() {
                面板/页面点击时发的就是这个结构，WQOskey 是题组 ID。 */
             const own = this._parseQuizFilters(puzzle.url);
             const quizId = puzzle.quizId || own.WQOskey || "";
-            /* ── q 与 WQCI 必须照真实点击来（实测 2026-11-14，cn.bing.com）──
-               真人在页面上点选项后，浏览器实际发出的那一发是：
-                 reportActivity?IG=…&IID=SERP.5053&q=Alberta&filters=…
-                   …WQId:"1" WQQI:"0" WQCI:"1" …&FORM=CWQHYL&rnoreward=1&skipopalnative=true&ajaxreq=1
-               注意三个关键点：
-                 ① q 是**答案文本**（Alberta），不是题目标题 "Bing Homepage quiz"；
-                 ② WQCI 从 "0" 变成 "1" —— 它表示「这道题的作答完成数」，
-                    WQCI:"0" 等于告诉服务端「还没答完」，那一发永远不会记账；
-                 ③ 还要带上 FORM=CWQHYL / rnoreward=1 / skipopalnative=true。
-               旧代码 ①②③ 全错（q 用原标题、WQCI 恒 "0"、三个参数完全没带），
-               所以 quiz 卡永远回 200 + IsAuthenticated:true 却一分不加 ——
-               这正是「Do you know the answer? 一直做不完」的真正原因。 */
+            /* 实测真人点选项后发出的是：q=答案文本（不是题目标题）、WQCI="1"
+               （"0" 表示未答完，那一发永不记账），并带 FORM=CWQHYL /
+               rnoreward=1 / skipopalnative=true。旧代码这三点全错。 */
             const q = puzzle.answerText || own.__q || "";
             const filtersDecoded = [
                 'mgzv3configlist:"BingQA_Quiz_layout"',
@@ -7153,14 +6792,9 @@ const __scBgKeepAlive = (function() {
             }
             const authed = /"IsAuthenticated":true/.test(String(text || ""));
             const increment = (String(text || "").match(/"RewardsIncrement":(\d+)/) || [])[1];
-            /* ⚠️ 这两个字段都**不能**当「加分成功」的判据（实测 2026-11，cn.bing.com）：
-               reportActivity 的响应里永远带着
-                 "IsAuthenticated":true  和  "RewardsIncrement":1
-               它们是**页面模块的配置值**，不是你这次答题真加了多少分 ——
-               连已经做完的卡、甚至没答对的请求，也照样回这两个值。
-               以前拿它们判成功，于是 quiz 卡「永远报交卷成功、永远不到账」，
-               用户看到的就是「Do you know the answer? 一直做不完」。
-               现在这里只报告「请求发出去了」，到没到账一律交给面板回读定夺。 */
+            /* ⚠️ IsAuthenticated 与 RewardsIncrement 是页面模块的配置值，不是本次得分：
+               已完成的卡、没答对的请求照样回这两个值。这里只报「请求发出去了」，
+               到没到账交给面板回读。 */
             return {
                 ok: authed,
                 isAuthenticated: authed,
@@ -7171,13 +6805,8 @@ const __scBgKeepAlive = (function() {
             };
         },
 
-        /* 从任意响应里尽力读出「余额 / 是否有错」。
-           面板接口在不同通道下会回三种东西：
-             · {IsRewardsUser:…, Balance:{Available:…}, ErrorCode:0}   正常记账
-             · {OfferComplete:…, EarnedCredits:…, ErrorDetail:{…}}     这次没算上
-             · HTML（登录/校验页）                                     通道被拒
-           「响应不是 JSON」不是失败判据 —— 早期就是只看 JSON，于是
-           后台通道回了 HTML 就整张卡判死，其实服务端可能已经记账了。 */
+        /* 从任意响应读「余额 / 是否有错」：正常记账 / 这次没算上 / HTML 被拒三种。
+           「响应不是 JSON」不能当失败判据 —— 服务端可能已经记账。 */
         _readReport(text) {
             const data = Utils.parseJSON(text);
             if (!data) return { json: false, text: String(text || "").slice(0, 200) };
@@ -7190,19 +6819,10 @@ const __scBgKeepAlive = (function() {
             const detail = data.ErrorDetail || {};
             const code = Number(detail.ErrorCode ?? data.ErrorCode ?? 0) || 0;
             const message = String(detail.Message || data.ErrorMessage || "").trim();
-            /* ── 为什么 OfferComplete 不能当「有没有加分」的判据 ──────────────
-               实测（2026-11，cn.bing.com，面板交卷接口）一次**成功**的响应长这样：
-                 {"OfferComplete":false, "EarnedCredits":5, "ActivityComplete":true,
-                  "Balance":{"Available":3878.0}, "ErrorDetail":{"ErrorCode":0}}
-               余额真的 +5、卡片回读也是 complete:true，但 OfferComplete 偏偏是 false。
-
-               旧代码把这两个字段用 || 揉成一个布尔：
-                 offerComplete: data.OfferComplete === true || data.ActivityComplete === true
-               于是调用方看到 false 就判「已受理但未记账」，把成功的卡算成失败 ——
-               日志里「余额 +20 / 6 张卡」就是这么来的（6 张里只有 4 张被认下来）。
-
-               正确的判据是 EarnedCredits（这次到底加了多少分），
-               OfferComplete/ActivityComplete 只作辅助参考，原样保留两个字段。 */
+            /* OfferComplete 不能当加分判据：成功响应可能是
+               {"OfferComplete":false,"EarnedCredits":5,"ActivityComplete":true}。
+               旧代码把两字段 || 成一个布尔，把成功卡算成失败。
+               判据是 EarnedCredits，另两个字段原样保留作参考。 */
             const earned = Number(data.EarnedCredits ?? data.PointsEarned ?? 0) || 0;
             return {
                 json: true,
@@ -7218,14 +6838,8 @@ const __scBgKeepAlive = (function() {
             };
         },
 
-        /* 交卷：带 hash 调面板接口。返回 {ok, points, balance, reason}
-           通道顺序（都被真实网络验证过，谁先通用谁在前）：
-             ① GM_xhr + text/plain：面板自己的 XHR 也没设 content-type，
-                默认就是 text/plain；带 application/json 反而容易被网关挡成 HTML。
-             ② GM_xhr + JSON 头：保留原行为兜底。
-             ③ 页面代发通道：在 bing 页面上跑脚本时由页面同源 fetch 发出，
-                这是唯一能保证 Origin/Referer 与面板完全一致的通道。
-           三通道都失败时由调用方用「面板回读」定胜负，不在这里硬判死。 */
+        /* 交卷通道顺序：text/plain → JSON 头 → 页面代发；
+           都失败由调用方用面板回读定胜负。 */
         /* 单发一次面板交卷：只用「实测最可靠」的那一种形态
            （text/plain + Origin，与面板自己的 XHR 一致），不穷举变体、不开 CDP。
            给 quiz 卡做「先试一次」用 —— 穷举交给主通道，这里要的是快。 */
@@ -7275,30 +6889,12 @@ const __scBgKeepAlive = (function() {
         },
 
         async report(panel, card) {
-            /* ── Quiz 卡先走面板通道，不要走答题流程 ──────────────────────
-               实测（2026-11-14，cn.bing.com）：「Do you know the answer?」这类卡
-               虽然落地页里有一个真题组，但**根本不需要答题** ——
-               直接用面板 reportactivity + hash 交卷就能拿满 5 分：
-                 {"EarnedCredits":5,"ActivityComplete":true,"ErrorCode":0}
-               两张同题卡（Sunday/Tuesday 指向同一个 quiz 页）也都能各自加 5 分。
-
-               旧代码把它当「必须先答题」的卡，走 _solveQuiz：
-               答完题再打 reportActivity，服务端只回 200 + IsAuthenticated:true，
-               一分不加 —— 于是永远「卡在未完成」。
-               （我实测过浏览器真人点击答题、以及逐字重放真实点击的完整参数，
-                两种都拿不到分；而面板通道一打就成。）
-
-               所以这里调换顺序：面板通道在前，答题只作为面板通道失败后的兜底。
-               reportActivity 对「交互式答题」无效这件事，指的是**只答题不交卷**，
-               不是「交卷对答题卡无效」。 */
+            /* Quiz 卡先走面板通道：实测带 hash 直接 reportactivity 就能拿满 5 分，
+               不需要真去答题（只答题不交卷反而拿不到分）。
+               答题流程只作面板通道失败后的兜底。 */
             if (card.isQuiz && card.destination) {
-                /* 只试「一发就成」的主通道，不做多通道穷举：
-                   以前这里调 _reportViaPanel，而它内部会把 5 种 content-type
-                   变体 + 页面代发 + 拼图 CDP 兜底全跑一遍，全失败才退回答题。
-                   结果单张答题卡要打十几条路径，一轮 4 张就吃掉十几分钟，
-                   后面的任务全被挤出时间窗（日志里用时 763 秒就是这么来的）。
-                   这里直接发一次标准请求：成功就走，失败立刻退回答题通道，
-                   两条路都是「一次定胜负」，不再层层穷举。 */
+                /* 只发一次标准请求，不做多通道穷举：穷举会让单张卡打十几条路径，
+                   一轮 4 张就吃掉十几分钟，把后面的任务全挤出时间窗。 */
                 const quick = await this._reportOnce(panel, card);
                 if (quick && quick.ok) {
                     return Object.assign({}, quick, { via: "quiz-panel" });
@@ -7425,14 +7021,9 @@ const __scBgKeepAlive = (function() {
                     reasons.push(`${v.name}: 服务端未识别登录态（游客响应）`);
                     continue;
                 }
-                /* ── 判成功的唯一依据：EarnedCredits ─────────────────────────
-                   OfferComplete 在成功的响应里也可能是 false（实测见 _readReport 注释），
-                   拿它当判据会把已经加分的卡算成失败。真正说明「这次加了几分」的
-                   只有 EarnedCredits；ActivityComplete 也认，它表示这张卡这一轮算做完了。
-
-                   earned > 0                 → 确实记账了，成功
-                   ActivityComplete=true      → 卡被标记完成（可能之前已做过，不重复计数）
-                   两者都没有                 → 已受理待复核，交给面板回读 */
+                /* 判成功的唯一依据：EarnedCredits > 0 或 ActivityComplete=true。
+                   OfferComplete 在成功响应里也可能是 false，不能当判据。
+                   两者都没有 = 已受理待复核，交给面板回读。 */
                 if (r.earned > 0 || r.activityComplete === true) {
                     return { ok: true, via: v.name, points: r.earned, balance: r.balance };
                 }
@@ -7489,12 +7080,8 @@ const __scBgKeepAlive = (function() {
             /* 这里不校验 Token：面板走的是 bing.com 的登录 Cookie，
                而不是 prod.rewardsplatform 的 OAuth Token，没有 Token 也能做。 */
 
-            /* 逐个主机试，直到「面板可用 **且** 里面有这组卡」为止。
-               以前是「第一个能返回 JSON 的主机就停」：cn.bing.com 的面板可能只回
-               一小组常用推广位，ENstar_ 那几张国际版活动根本不在里面，
-               于是脚本认定「此账号没有这组活动」并封盘——
-               而 www.bing.com 的面板里其实是有卡的。这就是「有时能检测到、有时说没有」
-               在主机维度上的第二个来源。 */
+            /* 逐主机试，直到「面板可用且里面有这组卡」；只看第一个能返回 JSON
+               的主机会漏掉只在 www.bing.com 下发的卡。 */
             let panel = null;
             let lastPanel = null;
             let cards = [];
@@ -7575,11 +7162,8 @@ const __scBgKeepAlive = (function() {
                 if (last && last.ok) {
                     ok++;
                     doneIds.add(card.offerId);
-                    /* 这里**不能**写「已完成」：ok 只代表服务端受理了这一发请求，
-                       真正的记账与否要等面板回读（见下面的 readBack）。
-                       以前这里直接打「🟢 国际版卡片已完成 +5p」，用户看到 6 行
-                       「已完成」，实际只加了 20/35 分 —— 这就是「日志骗人」的来源。
-                       现在只说「已交卷」，完成与否一律等回读结论。 */
+                    /* ok 只代表「服务端受理了这一发」，记账与否等面板回读。
+                       以前直接打「已完成」，用户看到 6 行完成实际只加了 20 分。 */
                     Utils.log("📮", `国际版卡片已交卷（待服务端确认）：${name} 名义 +${card.points}p`);
                 } else if (last && last.outcome === "accepted") {
                     /* 服务端收了但没新增记账：通常这张卡今天已经做过，不吵 */
@@ -7611,20 +7195,12 @@ const __scBgKeepAlive = (function() {
                     + `（${String(failed[0].reason).split("；")[0]}）`);
             }
 
-            /* 最终判据：面板回读。
-               交卷响应「不是 JSON」时服务端也可能已经记账（尤其是被网关改写成
-               HTML 的情况下），所以这里以面板的 complete 标记为准，而不是响应体。
-
-               重要：服务端对 reportactivity 的入账是**异步**的，而且连打会被
-               短暂降速 —— 现象就是回了 ErrorCode=0 但 OfferComplete 还是 false，
-               过一会儿再看却是完成的。所以复核一次不够，要「复核 → 补做 → 再复核」。 */
+            /* 最终判据只认面板回读的 complete：服务端入账是异步的，响应非 JSON 时
+               也可能已记账，所以要「复核 → 补做 → 再复核」。 */
             let gained = 0;
             let confirmed = 0;
-            /* 「交卷被受理」和「服务端确认到账」是两件事，必须用两个集合分开记：
-                 doneIds       —— 本轮的发送状态（交给补做轮去重，别再打同一张）
-                 confirmedIds  —— 只有面板回读 complete=true 才会写进来，
-                                  对外结论（日志 / 通知 / 返回值）一律以它为准。
-               混用这两个就是「明明没到账却报全部完成」的根源。 */
+            /* doneIds=本轮发送状态（补做去重用）；confirmedIds=回读 complete=true。
+               对外结论一律以 confirmedIds 为准。 */
             const confirmedIds = new Set();
             const readBack = async () => {
                 let after = await this.fetchPanel(panel.host);
@@ -7652,12 +7228,7 @@ const __scBgKeepAlive = (function() {
                     const newlyAcked = first.cards.filter(c => c.complete
                         && todo.some(t => t.offerId === c.offerId)).length;
                     if (newlyAcked > 0) ok = Math.max(ok, newlyAcked);
-                    /* 回读后的**真实**战果，逐张说清楚。
-                       这是唯一能对外声明的结论：complete 是服务端给的，
-                       不是脚本猜的。区分三种情况，别再一律说「已完成」：
-                         ✅ 服务端确认 complete=true  → 真的拿到了
-                         ❌ 交卷受理但 complete 仍 false → 没拿到，说清楚
-                         ⏭️ 本轮没轮到（到点交班）      → 下一轮继续 */
+                    /* 逐张说清三种情况：确认到账 / 受理但未记账 / 本轮没轮到。 */
                     const acked = [];
                     const notAcked = [];
                     for (const card of todo) {
@@ -7717,12 +7288,8 @@ const __scBgKeepAlive = (function() {
                 }
             } catch (_) {}
 
-            /* ── 最终结论只看服务端 ────────────────────────────────────
-               以前 pending 是拿 doneIds 算的，而 doneIds 在「交卷被受理」那一刻
-               就已经写入 —— 于是无论服务端到底记没记账，pending 永远是 0，
-               日志永远打「全部完成」。这就是用户看到的「明明没做却显示已完成」。
-               现在 pending 只认 readBack 回读到的 complete=true（已写进 doneIds
-               的那些「受理即完成」的项要剔除），拿不到就如实说「无法确认」。 */
+            /* pending 只认回读到的 complete=true。以前拿 doneIds 算，
+               于是「受理即完成」，日志永远打「全部完成」。 */
             const pending = cards.filter(c => !confirmedIds.has(c.offerId)).length;
             const confirmedCount = cards.length - pending;
             /* 被 pickCards 过滤掉的卡（没 hash 等）也算「没做完」：
@@ -7834,13 +7401,8 @@ const __scBgKeepAlive = (function() {
             return /^\d+$/.test(t) ? t : "714";
         },
 
-        /* 把服务端 promo 里的「是否完成 / 已浏览分钟」抄进本地状态。
-           汇总只认它，不再拿本地 count 冒充进度（那只是「我发了几次上报」）。
-
-           ⚠️ 坑：这个 promotion 的 attributes 里还有积分字段（`max` / `value` 常常是 120 ——
-           那是这张卡给的**积分**，不是分钟）。早先的候选列表把 `attr.max` 也列进去，
-           于是把 120 当成分钟目标，汇总里出现「✅ 120/120 分钟」这种离谱数字。
-           分钟类字段只认名字里带 minute 的；`max/value/target` 一律不碰。 */
+        /* 把服务端 promo 的「是否完成 / 已浏览分钟」抄进本地，汇总只认它。
+           ⚠ attr.max/value 是积分不是分钟（常见 120），分钟字段只认名字带 minute 的。 */
         syncFromPromo(st, promo) {
             if (!promo) return st;
             const attr = promo.attributes || {};
@@ -7905,12 +7467,8 @@ const __scBgKeepAlive = (function() {
             if (st.complete && Date.now() - st.sync < 2 * 60 * 60 * 1000) {
                 return { done: true, count: st.count || totalOf(), total: totalOf(), waitMs: 30 * 60 * 1000 };
             }
-            /* 节拍判定：第 N 次上报必须等「锚点 + N 个计费窗口」真的过去。
-               以前条件是 `st.count > 0 && ...`，每天第一次进来 count 就是 0，
-               守卫直接失效 —— 脚本一启动立刻把第 1 个「5 分钟」拍上去，
-               而那一刻一分钟都还没浏览，服务端记的却是真实时长。
-               这里先按「已知的间隔」挡一下，避免每次心跳都去联网拉 profile。
-               （老状态升级时的锚点反推在 state() 里完成。） */
+            /* 第 N 次上报必须等「锚点 + N 个窗口」过去。旧条件 count > 0 &&
+               让每天第一次直接失效，启动就拍上第 1 个 5 分钟。 */
             {
                 const winMs = Math.max(1, st.intervalMin) * 60 * 1000;
                 const anchor = st.startAt || st.last;
@@ -7926,12 +7484,8 @@ const __scBgKeepAlive = (function() {
                     }
                 }
             }
-            /* 还没有锚点，且已经知道真实计费窗口（st.total > 0 = 之前跟服务端对过话）：
-               现在落锚点，第 1 次上报等满一个窗口。
-               如果连窗口都还不知道，就先别落，等下面拉到 profile 用真实间隔落，
-               否则会按默认 5 分钟计时，碰上 10 分钟的活动就会早报。
-               注意：次数已经攒满（count >= total）但服务端没确认时不走这里，
-               那是「等复核」而不是「重新开始」，进度不能报成 0。 */
+            /* 已有真实窗口才落锚点；窗口未知就先等 profile，免得按默认 5 分钟早报。
+               count 已满但服务端没确认 = 等复核，不是重新开始。 */
             if (!st.startAt && st.total > 0 && st.count < st.total) {
                 st.startAt = Date.now();
                 this.save(st);
@@ -8078,11 +7632,8 @@ const __scBgKeepAlive = (function() {
             };
         },
 
-        /* 只读刷新：拉一次 profile 把「是否完成 / 分钟进度」更新到本地，不上报、不激活。
-           存在的理由：EdgePacer 有节流（nextAt），一轮里可能压根没轮到 EdgeStreak.step()，
-           而汇总只在每轮结束读一次本地状态。于是「页面早就 30/30 了，
-           推送还说 ⏳ 0/30」——显示的是一天前甚至更早的陈旧值。
-           这里在汇总前补一次轻量回读，代价是一次 GET。 */
+        /* 只读刷新一次 profile，不上报不激活。EdgePacer 有节流，
+           不刷新汇总会显示很早以前的陈旧进度。 */
         async refreshFromServer() {
             if (!GM_getValue("Tasks.edge", true)) return null;
             if (!GM_getValue("Config.token", false)) return null;
@@ -8186,20 +7737,10 @@ const __scBgKeepAlive = (function() {
     const ROUND_BUDGET_MS = 20 * 60 * 1000;
 
     const SEARCH_PACER = {
-        /* 节拍口径：以 Config.span（默认 60 秒）为基准，每次在 ±JITTER_MS（±15 秒）
-           范围内随机取一个值，做完一次搜索后按「本次已用掉多少」补齐差额，
-           使「搜索→搜索」的间隔落在 span±15 秒。
-
-           两个下限是三件事，别混：
-             SPAN_MIN_MS  = 60 秒：用户能配的**基准**最低就是 60，配 30 也夹到 60；
-             JITTER_MS    = ±15 秒：基准两侧对称浮动，所以实际间隔可以到 45 秒；
-             浮动后的下限取 5 秒（只是防负数），不再有 60 秒地板。
-           也就是说：配 60 → 实际 45~75 秒；配 90 → 实际 75~105 秒。
-           基准不会低于 1 分钟，但单次间隔允许向下浮动到 45 秒 —— 这是
-           「不要下限、保留配置最低 60」的准确含义。
-           限流保护不靠拖慢，而是靠下面两条刹车：
-             NO_CREDIT_LIMIT（连续 10 分钟没记账就本轮收手）
-             MAX_ATTEMPTS（单轮最多尝试次数） */
+        /* 节拍：以 Config.span（默认 60 秒）为基准 ±15 秒浮动，按「本次已用掉多少」补齐，
+           使间隔落在 span±15 秒（配 60 → 45~75 秒）。
+           SPAN_MIN_MS=60 秒是基准下限，FLOOR_MS=5 秒只防负数。
+           限流保护靠两条刹车：NO_CREDIT_LIMIT（连续 10 分钟零记账收手）、MAX_ATTEMPTS。 */
         SPAN_MIN_MS: 60 * 1000,
         JITTER_MS: 15 * 1000,
         /* 浮动后的绝对下限：只用来挡住负数/0，不是「最慢不能低于 1 分钟」 */
@@ -8341,9 +7882,13 @@ const __scBgKeepAlive = (function() {
                 this.forceCleanupOwnRound("");
                 return false;
             }
+            /* runAlive 是「第几次心跳」的序号：别的上下文只有靠它变化才能证明
+               这一轮真的还活着 —— aliveAt 可能被一个已经死掉的上下文留在过去。 */
+            const runAlive = (Number(st.runAlive) || 0) + 1;
             GM_setValue("Config.runState", Object.assign({}, st, {
                 phase: "running",
                 aliveAt: now,
+                runAlive,
                 ctx: Sched.ctxName(),
                 since: this.runningSince
             }));
@@ -8356,12 +7901,8 @@ const __scBgKeepAlive = (function() {
             this.heartbeat();
             this.hbTimer = setInterval(() => {
                 try { this.heartbeat(); } catch (_) {}
-                /* Edge 连签也挂在这个心跳上：原本是常驻上下文每 20 秒带一次，
-                   现在只有「本轮在执行」期间才有心跳，正好只在运行时上报。
-                   EdgePacer 自己按服务端给的 intervalMin 节流（通常 5 分钟），
-                   所以一轮 20 分钟里会推进 3~4 次，而不是每轮一次。
-                   单个上下文内 EdgePacer.nextAt 是内存态，跨轮不共享，
-                   所以每轮醒来都会先尝试一次。 */
+                /* Edge 连签挂在轮内心跳上：只在「本轮执行」期间上报，
+                   EdgePacer 自按 intervalMin 节流，一轮 20 分钟推进 3~4 次。 */
                 try { EdgePacer.maybeReport().catch(() => {}); } catch (_) {}
             }, RUN_HEARTBEAT_GAP);
         },
@@ -8445,13 +7986,8 @@ const __scBgKeepAlive = (function() {
             soft("接口缓存", () => {
                 API._promoCache = null;
                 API._webCompleteCache = null;
-                /* cookie 头是登录态快照：把**缓存有效性**清掉，让下一次
-                   getCookieHeader() 真的重读一遍。
-                   但不要把它替换成空函数 —— 有很多请求（getRewardsInfo /
-                   交卷 / 国际版面板）并不先调 getCookieHeader，它们依赖
-                   Utils.xhr 自动补的这份快照。清成空 = 下一轮前半段全部裸奔，
-                   那会直接退化成「未登录」而静默不记账。
-                   保留旧值、只失效缓存，是最安全的做法。 */
+                /* 只失效 cookie 缓存、不把快照清空：很多请求依赖 Utils.xhr
+                   自动补的那份 cookie，清空会退化成「未登录」而静默不记账。 */
                 API._ckCache = "";
                 API._ckAt = 0;
             });
@@ -8853,13 +8389,8 @@ const __scBgKeepAlive = (function() {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
             }
-            /* 本轮 CDP 的结果先记下来：真正的「收标签页 + 封盘」放在整轮末尾做，
-               因为后面还有「首页待领取」等环节可能要借同一个页面通道。
-
-               判据要说清：能不能「今天不再开页」取决于「还有没有需要 CDP 的东西」。
-               pending 已经把「今天确定做不了（isUnoffered）」和「已交卷等手动点（isManualCard）」
-               排除掉了，那些不该让我们一直开着标签页；但 lockedNow（明确锁着的卡）
-               和 outOfTime（到点交班）说明还有活没干完，不能封盘。 */
+            /* 本轮的 CDP 结果先记着，收标签页与封盘放到整轮末尾做。
+               还有 lockedNow / outOfTime 就不能封盘。 */
             const stillNeedsCdp = outOfTime || lockedNow > 0 || pending > 0;
             CDP._promosClean = !stillNeedsCdp;
             if (stillNeedsCdp) {
@@ -8885,12 +8416,8 @@ const __scBgKeepAlive = (function() {
 
         async doSearch(roundDeadline) {
             if (!GM_getValue("Tasks.search", true)) return;
-            /* ── 开跑前先用「权威来源」校正一次进度 ──────────────────────
-               getRewardsInfo 优先解析 earn 页 HTML，可那个页面的 pointsCounters
-               未必刷新（实测日志里出现「记账 9/60」，而面板同时已是 60/60）。
-               拿着偏低的基数进循环，会让每一次 quota 回读都判成「刚涨了 N 分」，
-               于是既打出一串假的「记账成功」，又白白多发几十次搜索。
-               这里直接用 getPcQuota（面板优先）对一次，拿它当唯一基准。 */
+            /* 开跑前用 getPcQuota（面板优先）校正一次进度：earn 页 pointsCounters
+               可能没刷新，拿偏低基数会让每次回读都误判成「刚涨了」。 */
             let progress = 0, max = 0;
             const info = await API.getRewardsInfo();
             if (info) {
@@ -8998,11 +8525,8 @@ const __scBgKeepAlive = (function() {
                 }
                 await Utils.delay(Utils.randomRange(SEARCH_PACER.OBSERVE_MIN, SEARCH_PACER.OBSERVE_MAX));
 
-                /* ── 记账核对 ──────────────────────────────────────────────
-                   只认「服务端计数器真的涨了」。以前这里有个坑：读不到配额时
-                   代码会凭空 progress += 3 做「乐观估计」，那时打出的「记账成功」
-                   是假的，还会让下一轮的 before 值偏高，真涨了也判成没涨。
-                   现在 quota 读不到就如实算一次核对失败，绝不虚改进度。 */
+                /* 只认「服务端计数器真的涨了」。读不到配额就如实算核对失败，
+                   绝不 progress += 3 做乐观估计。 */
                 const before = progress;
                 let quota = await API.getPcQuota();
                 if (quota && quota.progress <= before) {
@@ -9028,16 +8552,9 @@ const __scBgKeepAlive = (function() {
                         Utils.log("🟡", `本次未记账（${progress}/${max}，连续 ${sinceCredit} 次；再 ${Math.max(0, left)} 分钟没进展就本轮收手）`);
                     }
                 } else {
-                    /* ── 兜底：PC 计数器整条通道都读不到时的第二判据 ──────────
-                       注意这里**不碰手机配额**：手机搜索是另一条独立进度，
-                       拿 mobileSearch 当 PC 的基准，会把「PC 没加分」误判成「加了」，
-                       也会把真实的 PC 加分算到手机头上 —— 比读不到更糟。
-
-                       能用的独立证据只有「全站总积分有没有涨」：一次有效搜索
-                       至少 +1 分，余额涨了就说明这次确实计入到账号上了。
-                       缺点也说清楚：它分不清是哪条任务加的分（阅读/活动也会动余额），
-                       所以只用来证明「这次上报不是纯空转」，不用来推 PC 进度 ——
-                       progress 依旧不动，等下一轮拿到真配额再校正。 */
+                    /* 兜底判据：不碰手机配额（会把 PC 没加分误判成加了）。
+                       只用「总积分有没有涨」证明这次不是纯空转，不用它推 PC 进度 ——
+                       progress 不动，等下一轮真配额校正。 */
                     const balNow = await API.getBalance();
                     const gained = (balNow > 0 && lastBalance > 0) ? (balNow - lastBalance) : 0;
                     if (balNow > 0) lastBalance = balNow;
@@ -9059,11 +8576,7 @@ const __scBgKeepAlive = (function() {
 
                 const noCreditMs = Date.now() - lastCreditAt;
 
-                /* ── 刹车一：连续未记账太多，立刻收手 ──────────────────────
-                   以前要「10 分钟」和「8 次」同时满足才停，于是常见的是：
-                   34 次尝试全打了水漂，还要空转到上限才退出，下一轮再重复，
-                   用户看到的就是「一直卡在 9/60」。现在加一条更早的判据：
-                   连续 STREAK_STOP 次零记账就停，不必等到时间窗口。 */
+                /* 刹车一：连续 STREAK_STOP 次零记账就停，不必等满 10 分钟。 */
                 if (streakNoCredit >= SEARCH_PACER.STREAK_STOP && attempts >= SEARCH_PACER.MIN_ATTEMPTS_BEFORE_GIVEUP) {
                     Utils.log("🟡", `连续 ${streakNoCredit} 次搜索都没有记账（本轮 ${attempts} 次，${progress}/${max}），`
                         + `判定当前通道不记账，本轮提前收手，交给冷却后重试`);
@@ -9349,12 +8862,8 @@ const __scBgKeepAlive = (function() {
                 Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
                 return true;
             }
-            /* 上一轮「面板里还没有卡」不代表今天就没有了：这组活动是必应面板
-               边栏里的推广位，服务端按账号/时段陆续下发，早上面板空、下午才出现
-               是常态。以前这里把「本轮 found=0」当成「今天没有这组活动」直接封盘，
-               于是日志显示「此账号由于地区/账号不支持，跳过」，当天再也不看——
-               现象就是「有时候能检测到、有时候又说没有」。
-               现在 found=0 的记录只在当天有效很短时间：下次跑还会重新拉面板。 */
+            /* 「本轮面板没卡」≠「今天没有这组活动」：推广位是陆续下发的。
+               found=0 只当短时结论，过一会儿重新拉面板。 */
             if (st && Number(st.date) === today && Number(st.found) === 0) {
                 const stamped = Number(st.at) || 0;
                 const waited = Date.now() - stamped;
@@ -9496,10 +9005,17 @@ const __scBgKeepAlive = (function() {
             if (Sched.isBusy()) {
                 const st = Sched.getState() || {};
                 const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0);
-                Utils.log("🟡", `上一轮（${st.ctx || "未知"}）还在执行中（最后活动 ${Math.round((Date.now() - lastAct) / 1000)} 秒前），本次触发跳过`);
-                return;
+                /* 手动触发（force）：先实测那一轮是不是还活着。
+                   死掉的上下文会留下「看起来还新」的时间戳，只看时间戳会让手动运行永远点不动。 */
+                const alive = force ? await Sched.probeOwnerAlive().catch(() => true) : true;
+                if (alive) {
+                    Utils.log("🟡", `上一轮（${st.ctx || "未知"}）还在执行中（最后活动 ${Math.round((Date.now() - lastAct) / 1000)} 秒前），本次触发跳过`);
+                    return;
+                }
+                Utils.log("♻️", "上一轮的上下文已经不在（心跳没再涨），清理残留后继续");
+                Sched.resetRoundState("");
             }
-            Utils.log("▶️", `本轮进入执行流程（${Utils.hasDOM() ? "页面" : "后台"}上下文）`);
+            Utils.log("▶️", `本轮进入执行流程（${Utils.isBackground() ? "后台" : "页面"}上下文）`);
             this.abortRound = false;
             /* 运行时段是最后一道闸门，必须放在 runAll 里而不是只放在 init：
                只要有一个调用方忘了先判窗口，任务就会在深夜照跑。
@@ -9521,11 +9037,8 @@ const __scBgKeepAlive = (function() {
             this.running = true;
             this.runningSince = Date.now();
             this.lastRunStarted = true;
-            /* 每轮开跑时把「实际生效的运行时段」写进日志：
-               面板里填了什么、脚本真正解析成了什么、此刻在不在窗口内，一次看全。
-               以前时段相关的困扰（填了 10 点却像 9 点就跑）只能靠翻代码猜，
-               有了这一行就能直接判断是「没保存成功」「解析失败退回默认」
-               还是「根本没走调度、被手动触发绕过」。 */
+            /* 每轮把「面板填的时段 / 实际解析出的时段 / 此刻在不在窗口」打一行，
+               排查时段问题不用再翻代码。 */
             try {
                 const wc = Sched.winCfg();
                 const rawWin = GM_getValue("Config.winTime", null);
@@ -9707,13 +9220,8 @@ const __scBgKeepAlive = (function() {
                 const info = await API.getRewardsInfo();
                 if (info) {
                     const today = RewardsAuto.state.dateNowNum;
-                    /* 阅读进度取值要小心 0：
-                       `info.readProgress ?? state.readProgress` 这种写法里，0 不是 nullish，
-                       所以服务端某次回读到 0（活动翻页/回读抖动/查询失败被当成 0）
-                       会直接盖掉本轮已经确认过的 30/30 —— 于是出现
-                       「日志明明写了阅读进度已满 30/30，摘要却显示 0/30」。
-                       凡是本轮已确认完成（readDate===today），显示就以满进度为准，
-                       因为那个标记只有在服务端回读 >= max 时才会写。 */
+                    /* 0 不是 nullish：回读到 0 会盖掉已确认的 30/30。
+                       本轮已确认完成就以满进度为准。 */
                     const readDone = this.readDate === today;
                     let readProg = Number(info.readProgress);
                     if (!Number.isFinite(readProg)) readProg = Number(RewardsAuto.state.readProgress) || 0;
@@ -10089,53 +9597,64 @@ const __scBgKeepAlive = (function() {
         return text;
     };
 
-    GM_registerMenuCommand("🚀 立即运行", () => {
-        Utils.log("🚀", "手动触发：立即运行一轮");
-        /* 手动触发前先把卡死的记录收掉：否则用户点一次还是只会看到
-           「上一轮任务还在执行中」，那正是这次要修的现象。 */
-        const reaped = Sched.reapDeadRound();
-        if (!reaped && Sched.isBusy()) {
+    /* 手动运行：**不受运行时段限制**，也不要求正好在 cron 唤醒点上。
+       它唯一该被挡住的情况是「真的有一轮在跑」，否则会和那一轮并发上报。
+       所以这里不能只看 isBusy() 的时间戳 —— 时间戳可能是死掉的上下文留下的，
+       必须实测一次（probeOwnerAlive）再决定。 */
+    GM_registerMenuCommand("🚀 立即运行（不受时段限制）", async () => {
+        Utils.log("🚀", "手动触发：立即运行一轮（忽略运行时段与 cron 节拍）");
+        const now = Date.now();
+        try { Sched.reapDeadRound(now); } catch (_) {}
+
+        /* ① 记录里说有一轮在跑 → 实测它的心跳还在不在 */
+        if (Sched.isBusy(now)) {
             const st = Sched.getState() || {};
-            Utils.log("🟡", `上一轮任务还在执行中（${st.ctx || "未知"}，最后活动 ${Sched.fmt(st.at)}），请等它跑完或先用「🔓 释放运行锁」`);
-            return;
+            const lastAct = Math.max(Number(st.at) || 0, Number(st.aliveAt) || 0);
+            const alive = await Sched.probeOwnerAlive().catch(() => false);
+            if (alive) {
+                Utils.log("🟡", `上一轮确实还在执行中（${st.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前），等它跑完再点`);
+                return;
+            }
+            Utils.log("♻️", "上一轮的上下文已经不在了（心跳没再涨），清掉残留状态后开始");
+            Sched.resetRoundState("");
         }
+
+        /* ② 同一上下文里还有一轮在跑（极少见）：只看它是不是卡死 */
         if (TaskManager.running) {
-            Utils.log("🟡", "当前上下文已有一轮在跑，本次手动触发跳过");
-            return;
+            if (now - (TaskManager.runningSince || now) < RUN_STALE) {
+                Utils.log("🟡", "当前上下文已有一轮在跑，本次手动触发跳过");
+                return;
+            }
+            Utils.log("♻️", "当前上下文的运行标记已过期，清理后继续");
+            try { TaskManager.forceCleanupOwnRound(""); } catch (_) {}
         }
+
+        /* ③ 清掉可能残留的运行锁与认领，别让手动触发被它挡回去 */
+        try { Sched.clearClaim(); } catch (_) {}
+        const lock = Utils.lockInfo("Config.runLock");
+        if (lock && !lock.mine) {
+            try { GM_setValue("Config.runLock", null); } catch (_) {}
+            Utils.log("♻️", `已清理残留的运行锁（${Sched.fmt(lock.ts)}），手动运行继续`);
+        }
+
         Promise.resolve()
             .then(() => TaskManager.runAll({ force: true }))
             .catch(e => Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`))
             /* runAll 因为拿不到锁而直接返回时 lastRunStarted 仍是 false：
-               用它区分「真的跑了一轮」和「没跑起来」，后者 2 分钟后就重试。 */
+               用它区分「真的跑了一轮」和「没跑起来」。 */
             .finally(() => Sched.finish(true, TaskManager.lastRunStarted));
     });
 
-    const diagReleaseLock = () => {
-        try { Utils.releaseLock("Config.runLock"); } catch (_) {}
-        try { GM_setValue("Config.runLock", null); } catch (_) {}
-        try { Sched.clearClaim(); } catch (_) {}
-        GM_setValue("Config.runState", null);
-        try { TaskManager.stopHeartbeat(); } catch (_) {}
-        TaskManager.running = false;
-        TaskManager.runningSince = 0;
-        TaskManager.abortRound = false;
-        Utils.log("🔓", "已强制释放运行锁并清理运行状态，下一轮可正常触发");
-    };
-
-
-    const SOFT_RESET_KEYS = [
-        /* ── 运行状态 / 锁 / 调度 ── */
+    /* ── 运行痕迹 vs 今日进度，必须分开清 ──
+       运行痕迹（锁、认领、排期、变体缓存、节流计数）：跨轮没有保留价值，
+       定时模式下一轮的唤醒本来就该从干净状态开始，所以运行时段结束后自动清掉。
+       今日进度（tasks / doneDate / edge / monthly / intl）：必须留到下一天，
+       清了会让脚本把已经做完的任务再做一遍。 */
+    const RUNTIME_KEYS = [
         "Config.runState", "Config.runLock", "Config.cronClaim",
-        "Config.cronLastRun", "Config.cronNextRun", "Config.heartbeatAt",
-        /* ── 今日任务进度（tasks 里含 signDate/readDate/promosDate/searchDate） ── */
-        "Config.tasks", "Config.signPoint",
-        "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
-        "Config.edge", "Config.monthlyState", "Config.intlDailyDate",
-        /* ── 搜索相关的运行痕迹（配置项的 span 不动） ── */
+        "Config.heartbeatAt", "Config.idleWakeLogAt", "Config.windowOpenAt",
         "Config.searchGap", "Config.searchLast", "Config.searchPending",
-        "Config.searchGuard", "Config.restrictedTimes", "Config.lastSearchProgress",
-        /* ── 探测/协商缓存：下次自动重新协商，不影响授权 ── */
+        "Config.restrictedTimes", "Config.lastSearchProgress", "Config.searchAutoReset",
         "Config.dpl", "Config.actionDpl", "Config.nextAction", "Config.nextActionScanAt",
         "Config.claimVariant", "Config.questVariant", "Config.uaEdge",
         "Config.cookieProbed", "Config.cookieDenied",
@@ -10143,42 +9662,27 @@ const __scBgKeepAlive = (function() {
         "Config.tokenLock", "Config.edgeLock",
     ];
 
-    /* 授权键：只读出来核对，永不写入。重置后用于自检是否真的没动授权。 */
-    const AUTH_KEYS = [
-        "Config.code", "Config.codeUsed", "Config.codeFingerprint", "Config.codeTime",
-        "Config.token", "Config.tokenTime", "Config.accessToken", "Config.accessTokenTime",
+    /* 冷却自动恢复时才清：它要连今日进度一起重置，否则当天不会重新尝试 */
+    const DAILY_KEYS = [
+        "Config.tasks", "Config.signPoint",
+        "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
+        "Config.edge", "Config.monthlyState", "Config.intlDailyDate",
+        "Config.searchGuard",
     ];
 
-    /* 只读快照：用来对比重置前后，确认授权/配置真的没变 */
-    const snapshotKeys = (keys) => {
-        const out = {};
-        keys.forEach(k => { out[k] = GM_getValue(k, null); });
-        return out;
-    };
-
-    const authFingerprint = () => {
-        const st = snapshotKeys(AUTH_KEYS);
-        /* 只看「有没有授权、token 是否还在」，不输出 token 本身 */
-        return {
-            hasCode: !!st["Config.code"],
-            hasToken: !!st["Config.token"],
-            tokenTime: Number(st["Config.tokenTime"] || 0) || 0,
-            codeUsed: !!st["Config.codeUsed"],
-        };
-    };
-
-    const doSoftReset = (opts = {}) => {
-        const before = authFingerprint();
-        /* 先把要清的键里「本来就存在的」记下来，报告时能说清清了什么 */
-        const cleared = SOFT_RESET_KEYS.filter(k => GM_getValue(k, null) !== null);
-        /* 用 GM_deleteValue 而非写 null：写 null 会让「键存在但值为空」，
-           GM_getValue 的默认值只在键不存在时才生效，于是下游读到 null 就崩
-           delete 之后键真的消失，默认值全部恢复正常。 */
-        SOFT_RESET_KEYS.forEach(k => {
+    const clearKeys = (keys) => {
+        const cleared = keys.filter(k => GM_getValue(k, null) !== null);
+        /* 用 delete 而不是写 null：写 null 会让「键存在但值为空」，
+           GM_getValue 的默认值只在键不存在时才生效。 */
+        keys.forEach(k => {
             try { GM_deleteValue(k); } catch (_) { try { GM_setValue(k, undefined); } catch (_) {} }
         });
+        return cleared;
+    };
+
+    const resetMemoryState = () => {
         try {
-            TaskManager.init();                    // 任务标记全部归零
+            TaskManager.init();
             TaskManager.running = false;
             TaskManager.runningSince = 0;
             TaskManager.abortRound = false;
@@ -10192,44 +9696,25 @@ const __scBgKeepAlive = (function() {
             RewardsAuto.state.pcProgress = 0;
         } catch (_) {}
         try { Sched.clearClaim(); } catch (_) {}
-
-        const after = authFingerprint();
-        const authIntact = before.hasCode === after.hasCode
-            && before.hasToken === after.hasToken
-            && before.tokenTime === after.tokenTime
-            && before.codeUsed === after.codeUsed;
-
-        Utils.log("🧹", `重置完成：清理 ${cleared.length} 项运行状态，授权${authIntact ? "完整保留 ✅" : "状态异常 ⚠️"}`);
-        if (!authIntact) {
-            Utils.log("🔴", "重置后发现授权状态有变化，请用「📊 Token状态」确认；如已失效请重新「🔑 手动授权」");
-        }
-
-        /* 定时模式：重置后把「下一轮时间」直接置为现在，下一次定时唤醒就会开跑。
-           这里不再起任何计时器（没有常驻上下文可醒）。 */
-        if (opts.rearm !== false) {
-            try {
-                if (typeof Sched !== "undefined") Sched.rearmNow(0);
-            } catch (_) {}
-        }
-        return { cleared, authIntact, before, after };
     };
 
-    GM_registerMenuCommand("🧹 重置(任务卡住时尝试)", () => {
-        const au = authFingerprint();
-        const msg = "将把「运行状态 / 今日进度 / 节流记录」清成刚装脚本的样子。\n\n"
-            + "✅ 会保留：授权码与 Token（不用重新授权）、所有配置项、任务开关、通知设置\n"
-            + "⚠️ 会清除：今日已完成标记、搜索冷却与限流计数、运行锁、调度计划、各类变体缓存\n\n"
-            + `当前授权：${au.hasToken ? "Token 有效" : "无 Token"}${au.hasCode ? " / 已存授权码" : ""}\n\n`
-            + "继续吗？";
-        if (!Utils.uiConfirm(msg)) {
-            Utils.log("🧹", "重置已取消");
-            return;
+    /* 只清运行痕迹：运行时段结束时自动调用，不动今日进度 */
+    const clearRuntimeCaches = (reason) => {
+        const cleared = clearKeys(RUNTIME_KEYS);
+        resetMemoryState();
+        if (cleared.length > 0) {
+            Utils.log("🧹", `${reason || "运行结束"}：已清理 ${cleared.length} 项运行缓存（今日进度保留）`);
         }
-        const r = doSoftReset();
-        Utils.uiAlert(`🧹 重置完成\n\n清理了 ${r.cleared.length} 项运行状态\n`
-            + `授权：${r.authIntact ? "✅ 完整保留，无需重新授权" : "⚠️ 有变化，请检查 Token状态"}\n\n`
-            + "下一轮会自动开始（已按新的随机间隔排程）。");
-    });
+        return cleared;
+    };
+
+    /* 连今日进度一起清：只在搜索冷却到期的自动恢复里用 */
+    const doSoftReset = () => {
+        const cleared = clearKeys(RUNTIME_KEYS).concat(clearKeys(DAILY_KEYS));
+        resetMemoryState();
+        Utils.log("🧹", `重置完成：清理 ${cleared.length} 项运行状态与今日进度`);
+        return { cleared };
+    };
 
     GM_registerMenuCommand("🔔 配置通知接口", async () => {
         const configNames = [
@@ -10335,23 +9820,34 @@ const __scBgKeepAlive = (function() {
         return text;
     };
 
-    /* ══ 定时（cron）模式 ══════════════════════════════════════════
-       @crontab 写在脚本头：每 20 分钟唤醒一次，全天 0-23 点。
-         · 一次唤醒 = 一轮，没有「叫醒了再判断到没到点」的第二层判断；
-         · 每轮开跑前随机等 0~5 分钟，起跑时刻自然错开，不落在整点；
-         · cron 里不能写 9-23 时段 —— 那是写死在元数据里的，
-           面板改运行时段后对不上。所以 cron 全天唤醒，由脚本按
-           Config.winTime 判断「现在是不是允许跑」，时段外立刻退出。
-       浏览器关掉时 cron 不会触发，这是浏览器的限制，不是脚本能改的。 */
+    /* ══ 定时（cron）模式 ══
+       @crontab 每 20 分钟唤醒一次，全天 0-23 点：一次唤醒 = 一轮，开跑前随机等 0~5 分钟。
+       cron 不能写 9-23 时段（写死在元数据里，面板改了就错位），由脚本按 Config.winTime 判断。
+       浏览器关闭时不会触发。 */
     const CRON_WAKE_MS = 20 * 60 * 1000;
     const CRON_PERIOD = 20 * 60 * 1000;
-    /* 开跑前的随机等待上限：0~5 分钟。
-       ⚠ 注意它的作用：只是把「起跑时刻」在 20 分钟这个槽里往后挪，
-       两次开跑的间隔仍然是 20 分钟（cron 每 20 分钟叫醒一次）。
-       想要「20、22、24 分钟」这种间隔差，cron 必须比 20 分钟更密
-       （例如每 5 分钟一次），再用 Config.cronNextRun 做二次判断 —— 代价是空唤醒。 */
+    /* 开跑前随机等 0~5 分钟：只把起跑时刻在 20 分钟槽内后移，
+       两次开跑的间隔仍是 20 分钟（cron 每 20 分钟唤醒一次）。 */
     const CRON_JITTER = 5 * 60 * 1000;
     const CRON_FIRST_DELAY = 5 * 1000;
+    /* 「脚本没在跑」的判据：cron 每 20 分钟唤醒一次，每次唤醒开头都会写
+       Config.heartbeatAt。所以两次唤醒间隔超过 30 分钟，说明中间至少漏了一次 ——
+       也就是脚本被停用 / 浏览器关过 / 系统休眠。这时清运行痕迹，从头开始。 */
+    const RESUME_GAP = 30 * 60 * 1000;
+    /* @crontab 每 20 分钟一次，正常唤醒只会落在 :00 / :20 / :40 这几分钟上。
+       落在其它分钟 = 不是 cron 叫醒的，而是「脚本刚被启用 / 重新加载」时
+       立刻跑了一次 —— 这种情况同样要清运行痕迹，否则停用前那一轮的锁会挡住。
+       容忍 3 分钟：浏览器对后台定时器不保证秒级精度。 */
+    const WAKE_GRID_MIN = 20;
+    /* 容忍 2 分钟：后台定时器会有轻微延迟，但延迟到 3 分钟以上很罕见；
+       就算误判成「新会话」，代价也只是多重置一次运行缓存（今日进度不动）。 */
+    const WAKE_GRID_TOLERANCE_MIN = 2;
+    /* 判定「上一轮的执行上下文已经死了」：它每 20 秒刷一次 aliveAt，
+       超过这个时间没刷就说明上下文被销毁了（停用脚本 / 页面回收）。 */
+    const RUN_HEARTBEAT_STALE = 90 * 1000;
+    /* 「值刚被写过」的窗口。定时模式下 heartbeatAt 只在一轮开始时写一次，
+       所以它落在最近 90 秒内 = 这不是自然到来的定时唤醒，而是脚本刚被启用/重载 */
+    const FRESH_STAMP_MS = 90 * 1000;
     const CRON_STALL = 3 * 60 * 1000;
     /* 「心跳」判据：真正在跑的上下文每 20 秒刷一次 aliveAt。
        超过 RUN_STALE 两个时间都没动，就判定它已经死了。
@@ -10365,25 +9861,16 @@ const __scBgKeepAlive = (function() {
        中断后最多这么久就会被下一个上下文抢走，不再永久占位。 */
     const RUN_LOCK_TTL = 6 * 60 * 1000;
     const RUN_HEARTBEAT_GAP = 20 * 1000;
-    /* 「活着但不动」判据：上下文还在心跳，可任务已经这么久没有任何推进，
-       说明卡在某个永不 settle 的 await 上（典型是 MV3 后台被杀后
-       GM_xmlhttpRequest 的回调永远不会来）。这种情况不能再等，
-       否则就是用户看到的「一直卡着，重启浏览器也没用」。
-       取 15 分钟：单张卡最长要约 8 分钟，正常长任务不会被误伤。 */
+    /* 「活着但不动」判据：15 分钟没进展就强制收尾
+       （单张卡最长约 8 分钟，不会误伤正常长任务）。 */
     const ROUND_STALL = 15 * 60 * 1000;
     /* 单轮硬上限：预算 20 分钟 + 收尾阶段（连签/领奖/Edge），
        留 20 分钟余量，到点无论卡在哪都由心跳强制收尾。 */
     const ROUND_HARD_LIMIT = ROUND_BUDGET_MS + 20 * 60 * 1000;
 
-    /* ══ 每日运行窗口 ═══════════════════════════════════════════════
-       为什么要窗口：0 点刚过就开跑、或者整夜每隔 20 分钟跑一轮，在风控看来
-       就是脚本 —— 真人不会凌晨三点准时做任务。所以把运行时段收在
-       Config.winStart ~ Config.winEnd（默认 09:00~23:00），窗口之外只保留
-       心跳，不再开新的一轮。
-
-       开始时刻就是配置的整点（如 9 点），不做随机推后：要「同一天恒等」
-       才不会让计划漂移，而那种确定性随机反而让用户无法预期到底几点开始。
-       想避免「整点太像脚本」，交给每轮的随机延长（脚本内部固定 10 分钟）即可。 */
+    /* ══ 每日运行窗口 ══
+       默认 09:00~23:00（Config.winTime），窗口外只保留定时唤醒，不开新的一轮。
+       开始时刻不做随机推后（同一天恒等，计划才不漂移）。 */
     const WINDOW = {
         TIME_DEFAULT: "09:00-23:00",
         START_DEFAULT: 9,     // 仅用于兼容旧版 Config.winStart
@@ -10415,9 +9902,8 @@ const __scBgKeepAlive = (function() {
                 const last = this.lastRun();
                 ts = last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
             }
-            /* plan() 只读不写，同一份配置下返回值恒定 —— 定时模式下每次唤醒都会读它，
-               一旦这里写入任何东西，「还没到点」的判断就会被自己改掉。
-               下次时间由 finish()（一轮跑完之后）或 rearmNow()（重置/手动）负责写。 */
+            /* plan() 只读不写：同一份配置下返回值恒定，定时模式下每次唤醒都会读它。
+               下次时间只由 finish()（一轮跑完）负责写。 */
             /* 落在运行时段之外就顺延到下一个窗口起点：窗口外绝不开新的一轮。
                alignToWindow 只依赖日期和配置，同一天算出来的值恒定，多次调用不漂移。 */
             return this.alignToWindow(ts);
@@ -10430,11 +9916,8 @@ const __scBgKeepAlive = (function() {
             return d.getTime();
         },
 
-        /* 解析 "开始-结束" 形式的时段文本，返回 { startMin, endMin }（分钟数），
-           解析不了返回 null。宽容一点，用户常见的写法都要认：
-             "09:00-23:00"  "9:00-23:00"  "9-23"  "09:00~23:00"
-             "09:00至23:00"  "09：00－23：00"（全角冒号/破折号）
-           24:00 允许作为结束时刻（表示当天末尾）。 */
+        /* 解析 "开始-结束" 时段，宽容全角/连接符/省略分钟；解析不了返回 null。
+           24:00 表示当天末尾。 */
         parseWinTime(raw) {
             const s = String(raw == null ? "" : raw)
                 .replace(/[：]/g, ":")            // 全角冒号
@@ -10525,31 +10008,12 @@ const __scBgKeepAlive = (function() {
             }
             return t;
         },
-        /* 随机延长上限（毫秒）。固定在脚本内部，不再暴露成用户配置 ——
-           这个值调大调小对结果没什么意义，让用户填反而增加困惑。 */
-        jitterMs() { return CRON_JITTER; },
 
-        /* 摇一次本轮的随机延长量，只在下单时调用（不能放进 plan） */
-        rollJitter() {
-            const span = this.jitterMs();
-            if (span <= 0) return 0;
-            /* 取整到秒，日志里的时间点更好读 */
-            return Math.round((Math.random() * span) / 1000) * 1000;
-        },
-
-        /* 排下一轮：基准 20 分钟 + 本次随机延长，写死到 Config.cronNextRun */
-        scheduleNext(fromMs, extraMs = 0) {
-            const base = Number(fromMs) || Date.now();
-            const jitter = this.rollJitter();
-            const ts = base + CRON_PERIOD + jitter + (Number(extraMs) || 0);
-            this.saveNext(ts);
-            return { ts, jitter };
-        },
 
         saveNext(ts) { GM_setValue("Config.cronNextRun", ts); },
 
 
-        ctxName() { return Utils.hasDOM() ? "页面" : "后台"; },
+        ctxName() { return Utils.isBackground() ? "后台" : "页面"; },
 
         getClaim() {
             const c = GM_getValue("Config.cronClaim", null);
@@ -10580,11 +10044,7 @@ const __scBgKeepAlive = (function() {
         isBusy(now = Date.now()) {
             const s = this.getState();
             if (!s || s.phase !== "running") return false;
-            /* 存活判据取两个时间的较大者：
-               at       = 最后一次「任务真的有推进」
-               aliveAt  = 最后一次心跳（证明上下文没被冻结）
-               两个都停了才算死。只卡在一个 await 上时 aliveAt 还在走，
-               说明上下文活着，不该被新的一轮插进来并发。 */
+            /* 存活判据取 max(at, aliveAt)：两个都停了才算死。 */
             const last = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
             return now - last < RUN_STALE;
         },
@@ -10621,6 +10081,33 @@ const __scBgKeepAlive = (function() {
             }
         },
 
+        /* 这次唤醒是不是落在 cron 刻度上。
+           落不在 = 不是定时叫醒的（脚本刚启用 / 被重新加载），按「新会话」处理。 */
+        wakeIsOffGrid(now = Date.now()) {
+            const d = new Date(now);
+            const m = d.getMinutes() % WAKE_GRID_MIN;
+            const dist = Math.min(m, WAKE_GRID_MIN - m);
+            return dist > WAKE_GRID_TOLERANCE_MIN;
+        },
+
+        /* 上一次的 running 记录还挂着，但它的心跳早就停了 → 上下文已死 */
+        deadOwner(now = Date.now()) {
+            const s = this.getState();
+            if (!s || s.phase !== "running") return false;
+            const last = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
+            return last > 0 && (now - last) > RUN_HEARTBEAT_STALE;
+        },
+
+        /* 实测一次「记录里那一轮还活着吗」：等两个心跳周期，看 runAlive 有没有涨。
+           活着 → 让路；没涨 → 那个上下文已经没了（停用脚本 / 标签页被回收），
+           记录作废，本次直接开跑。比只看时间戳可靠：时间戳可能是几秒前刚写的。 */
+        async probeOwnerAlive() {
+            const before = Number((this.getState() || {}).runAlive) || 0;
+            await Utils.delay(RUN_HEARTBEAT_GAP * 2 + 2000);
+            const after = Number((this.getState() || {}).runAlive) || 0;
+            return after > before;
+        },
+
         /* 本次浏览器会话的标识：后台上下文每次唤醒都会重新执行脚本，
            但同一次浏览器启动内 performance.timeOrigin 固定，重启后才会变。 */
         bootId() {
@@ -10631,16 +10118,22 @@ const __scBgKeepAlive = (function() {
             return 0;
         },
 
-        /* 浏览器重启 / 长时间关机后，把上一段会话留下的运行痕迹清掉：
-           运行锁、认领、running 标记、旧排期。不清的话新一轮会被
-           「上一轮还在执行中」挡住，也就是「抢轮次」。 */
+        /* 新的浏览器会话（重启 / 脚本被停用后又启用 / 长时间关机）：
+           把上一段会话的全部运行痕迹清掉 —— 锁、认领、running 标记、旧排期、
+           变体缓存、节流计数。不清的话新一轮会被「上一轮还在执行中」挡住（抢轮次）。
+           ⚠ 脚本被「停用」的那一刻没有任何代码会执行，所以清不掉；
+           清理一定发生在下一次唤醒的最开始，效果等价于「启用后从干净状态开始」。
+           今日进度（tasks / doneDate / edge / monthly / intl）不清，清了会重复做任务。 */
         resetRoundState(reason) {
+            let cleared = [];
+            try { cleared = clearKeys(RUNTIME_KEYS); } catch (_) {}
             try { this.clearClaim(); } catch (_) {}
             try { GM_setValue("Config.runLock", null); } catch (_) {}
             try { GM_setValue("Config.runState", null); } catch (_) {}
             try { GM_setValue("Config.cronNextRun", 0); } catch (_) {}
-            try { GM_setValue("Config.idleWakeLogAt", 0); } catch (_) {}
-            if (reason) Utils.log("♻️", reason);
+            if (reason) {
+                Utils.log("♻️", reason + (cleared.length ? `（已清理 ${cleared.length} 项运行缓存）` : ""));
+            }
         },
 
         /* ══ 定时模式唯一入口 ══════════════════════════════════════════
@@ -10652,32 +10145,75 @@ const __scBgKeepAlive = (function() {
             this.task = task;
             const now = this.startedAt;
 
-            /* ① 换了一次开机：清掉上一段会话的锁与排期，从头开始 */
+            /* ① 判断「上一段会话是不是还在」：浏览器重启 / 脚本停用过 / 睡了很久
+               都会在这里被认出来，然后把运行痕迹全部清掉，本轮从头开始。
+               ⚠ 脚本被停用的那一刻不会有任何代码执行（环境直接销毁），
+               所以清理只能发生在下一次唤醒的最开头 —— 效果是「启用后第一次跑就是干净的」。 */
             const boot = this.bootId();
             const prevBoot = Number(GM_getValue("Config.bootId", 0)) || 0;
             const prevAt = Math.max(Number(GM_getValue("Config.heartbeatAt", 0)) || 0, this.lastRun());
-            const offlineLong = prevAt > 0 && (now - prevAt) > 45 * 60 * 1000;
+            const gapMs = prevAt > 0 ? (now - prevAt) : 0;
+            const offlineLong = gapMs > RESUME_GAP;
             const bootChanged = boot > 0 && prevBoot > 0 && boot !== prevBoot;
-            if (bootChanged || offlineLong) {
-                this.resetRoundState("检测到新的浏览器会话（"
-                    + (bootChanged ? "浏览器重启过" : "离开超过 45 分钟")
-                    + "），已清除上一轮的运行锁与排期，本轮从头开始");
+            /* 不是 cron 叫醒的：脚本刚被启用、或被重新加载，等价于新会话 */
+            const offGrid = this.wakeIsOffGrid(now);
+            /* 上一轮还挂着 running，但它的心跳早就停了：那个上下文已经没了 */
+            const ownerDead = this.deadOwner(now);
+            /* 同一个上下文里 heartbeatAt 只在一轮开始时写一次，间隔必然 = cron 周期。
+               所以「值离现在不到 90 秒」只可能是刚刚重新加载过脚本（停用→启用），
+               这条判据跟落在哪一分钟无关，补上 offGrid 在刻度上识别不到的缺口。 */
+            const justLoaded = prevAt > 0 && gapMs < FRESH_STAMP_MS;
+            if (bootChanged || offlineLong || offGrid || ownerDead || justLoaded) {
+                let why = "";
+                if (bootChanged) why = "浏览器重启过";
+                else if (offGrid) why = "脚本刚启用或重新加载（非定时唤醒）";
+                else if (justLoaded) why = "脚本刚被重新启用（距上次唤醒不到 90 秒）";
+                else if (ownerDead) why = "上一轮的执行上下文已被销毁";
+                else why = `离开超过 ${Math.round(RESUME_GAP / 60000)} 分钟（脚本停用过 / 电脑睡眠过）`;
+                this.resetRoundState(`检测到新的会话（${why}），已清除上一段的运行锁与缓存，本轮从头开始`);
             }
             if (boot > 0) GM_setValue("Config.bootId", boot);
             GM_setValue("Config.heartbeatAt", now);
 
-            /* ② 回收确实死掉的轮次，清掉超时未开始的认领 */
+            /* ①b 跨天：昨天留下的运行痕迹同样作废（今日进度有各自的 date 字段，不受影响） */
+            const prevDay = Number(GM_getValue("Config.lastSeenDay", 0)) || 0;
+            const todayNum = Utils.getTodayNum();
+            if (prevDay > 0 && prevDay !== todayNum) {
+                this.resetRoundState(`跨天（${prevDay} → ${todayNum}），已清除昨天的运行锁与缓存`);
+            }
+            GM_setValue("Config.lastSeenDay", todayNum);
+
+            /* ② 回收确实死掉的轮次，清掉超时未开始的认领与孤儿锁 */
             try { this.reapDeadRound(now); } catch (_) {}
             const staleClaim = this.getClaim();
             if (staleClaim && staleClaim.at && !this.isBusy(now) && now - staleClaim.at > CRON_STALL) {
                 this.clearClaim();
                 Utils.log("♻️", `清理超时未开始的认领（${this.fmt(staleClaim.at)}）`);
             }
+            /* 孤儿锁：锁记录还在，但没有任何 holding 的轮次记录（phase 不是 running）——
+               典型是「停用脚本时那一轮正好死在释放锁之前」。锁不释放，下一轮会被
+               runAll 的 acquireLock 直接挡回去，所以这里按 TTL 兜底清掉。
+               注意只在「确实没有谁在跑」时清，避免把正在跑的锁抢走。 */
+            const orphanLock = Utils.lockInfo("Config.runLock");
+            const curPhase = (this.getState() || {}).phase;
+            if (orphanLock && curPhase !== "running"
+                && (now - Number(orphanLock.ts || 0)) > RUN_LOCK_TTL) {
+                try { GM_setValue("Config.runLock", null); } catch (_) {}
+                Utils.log("♻️", `清理孤儿运行锁（${this.fmt(orphanLock.ts)} 残留，已超过 ${Math.round(RUN_LOCK_TTL / 60000)} 分钟）`);
+            }
 
-            /* ③ 运行时段以面板 Config.winTime 为准：cron 全天唤醒，这里才是闸门 */
+            /* ③ 运行时段以面板 Config.winTime 为准：cron 全天唤醒，这里才是闸门。
+               时段一结束就把运行痕迹（锁、认领、排期、变体缓存、节流计数）清干净，
+               下一次开窗从全新状态开始 —— 定时模式下没有「卡住需要人手动重置」这回事了。
+               今日进度（tasks / doneDate / edge / monthly / intl）不清，清了会重复做任务。 */
             if (!this.inWindow(now)) {
+                const wasInWindow = Number(GM_getValue("Config.windowOpenAt", 0)) > 0;
                 const next = this.alignToWindow(now);
                 this.saveNext(next);
+                if (wasInWindow) {
+                    GM_setValue("Config.windowOpenAt", 0);
+                    try { clearRuntimeCaches("运行时段结束"); } catch (_) {}
+                }
                 this.clearClaim();
                 this.state("waiting", { runAt: next, inWindow: false });
                 const cfg = this.winCfg();
@@ -10690,6 +10226,9 @@ const __scBgKeepAlive = (function() {
                 return { ran: false, reason: "window" };
             }
 
+            /* 时段内：记一个「窗口开着」的标记，供窗口结束那一刻判断是否要做清理 */
+            if (!Number(GM_getValue("Config.windowOpenAt", 0))) GM_setValue("Config.windowOpenAt", now);
+
             /* ④ 关了「持续检测」且今天已全部完成：醒来什么也不做，也不打日志 */
             const stopped = !GM_getValue("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
@@ -10701,12 +10240,19 @@ const __scBgKeepAlive = (function() {
             /* ⑤ 搜索冷却到期就自动重置并立刻恢复 */
             try { this.autoRecoverFromCooldown(now); } catch (_) {}
 
-            /* ⑥ 上一轮还没收尾（长任务超过一个唤醒周期）→ 让路，不改排期 */
+            /* ⑥ 上一轮还没收尾（长任务超过一个唤醒周期）→ 先实测它死没死。
+               停用脚本再马上启用时，上一轮的 running 记录会留在存储里，
+               而那个上下文已经不在了；只看时间戳会误判成「还在跑」，然后跳过一整轮。 */
             if (this.isBusy(now)) {
                 const s = this.getState() || {};
                 const lastAct = Math.max(Number(s.at) || 0, Number(s.aliveAt) || 0);
-                Utils.log("🟡", `定时唤醒：上一轮还在执行中（${s.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前），本次跳过`);
-                return { ran: false, reason: "busy" };
+                const alive = await this.probeOwnerAlive().catch(() => false);
+                if (alive) {
+                    Utils.log("🟡", `定时唤醒：上一轮确实还在执行中（${s.ctx || "未知"}，最后活动 ${Math.max(0, Math.round((now - lastAct) / 60000))} 分钟前），本次跳过`);
+                    return { ran: false, reason: "busy" };
+                }
+                Utils.log("♻️", `上一轮（${s.ctx || "未知"}）的上下文已经不在了（心跳没再涨），记录作废，本轮直接开始`);
+                this.resetRoundState("");
             }
 
             /* ⑦ 随机等 0~5 分钟再开跑：唤醒在整 20 分钟刻度上，
@@ -10726,20 +10272,13 @@ const __scBgKeepAlive = (function() {
             this.state("claimed");
             Utils.log("⏰", `定时唤醒：开始本轮任务（${this.ctxName()}上下文）`);
             try {
-                await this.task();
+                await this.task({ force: false });
             } catch (e) {
                 Utils.log("🔴", `本轮任务启动失败：${e && e.message ? e.message : e}`);
                 this.clearClaim();
                 return { ran: false, reason: "error" };
             }
             return { ran: true, reason: "run" };
-        },
-        /* 定时模式下没有常驻计时器：所有「下次什么时候跑」只写进 Config.cronNextRun，
-           由下一次 @crontab 唤醒时读取。arm/tick/watchdog 三个函数随之删除。 */
-        rearmNow(extraMs = 0) {
-            const ts = Date.now() + (Number(extraMs) || 0);
-            this.saveNext(ts);
-            return ts;
         },
 
         autoRecoverFromCooldown(now) {
@@ -10760,31 +10299,16 @@ const __scBgKeepAlive = (function() {
             Utils.log("🔄", `搜索冷却已到期（${guard.reason || "连续多轮未记账"}${span > 0 ? `，迟到 ${span} 分钟` : ""}），`
                 + "开始自动重置运行状态并立即恢复任务");
 
-            /* 重置成「刚装脚本」的运行状态，但保留授权与配置 */
-            let result = null;
+            /* 冷却到期 = 上一轮的节流结论作废：清运行痕迹 + 今日进度，让这一轮重新尝试 */
             try {
-                result = doSoftReset({ rearm: false });
+                doSoftReset();
             } catch (e) {
                 Utils.log("🟡", `自动重置异常：${e && e.message ? e.message : e}，改为只解除冷却`);
                 try { API.clearSearchGuard(true); } catch (_) {}
             }
-            if (result) {
-                Utils.log("✅", `自动重置完成：清理 ${Array.isArray(result.cleared) ? result.cleared.length : (Number(result.cleared) || 0)} 项运行状态，`
-                    + `授权${result.authIntact ? "完整保留" : "状态异常，请检查"}`);
-            }
-
-            /* 重置已把 Config.cronNextRun 清空，这里显式排一个「马上」的下次触发。
-               注意还要绕开运行时段：若此刻在时段外，就顺延到下一个窗口起点。 */
-            const fireAt = this.alignToWindow(now);
-            this.saveNext(fireAt);
+            /* 清完把认领与排期归位：当前就在本轮里，直接往下跑即可 */
             this.clearClaim();
             GM_setValue("Config.runState", null);
-            if (fireAt > now + 1000) {
-                Utils.log("🌙", `当前不在运行时段（${this.fmtHM(this.winCfg().startMin)}~${this.fmtHM(this.winCfg().endMin)}），`
-                    + `重置已就绪，${this.fmt(fireAt)} 到点开跑`);
-            } else {
-                Utils.log("🚀", "重置已就绪，下一轮立即开始");
-            }
             return true;
         },
 
@@ -10854,17 +10378,20 @@ const __scBgKeepAlive = (function() {
     /* 定时模式下 init 必须 await：runOnce() 要等这一轮真的结束才返回，
        上下文随后正常退出。以前用 setTimeout 甩出去就不管了，常驻上下文里没问题，
        定时上下文里会「任务还没跑完，执行体已经结束」。 */
-    const init = async () => {
+    /* force=true 表示「用户手动点了立即运行」：跳过运行时段与「今日已完成」两道闸门。
+       定时唤醒传 false，仍然受时段限制。 */
+    const init = async (opts = {}) => {
+        const force = !!(opts && opts.force);
         bootstrap();
 
         const isKeep = GM_getValue("Config.keep", true);
-        if (!isKeep && isDayComplete()) {
+        if (!force && !isKeep && isDayComplete()) {
             markDayComplete();
             Sched.finish(false);
             return;
         }
 
-        if (!Sched.inWindow(Date.now())) {
+        if (!force && !Sched.inWindow(Date.now())) {
             const next = Sched.alignToWindow(Date.now());
             const cfg = Sched.winCfg();
             const span = cfg.allDay ? "全天不限" : `${Sched.fmtHM(cfg.startMin)}~${Sched.fmtHM(cfg.endMin)}`;
@@ -10880,7 +10407,7 @@ const __scBgKeepAlive = (function() {
         Sched.state("waiting", { runAt: Date.now() + delay });
         await Utils.delay(delay);
         try {
-            await TaskManager.runAll();
+            await TaskManager.runAll({ force });
         } catch (e) {
             Utils.log("🔴", `本轮任务异常：${e && e.message ? e.message : e}`);
         } finally {
@@ -10934,7 +10461,8 @@ const __scBgKeepAlive = (function() {
     }
 
     bootstrap();
-    if (Utils.hasDOM()) {
+    const inBgCtx = Utils.isBackground();
+    if (!inBgCtx) {
         Utils.log("🖥️", `页面上下文已加载（${location.hostname}），任务轮交给定时唤醒`);
     }
 
@@ -10977,15 +10505,6 @@ const __scBgKeepAlive = (function() {
         return text;
     };
 
-    const diagResetSchedule = () => {
-        Sched.clearClaim();
-        GM_setValue("Config.runState", null);
-        GM_setValue("Config.cronNextRun", null);
-        try { GM_setValue("Config.runLock", null); } catch (_) {}
-        Utils.log("🧹", "调度计划已重置（含运行锁），下一次定时唤醒将立刻开跑");
-        Sched.rearmNow(0);
-    };
-
 
     try {
         const host = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : globalThis;
@@ -10994,8 +10513,6 @@ const __scBgKeepAlive = (function() {
             pcSearch: diagPcSearch,
             region: diagRegion,
             schedule: diagSchedStatus,
-            resetSchedule: diagResetSchedule,
-            releaseLock: diagReleaseLock,
             claim: diagClaim
         };
     } catch (_) {}
@@ -11012,7 +10529,7 @@ const __scBgKeepAlive = (function() {
        页面上下文只承担页面代发 / 菜单 / 授权，不再自己跑一轮。
        runOnce 返回的是「这一轮跑完」的 Promise，跑完上下文就正常结束 ——
        不再用「永不 resolve 的 Promise」挂住后台，避免每次唤醒都堆一个实例。 */
-    if (!Utils.hasDOM()) {
+    if (inBgCtx) {
         return Sched.runOnce(init);
     }
 })();
