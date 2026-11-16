@@ -8981,9 +8981,16 @@ const __scBgKeepAlive = (function() {
             }
             Utils.log("▶️", `本轮进入执行流程（${Utils.isBackground() ? "后台" : "页面"}上下文）`);
             this.abortRound = false;
-            /* 运行时段是最后一道闸门，必须放在 runAll 里而不是只放在 init：
-               只要有一个调用方忘了先判窗口，任务就会在深夜照跑。
-               手动「🚀 立即运行」传 force=true 明确表示「我知道现在不在时段内，就要跑」。 */
+            /* 「今日已完成 + 持续检测关闭」：只拦定时唤醒，不拦手动。
+               手动「🚀 立即运行」是用户的明确意图 —— force=true 表示「我知道今天做完了，
+               现在就是要再跑一轮」，所以这里必须让开，否则点了没反应。
+               要立刻重跑就点它；定时唤醒仍然会被这条挡住。 */
+            if (!force && !GM_getValue("Config.keep", true)
+                && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum()) {
+                Utils.log("💤", "今日任务已全部完成且「持续检测」已关闭，本次定时唤醒不执行；明天自动恢复");
+                Sched.state("done");
+                return;
+            }
             if (!force && !Sched.inWindow(Date.now())) {
                 const wc = Sched.winCfg();
                 const span = wc.allDay ? "全天不限" : `${Sched.fmtHM(wc.startMin)}~${Sched.fmtHM(wc.endMin)}`;
@@ -9182,6 +9189,12 @@ const __scBgKeepAlive = (function() {
                    这一步只读不写（不上报、不激活），失败也不影响汇总。 */
                 try { await EdgeStreak.refreshFromServer(); } catch (_) {}
                 const info = await API.getRewardsInfo();
+                /* 汇总块里判断出的「今天真的全做完了」。
+                   要和 isDayComplete() 共用同一个结论：
+                   后者看的是本地标记位（searchDate / edge.complete），
+                   而面板可能已经 60/60、Edge 已经 30/30 —— 两套判据不一致，
+                   就会出现「日志说全部完成，却每 20 分钟继续跑」。 */
+                let dayVerified = false;
                 if (info) {
                     const today = RewardsAuto.state.dateNowNum;
                     /* 0 不是 nullish：回读到 0 会盖掉已确认的 30/30。
@@ -9361,6 +9374,9 @@ const __scBgKeepAlive = (function() {
                         }
                     }
 
+                    /* allDone = 各任务在服务端口径上全部达标（见上面的 goals 汇总）。
+                       这就是「今天还该不该继续跑」的权威结论。 */
+                    dayVerified = allDone;
                     if (canNotify) {
                         /* 全天达标：一天只推一条，key 按日期固定 */
                         Utils.notifyDone("🎉", logMsg, `roundDone:${today}`);
@@ -9371,7 +9387,11 @@ const __scBgKeepAlive = (function() {
                 } else {
                     Utils.log("📊", ("本轮执行完成 · ⏱️ 用时 " + totalTime + " 秒 · 服务端状态读取失败，明细见日志"));
                 }
-                if (!GM_getValue("Config.keep", true) && isDayComplete()) markDayComplete();
+                /* 「持续检测」关掉后，用 dayVerified（服务端口径）或 isDayComplete()（本地标记）
+                   任一成立就封盘 —— 两个判据取并集，避免一个没写标记就停不下来。 */
+                if (!GM_getValue("Config.keep", true) && (dayVerified || isDayComplete())) {
+                    markDayComplete();
+                }
             } catch (e) {
                 if (e && e.regionBlocked) {
                     /* 出口被拦 = 需要人介入：推一条，但 6 小时内同类只推一次 */
@@ -9567,8 +9587,13 @@ const __scBgKeepAlive = (function() {
        所以这里不能只看 isBusy() 的时间戳 —— 时间戳可能是死掉的上下文留下的，
        必须实测一次（probeOwnerAlive）再决定。 */
     GM_registerMenuCommand("🚀 立即运行", async () => {
-        Utils.log("🚀", "手动触发：立即运行一轮（忽略运行时段与 cron 节拍）");
         const now = Date.now();
+        /* 手动运行是强制的：既不看运行时段，也不看今日是否已完成。
+           今天已封盘时多说一句，免得用户以为是 bug。 */
+        const dayDone = (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
+        Utils.log("🚀", dayDone
+            ? "手动触发：今日任务已完成，仍按你的要求强制跑一轮"
+            : "手动触发：立即运行一轮（忽略运行时段与 cron 节拍）");
         try { Sched.reapDeadRound(now); } catch (_) {}
 
         /* ① 记录里说有一轮在跑 → 实测它的心跳还在不在 */
@@ -9867,10 +9892,8 @@ const __scBgKeepAlive = (function() {
                 const last = this.lastRun();
                 ts = last ? last + CRON_PERIOD : now + CRON_FIRST_DELAY;
             }
-            /* plan() 只读不写：同一份配置下返回值恒定，定时模式下每次唤醒都会读它。
-               下次时间只由 finish()（一轮跑完）负责写。 */
-            /* 落在运行时段之外就顺延到下一个窗口起点：窗口外绝不开新的一轮。
-               alignToWindow 只依赖日期和配置，同一天算出来的值恒定，多次调用不漂移。 */
+            /* plan() 只读不写：返回 finish() 写下的「参考排期」，仅供诊断面板对照。
+               真正的唤醒时刻由 @crontab 决定，用 nextWakeAt() 算。 */
             return this.alignToWindow(ts);
         },
 
@@ -9977,6 +10000,17 @@ const __scBgKeepAlive = (function() {
 
         saveNext(ts) { GM_setValue("Config.cronNextRun", ts); },
 
+        /* 下一次 cron 唤醒的真实时刻：@crontab 每 20 分钟 → 落在 :00 / :20 / :40。
+           不能写成「现在 + 20 分钟」—— 一轮可能只跑 9 分钟就结束，
+           那时离下一个刻度可能只有几十秒，日志会骗人。 */
+        nextWakeAt(now = Date.now()) {
+            const step = CRON_WAKE_MS;
+            const base = this.midnightOf(now);
+            const off = now - base;
+            const next = base + (Math.floor(off / step) + 1) * step;
+            return next;
+        },
+
 
         ctxName() { return Utils.isBackground() ? "后台" : "页面"; },
 
@@ -10039,10 +10073,13 @@ const __scBgKeepAlive = (function() {
             const base = (claim && claim.at) || now;
             this.clearClaim();
             GM_setValue("Config.cronLastRun", now);
-            this.saveNext(now + CRON_PERIOD);
+            const nextAt = this.nextWakeAt(now);
+            this.saveNext(nextAt);
             this.state(ok ? "done" : "idle");
             if (ran) {
-                Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟，上限 ${ROUND_BUDGET_MS / 60000} 分钟），下一次唤醒在 20 分钟后`);
+                const waitMin = Math.max(0, Math.round((nextAt - now) / 60000));
+                Utils.log("🕒", `本轮结束（用时 ${Math.max(0, Math.round((now - base) / 60000))} 分钟），`
+                    + `下一次唤醒 ${this.fmt(nextAt)}（约 ${waitMin} 分钟后）`);
             }
         },
 
@@ -10145,6 +10182,7 @@ const __scBgKeepAlive = (function() {
             const todayNum = Utils.getTodayNum();
             if (prevDay > 0 && prevDay !== todayNum) {
                 this.resetRoundState(`跨天（${prevDay} → ${todayNum}），已清除昨天的运行锁与缓存`);
+                try { GM_setValue("Config.stoppedLogAt", 0); } catch (_) {}
             }
             GM_setValue("Config.lastSeenDay", todayNum);
 
@@ -10194,11 +10232,17 @@ const __scBgKeepAlive = (function() {
             /* 时段内：记一个「窗口开着」的标记，供窗口结束那一刻判断是否要做清理 */
             if (!Number(GM_getValue("Config.windowOpenAt", 0))) GM_setValue("Config.windowOpenAt", now);
 
-            /* ④ 关了「持续检测」且今天已全部完成：醒来什么也不做，也不打日志 */
+            /* ④ 关了「持续检测」且今天已封盘（doneDate 是 today）：醒来什么都不做。
+               doneDate 由 markDayComplete() 写，而它现在看的是「服务端结论 ∪ 本地标记」，
+               所以面板显示全部完成时这里一定也能停下来。 */
             const stopped = !GM_getValue("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
             if (stopped) {
                 this.state("done");
+                if (!Number(GM_getValue("Config.stoppedLogAt", 0))) {
+                    GM_setValue("Config.stoppedLogAt", now);
+                    Utils.log("💤", "「持续检测」已关闭且今日任务已完成，之后不再跑（明天自动恢复）");
+                }
                 return { ran: false, reason: "done" };
             }
 
@@ -10433,7 +10477,7 @@ const __scBgKeepAlive = (function() {
 
     const diagSchedStatus = () => {
         const now = Date.now();
-        const next = Sched.plan(now);
+        const next = Sched.nextWakeAt(now);
         const last = Sched.lastRun();
         const st = Sched.getState();
         const claim = Sched.getClaim();
@@ -10449,7 +10493,8 @@ const __scBgKeepAlive = (function() {
         text += `唤醒节拍：每 ${CRON_WAKE_MS / 60000} 分钟一次（@crontab），一次唤醒跑一轮\n`;
         text += `开跑偏移：唤醒后随机等 0~${Math.round(CRON_JITTER / 60000)} 分钟再开跑（错开整点）\n`;
         text += `最近结束：${Sched.fmt(last)}\n`;
-        text += `下次触发：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
+        text += `下次 cron 唤醒：${Sched.fmt(next)}（约 ${Math.max(0, Math.ceil((next - now) / 60000))} 分钟后）\n`;
+        text += `上次结束：${last ? Sched.fmt(last) : "无"}（排期记录 ${Sched.fmt(Sched.plan(now))}）\n`;
         text += `运行阶段：${st ? (phaseText[st.phase] || st.phase) : "未知"}${st && st.ctx ? `（${st.ctx}）` : ""}\n`;
         if (st) {
             text += `  最后进展：${Sched.fmt(st.at)}（${Math.max(0, Math.round((now - (Number(st.at) || 0)) / 60000))} 分钟前）\n`;
