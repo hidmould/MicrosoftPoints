@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.5.7
+// @version      1.5.8
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -1928,8 +1928,14 @@ const __scBgKeepAlive = (function() {
                 if (hit && hit.webSocketDebuggerUrl) {
                     try {
                         await this.usePage(hit);
+                        /* 刚建的后台页在导航提交前就是 about:blank 且 readyState=complete，
+                           只看 readyState 会把「还没跳过去」当成「已就绪」返回给调用方。 */
+                        const href = String(await this.evaluate("location.href") || "");
                         const st = await this.evaluate("document.readyState");
-                        if (st === "complete") return hit;
+                        const landed = !/^about:/i.test(href)
+                            && (!probe || href.indexOf("https://" + probe.split("#")[0].split("?")[0]) === 0
+                                || href.indexOf(probe) >= 0);
+                        if (st === "complete" && landed) return hit;
                     } catch (_) {}
                 }
                 await Utils.delay(500);
@@ -2141,6 +2147,9 @@ const __scBgKeepAlive = (function() {
                 else p.resolve(m.result);
             };
             this._ws = ws;
+            /* 记住连的是哪个标签页：usePage() 靠它判断「已经连在这个页上了」，
+               不写的话每次调用都会重连一遍，_wsUrl 永远是空的。 */
+            this._wsUrl = wsUrl;
             return ws;
         },
 
@@ -2164,6 +2173,7 @@ const __scBgKeepAlive = (function() {
         close() {
             try { if (this._ws) this._ws.close(); } catch (_) {}
             this._ws = null;
+            this._wsUrl = "";
             this._pending = null;
         },
 
@@ -4841,21 +4851,16 @@ const __scBgKeepAlive = (function() {
             return [...found.keys()];
         },
 
-        async fetchQuestCards(parentId) {
-            const url = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
-            const html = await Utils.xhr({
-                url,
-                headers: RewardsAuto.desktopAppHeaders
-            });
-            if (!html) return { parentId, url, html: "", cards: [] };
-            const text = this._flightText(html);
+        /* 解析 quest 详情页里的子项。 */
+        _parseQuestCards(text, url, parentId, lockTrusted) {
             const cards = [];
             for (const item of this._flightItems(text, "[A-Za-z0-9]*_pcchild[^\"]+")) {
                 if (!item.offerId || !item.hash) continue;
                 cards.push({
                     offerId: item.offerId,
                     hash: item.hash,
-                    title: String(item.ariaLabel || item.linkText || item.offerId).replace(/^\s*\d+\s*[分点]?\s*,?\s*/, "").trim() || item.offerId,
+                    title: String(item.ariaLabel || item.linkText || item.offerId)
+                        .replace(/^\s*\d+\s*[分点]?\s*,?\s*/, "").trim() || item.offerId,
                     isCompleted: item.isCompleted === true,
                     isLocked: item.isLocked === true,
                     href: item.href || item.destination || ""
@@ -4863,16 +4868,96 @@ const __scBgKeepAlive = (function() {
             }
             /* 父任务的「M/N 个任务」文案：只用于日志对照，不参与判定
                （它不说明是哪几张完成，拿它反推会把当天要做的卡误标成已完成） */
-            const pm = text.match(/(\d+)\s*\/\s*(\d+)\s*个任务/);
+            const pm = String(text || "").match(/(\d+)\s*\/\s*(\d+)\s*个任务/);
             const progress = pm ? { done: parseInt(pm[1], 10) || 0, total: parseInt(pm[2], 10) || 0 } : null;
-            return { parentId, url, html, text, progress, cards: this._reconcileWeeklyLocks(cards) };
+            /* 兜底判据：非应用身份下服务端会把「所有待办」都渲染成 isLocked=true，
+               且标题写成「奖励应用专属」；应用身份才会渲染出「10 分」这种真实标题。
+               两种痕迹任一成立就说明这次读不是应用身份，isLocked 一律不可信。 */
+            const plainRender = /奖励应用专属/.test(String(text || ""));
+            /* 应用身份的子项标题带分值前缀（「10 分, 雀形鸟」），普通身份没有；
+               这一条在「今天已做完、剩下全是锁定卡」时也能判定出身份。 */
+            const appTitled = /\d+\s*[分点]\s*[,，]/.test(String(text || ""));
+            const trusted = appTitled
+                || (!plainRender && (lockTrusted || cards.some(c => !c.isCompleted && !c.isLocked)));
+            return { parentId, url, text, progress, lockTrusted: trusted, cards: this._reconcileWeeklyLocks(cards, trusted) };
+        },
+
+        /* 读 quest 详情页：优先 CDP 页面通道 + Network.setUserAgentOverride 切桌面应用 UA。
+           只有这种读法的 isLocked 才是真值：GM 直读改不了 UA，非应用身份下服务端会把
+           整周子项一律渲染成 isLocked=true（2026-11-19 实测：周四那张本已解锁仍报锁定，
+           于是整天漏做）。CDP 不可用（没配 CDP / 今日已封盘 / 开不出页）时退回 GM 直读，
+           并把 lockTrusted 置 false —— 调用方改按 offerId 里的星期推断，不再拿 isLocked 当判据。 */
+        async _readQuestPage(url, { create = false } = {}) {
+            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+                try {
+                    if (await CDP.available()) {
+                        const page = await CDP.ensurePage(url, { nav: false, create: !!create, reason: "desktop" });
+                        if (page && page.webSocketDebuggerUrl) {
+                            /* 必须用 usePage：只判 readyState 会把命令发到上一次连的那个标签页，
+                               新开的页根本没连上，UA 改了也白改（还读不到内容）。 */
+                            await CDP.usePage(page);
+                            /* 先确认这个页真的在 rewards 域下：借来的页可能还停在 about:blank，
+                               在这种页里 fetch 跨域必失败，读出来只会是空。 */
+                            let here = String(await CDP.evaluate("location.href") || "");
+                            if (!/^https:\/\/rewards\.bing\.com\//i.test(here) && CDP.isOwned(page.id)) {
+                                try { await CDP.goto(page, url); } catch (_) {}
+                                here = String(await CDP.evaluate("location.href") || "");
+                            }
+                            if (!/^https:\/\/rewards\.bing\.com\//i.test(here)) {
+                                /* 借到的页还停在 about:blank 又不能导航：别在这里认输，
+                                   交给下面的 GM 直读兜底，至少还能拿到进度文案。 */
+                                throw new Error("页面不在 rewards 域下（" + here.slice(0, 30) + "）");
+                            }
+                            /* UA 覆盖要放在页面就位之后：先覆盖再导航，导航请求仍可能用回默认 UA。 */
+                            const uaOk = await CDP.setAppUA(true);
+                            try {
+                                let html = await CDP.fetchPageText(url);
+                                if (!html) {
+                                    await Utils.delay(1500);
+                                    html = await CDP.fetchPageText(url);
+                                }
+                                if (html) return { html, lockTrusted: uaOk, viaCdp: true };
+                            } finally {
+                                try { await CDP.setAppUA(false); } catch (_) {}
+                            }
+                        }
+                    }
+                } catch (eCdpRead) {
+                    Utils.log("🖥️", "quest 页 CDP 读取失败（" + eCdpRead.message + "），改 GM 直读");
+                }
+            }
+            const html = await Utils.xhr({ url, headers: RewardsAuto.desktopAppHeaders });
+            return { html: html || "", lockTrusted: false, viaCdp: false };
+        },
+
+        /* 登录页/风控页不是「本周全做完」：读到这种页面必须当作读取失败，
+           否则一张卡都解析不出来会被当成 ✅ 已全部完成，把整天糊过去。 */
+        _looksBlockedPage(html) {
+            const raw = String(html || "");
+            if (!raw) return true;
+            return /<title>\u767b\u5f55<\/title>|Sign in to your account|oauth20_authorize|<title>Bing<\/title>|sc_error/i.test(raw);
+        },
+
+        async fetchQuestCards(parentId, { create = false } = {}) {
+            const url = "https://rewards.bing.com/earn/quest/" + encodeURIComponent(parentId);
+            const read = (await this._readQuestPage(url, { create })) || { html: "", lockTrusted: false };
+            if (!read.html || this._looksBlockedPage(read.html)) {
+                return { parentId, url, html: "", cards: [], lockTrusted: false };
+            }
+            const snap = this._parseQuestCards(this._flightText(read.html), url, parentId, read.lockTrusted);
+            /* html 要跟着返回：调用方靠它区分「读到了但没卡片」和「根本没读到」，
+               少了它任何一次读取失败都会被当成「本周已全部完成」。 */
+            return { ...snap, html: read.html };
         },
 
         /* 解锁态对账：isLocked 以服务端为准，绝不改写。
            2026-11-15 事故：旧版周日 idx<=today 恒真，一轮把整周 7 张全交卷。
-           （原来的「强制解锁」开关已移除：那正是造成上述事故的逻辑，不该留着。） */
-        _reconcileWeeklyLocks(cards) {
+           （原来的「强制解锁」开关已移除：那正是造成上述事故的逻辑，不该留着。）
+           2026-11-19：GM 直读拿到的 isLocked 只是服务端对「非应用身份」的渲染，
+           不是真实状态，所以只有应用身份读法才做这套对账，否则原样返回。 */
+        _reconcileWeeklyLocks(cards, lockTrusted = true) {
             const list = (cards || []).slice();
+            if (!lockTrusted) return list;
             const today = this.QUESTS.todayIndex();
             const lockedOpen = list.filter(c => !c.isCompleted && c.isLocked);
             const expected = lockedOpen.filter(c => {
@@ -4880,12 +4965,11 @@ const __scBgKeepAlive = (function() {
                 return idx >= 0 && idx <= today;
             });
             if (expected.length > 0) {
-                Utils.log("🖥️", `桌面周任务：服务端仍有 ${lockedOpen.length} 张锁定`
-                    + `（按星期推算其中 ${expected.length} 张本该已解锁，以服务端为准，不解锁）`);
+                Utils.log("🖥️", "桌面周任务：服务端仍有 " + lockedOpen.length + " 张锁定"
+                    + "（按星期推算其中 " + expected.length + " 张本该已解锁，以服务端为准，不解锁）");
             }
             return list;
         },
-
         /* 月度计划：与桌面任务同一 quest 结构，差别是父 id 不含 RewardsApp、
            子项更多且按天解锁、全完成 +50。进度只认「M/N 个任务」回读。 */
 
@@ -4942,17 +5026,32 @@ const __scBgKeepAlive = (function() {
            没有这个文案时退化为数子项的 isCompleted，避免把「已解锁但没进度文案」当成 0 进度。 */
         /* 用应用 UA 拉详情页（普通 UA 会渲染成 0/N 且子项全锁）；
            应用 UA 解析不出子项时才退普通 PC UA 兜底。identity 用于日志定位。 */
-        async fetchMonthlyQuest(parentId) {
+        async fetchMonthlyQuest(parentId, { create = false } = {}) {
             const url = MONTHLY.PAGE_URL + encodeURIComponent(parentId);
+            /* 三种读法，按可信度排序：
+               ① CDP 页面通道 + 应用 UA —— 网络层 UA 真被改掉，isLocked 才是真值；
+               ② GM 直读 + 应用 UA 头 —— 没有 CDP 时的兜底（浏览器会丢弃这个头）；
+               ③ GM 直读 + 普通 PC UA —— 只兜底解析子项，解锁态一律不可信。 */
             const identities = [
+                { name: "CDP 应用身份", cdp: true },
                 { name: "应用 UA", headers: RewardsAuto.desktopAppHeaders },
                 { name: "普通 UA", headers: { "user-agent": RewardsAuto.ua.pc, "accept-language": "zh-CN,zh;q=0.9,en;q=0.8" } },
             ];
             let lastReason = "";
             for (const idn of identities) {
                 let html = "";
+                let lockTrusted = false;
+                let viaCdp = false;
                 try {
-                    html = await Utils.xhr({ url, headers: idn.headers });
+                    if (idn.cdp) {
+                        const read = await this._readQuestPage(url, { create });
+                        html = (read && read.html) || "";
+                        lockTrusted = !!(read && read.lockTrusted);
+                        viaCdp = !!(read && read.viaCdp);
+                        if (!html) { lastReason = "CDP 读不到 quest 页"; continue; }
+                    } else {
+                        html = await Utils.xhr({ url, headers: idn.headers });
+                    }
                 } catch (e) {
                     lastReason = `详情页请求失败：${e.message}`;
                     continue;
@@ -4985,11 +5084,16 @@ const __scBgKeepAlive = (function() {
                     lastReason = "未解析到子项";
                     continue;
                 }
-                if (idn.name !== identities[0].name) {
-                    Utils.log("📆", `月度计划：${parentId} 应用 UA 没解析出内容，已用${idn.name}兜底`);
+                /* CDP 没连上时 _readQuestPage 会退回 GM 直读（比纯 PC UA 更接近应用身份），
+                   此时如实标成兜底，别把它写成「CDP 应用身份」。 */
+                const identName = (idn.cdp && viaCdp)
+                    ? (lockTrusted ? "CDP 应用身份" : "CDP 页面通道（UA 未生效）")
+                    : (lockTrusted ? "应用身份（GM 直读）" : (idn.name || "GM 直读"));
+                if (identName !== identities[0].name) {
+                    Utils.log("📆", `月度计划：${parentId} 前一种身份没解析出内容，已用「${identName}」兜底`);
                 }
                 return {
-                    parentId, url, ok: true, identity: idn.name,
+                    parentId, url, ok: true, identity: identName, lockTrusted,
                     html, text, cards,
                     done: totalByText > 0 ? doneByText : completedCards,
                     total: totalByText > 0 ? totalByText : cards.length,
@@ -5177,6 +5281,14 @@ const __scBgKeepAlive = (function() {
                     pendingCount++;
                     continue;
                 }
+                /* 首次只借现成 rewards 页读；解析不出来才允许静默开一个后台页，
+                   用应用身份重读一次（非应用身份下月度子项常被渲染成解析不出内容）。 */
+                if (!snap.ok || snap.cards.length === 0) {
+                    try {
+                        const retry = await this.fetchMonthlyQuest(parentId, { create: true });
+                        if (retry.ok && retry.cards.length > 0) snap = retry;
+                    } catch (_) {}
+                }
                 if (!snap.ok || snap.cards.length === 0) {
                     if (!snap.ok) Utils.log("🟡", `月度计划：${parentId} ${snap.reason}`);
                     else Utils.log("🟡", `月度计划：${parentId} 未解析到子项`);
@@ -5217,6 +5329,13 @@ const __scBgKeepAlive = (function() {
                     reports.push(`${q.done}/${q.total}`);
                     Utils.log("✅", `月度计划：${parentId} 本月已全部完成`);
                     continue;
+                }
+
+                /* 解锁态不可信（没配 CDP 时）只提示、不当判据用：月度子项本来就一次只解锁一个，
+                   保持原有跳过逻辑不会被卡死，只是别让这条噪音每轮刷屏。 */
+                if (!snap.lockTrusted && snap.cards.some(c => !c.isCompleted && c.isLocked)) {
+                    Utils.logSilenced("📆", "月度计划：本轮读不到应用身份页面（CDP 不可用），子项解锁态可能不准",
+                        "monthlyLockUntrusted", 6 * 60 * 60 * 1000);
                 }
 
                 /* 2) 挑一个能做的子项：未完成、已解锁、未禁用。
@@ -5449,9 +5568,7 @@ const __scBgKeepAlive = (function() {
                         const page = await CDP.ensurePage("https://rewards.bing.com/earn",
                             { nav: false, create: true, reason: "desktop" });
                         if (page && page.webSocketDebuggerUrl) {
-                            if (!CDP._ws || CDP._ws.readyState !== 1) {
-                                await CDP.connect(page.webSocketDebuggerUrl);
-                            }
+                            await CDP.usePage(page);
                             /* 关键：先把网络层 UA 切成桌面应用身份。
                                普通 UA 下这个 action 会返回 true 但服务端不记账，
                                所以「请求成功」在这里完全不等于「卡片完成」。 */
@@ -5561,19 +5678,37 @@ const __scBgKeepAlive = (function() {
                 + questIds.map(id => id.replace(/^WW_pcparent_RewardsApp_weekly_Exclusive_?/i, "")).join("、"));
 
             let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
+            /* 本轮是否还有「该做但没做成 / 解锁态没确认」的桌面任务 ——
+               有的话收尾不能封盘，否则下一轮开不出 CDP 页，整天都补不上。 */
+            let desktopNeedCdp = false;
+            /* 这次运行里 CDP 到底能不能用：决定「解锁态没读到」要不要拦住收尾封盘。 */
+            const cdpUsable = await CDP.available();
             for (const parentId of questIds) {
                 let snap;
                 try {
-                    snap = await this.fetchQuestCards(parentId);
+                    /* create:true —— 允许为这次读取静默开一个后台页来切应用身份；
+                       没有 CDP 时 ensurePage 直接返回 null，自动退回 GM 直读 */
+                    snap = await this.fetchQuestCards(parentId, { create: true });
                 } catch (eSnap) {
                     Utils.log("🔴", `桌面专属任务：读取 ${parentId} 失败（${eSnap.message}），跳过这一个`);
                     totalFailed++;
+                    continue;
+                }
+                if (!snap.html) {
+                    /* 读都没读到，不等于做完了：不能让「已全部完成」把这一天糊过去 */
+                    Utils.log("🔴", `桌面专属任务：${parentId} 详情页读取失败，本轮跳过`);
+                    totalFailed++;
+                    if (cdpUsable) desktopNeedCdp = true;
                     continue;
                 }
                 if (snap.cards.length === 0) {
                     Utils.log("✅", `桌面专属任务本周已全部完成：${parentId}`);
                     continue;
                 }
+                /* 读到的解锁态不可信 = 这张「当天该做」的判断本身没证据。
+                   只有在 CDP 真的能用时才拉住封盘：没有 CDP 的环境（Chrome 常见）
+                   再怎么等也读不到应用身份页面，硬拦只会让日志一直说「还要开页」。 */
+                if (!snap.lockTrusted && cdpUsable) desktopNeedCdp = true;
                 totalFound += snap.cards.length;
                 const open = snap.cards.filter(c => !c.isCompleted);
                 if (open.length === 0) {
@@ -5605,17 +5740,40 @@ const __scBgKeepAlive = (function() {
                 if (!Array.isArray(attempted.ids)) attempted.ids = [];
                 const triedToday = new Set(attempted.ids);
 
-                const openUnlocked = open.filter(c => !c.isLocked);
-                const unlockedIds = new Set(openUnlocked.map(c => c.offerId));
-                const catchUpCards = open.filter(c => !unlockedIds.has(c.offerId) && isOverdue(c));
+                /* 判据分两套，取决于这次读到的 isLocked 可不可信：
+                   ① lockTrusted（CDP 应用身份读的）：isLocked 是真值，照常用；
+                   ② 不可信（没配 CDP / 今日已封盘，退回 GM 直读）：非应用身份下服务端会把
+                      整周子项都渲染成 isLocked=true，再拿它当判据就是「今天这张明明解锁也漏做」，
+                      所以改按 offerId 里的星期推断：只做「星期已到」的那几张。 */
+                const lockTrusted = !!snap.lockTrusted;
+                const dayOfCard = (c) => this.QUESTS.weekdayIndex(c.offerId);
+                const dayIndexed = open.filter(c => dayOfCard(c) >= 0);
+                const readyCards = lockTrusted
+                    ? open.filter(c => !c.isLocked)
+                    : (dayIndexed.length === 0
+                        /* 子项里没有星期信息（换了一套任务结构）：星期推断无从下手，
+                           退回「未完成的都试一遍」，上限 3 张，别一口气全打出去。 */
+                        ? open.filter(c => !c.isLocked).concat(open.filter(c => c.isLocked)).slice(0, 3)
+                        : open.filter(c => {
+                            const i = dayOfCard(c);
+                            return i >= 0 && i <= todayIdx;
+                        }));
+                const readyIds = new Set(readyCards.map(c => c.offerId));
+                const catchUpCards = open.filter(c => !readyIds.has(c.offerId) && isOverdue(c));
                 const catchUpRun = catchUpCards.filter(c => !triedToday.has(c.offerId));
-                const futureLocked = open.filter(c => c.isLocked && !isOverdue(c));
-                const unlocked = openUnlocked.concat(catchUpRun);
+                const futureLocked = open.filter(c => !readyIds.has(c.offerId) && !isOverdue(c));
+                const unlocked = readyCards.concat(catchUpRun);
+                if (open.length > 0 && !lockTrusted) {
+                    Utils.log("🖥️", "桌面周任务：本轮读不到应用身份页面（CDP 不可用），解锁态改按星期推断");
+                }
                 if (unlocked.length === 0) {
-                    Utils.log("🖥️", `桌面专属任务：${open.length} 张待办全部未解锁（未到对应星期），本轮不处理`);
+                    Utils.log("🖥️", `桌面专属任务：${open.length} 张待办都不在可做范围（未到对应星期），本轮不处理`);
+                    /* 解锁态没确认（或是靠星期推断的）就留个余量：今天还没验过真值，
+                       别让收尾把它封到明天（只在 CDP 可用时有意义）。 */
+                    if (!lockTrusted && cdpUsable) desktopNeedCdp = true;
                 } else {
                     Utils.log("🖥️", `桌面奖励应用专属任务：${unlocked.length} 张待办`
-                        + `（服务端已解锁 ${openUnlocked.length} 张`
+                        + `（${lockTrusted ? "服务端已解锁" : "按星期推断已到"} ${readyCards.length} 张`
                         + (catchUpCards.length ? `，补做错过的 ${catchUpCards.length} 张` : "")
                         + `；另有 ${futureLocked.length} 张未到日期，不处理）（${parentId}）`);
                     if (catchUpCards.length) {
@@ -5626,7 +5784,7 @@ const __scBgKeepAlive = (function() {
                     }
                     for (const c of unlocked) {
                         const d = dayOf(c);
-                        const tag = c.isLocked ? "补做" : "已解锁";
+                        const tag = readyIds.has(c.offerId) ? (lockTrusted ? "已解锁" : "按星期") : "补做";
                         Utils.log("🖥️", `  · [${tag}${d ? " " + d : ""}] ${c.title}`);
                     }
                     /* 未解锁的也列出来并带上星期，方便对照「网站说 6 张、脚本说 7 张」这类偏差 */
@@ -5716,16 +5874,28 @@ const __scBgKeepAlive = (function() {
                     Utils.log("🔵", `桌面应用每周专属任务全部完成（本次完成 ${doneHere} 张）`);
                 } else {
 
-                    const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !c.isLocked) : [];
-                    /* 已过期但仍锁定的，是今天试过补做、服务端没受理的那几张；
-                       它们不算「还要等哪一天」，单独归到补做失败里 */
+                    /* 复核同样要区分 isLocked 可信与否，否则「已到日子但没交成」
+                       会被误报成「还在等那一天」。 */
+                    const vTrusted = !!(verify && verify.lockTrusted);
+                    const notReady = (c) => {
+                        if (vTrusted) return !!c.isLocked;
+                        const i = this.QUESTS.weekdayIndex(c.offerId);
+                        return i < 0 || i > todayIdx;
+                    };
+                    const leftUnlocked = verify ? verify.cards.filter(c => !c.isCompleted && !notReady(c)) : [];
+                    /* 还没到日子的，是「要等哪一天」；已过期又没做成的，是补做没受理 */
                     const leftLockedCards = verify
-                        ? verify.cards.filter(c => !c.isCompleted && c.isLocked && !isOverdue(c))
+                        ? verify.cards.filter(c => !c.isCompleted && notReady(c) && !isOverdue(c))
                         : [];
                     const leftOverdue = verify
-                        ? verify.cards.filter(c => !c.isCompleted && c.isLocked && isOverdue(c)).length
+                        ? verify.cards.filter(c => !c.isCompleted && notReady(c) && isOverdue(c)).length
                         : 0;
                     const leftLocked = leftLockedCards.length;
+                    /* 今天该做的没做成 / 解锁态没读准 —— 都算「桌面任务还没收工」，
+                       收尾不能封盘，下一轮继续开页确认并补做。 */
+                    if (leftUnlocked.length > 0 || (leftOverdue > 0 && cdpUsable) || (!vTrusted && cdpUsable)) {
+                        desktopNeedCdp = true;
+                    }
                     if (leftUnlocked.length > 0) {
                         /* 记下待记账的标题，供收尾通知点名 */
                         try {
@@ -5758,6 +5928,10 @@ const __scBgKeepAlive = (function() {
                 /* 只写日志：这类失败下一轮会重试，收尾通知里也会点名 */
                 Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`);
             }
+            /* 让桌面任务也参与收尾封盘：它同样依赖 CDP 的应用身份通道。
+               以前只有活动卡片会写 _promosClean，于是「今天没卡片」时收尾就把今天封盘，
+               而桌面周任务那张当天已解锁的卡还没做，下一轮连页都开不出来，整天不处理。 */
+            if (desktopNeedCdp) CDP._desktopNeed = true;
             return { found: totalFound, done: totalDone, pending: totalPending, failed: totalFailed };
         },
 
@@ -7968,6 +8142,7 @@ const __scBgKeepAlive = (function() {
             soft("CDP令牌", () => {
                 CDP.revokeAllow();
                 CDP._promosClean = false;
+                CDP._desktopNeed = false;
                 CDP._uaOverrideAt = 0;
                 CDP._warnedAt = 0;
             });
@@ -9172,12 +9347,18 @@ const __scBgKeepAlive = (function() {
                     const closed = await CDP.closeOwned();
                     if (closed > 0) Utils.log("🖱️", `已关闭 ${closed} 个本轮临时标签页`);
                     const claimBad = /未成功|异常|待复核/.test(this.claimSummary || "");
-                    if (CDP._promosClean && !claimBad) {
+                    /* 桌面周任务也要点头才封盘：它同样靠 CDP 的应用身份通道，
+                       今天那张已解锁的卡没做完就不该把 CDP 断到明天。 */
+                    const desktopNeed = !!CDP._desktopNeed;
+                    CDP._desktopNeed = false;
+                    if (CDP._promosClean && !claimBad && !desktopNeed) {
                         CDP.markTodayDone();
                         Utils.log("🖱️", "今天所有需要 CDP 的任务都处理完了，之后不再打开标签页（明天自动恢复）");
                     } else {
                         CDP._promosClean = false;
-                        Utils.log("🖱️", "还有需要 CDP 的项未完成，下一轮需要时再静默开页");
+                        Utils.log("🖱️", desktopNeed
+                            ? "还有桌面专属任务没做完，下一轮还要开页（暂不封盘）"
+                            : "还有需要 CDP 的项未完成，下一轮需要时再静默开页");
                     }
                 } catch (_) {}
                 const endTime = Utils.getTimestamp();
