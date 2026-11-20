@@ -64,7 +64,7 @@ Config:
         type: checkbox
         default: true
     span:
-        title: 搜索间隔(最低 60，可设更大；实际在基准 60±15 秒内浮动)
+        title: 搜索间隔(最低 60，可设更大；实际在基准 ±15 秒内浮动)
         type: number
         default: 60
         min: 60
@@ -234,7 +234,7 @@ const __scBgKeepAlive = (function() {
         },
 
         region(fallback = "us") {
-            if (GM_getValue("Config.lock", true)) return "cn";
+            if (Utils.flag("Config.lock", true)) return "cn";
             const r = String(this.state.region || "").toLowerCase().trim();
             return r || fallback;
         },
@@ -576,7 +576,7 @@ const __scBgKeepAlive = (function() {
 
         /* 真正发出去（浏览器通知 + webhook）。只允许 notifyDone / notifyAnomaly 调用 */
         deliver(icon, msg) {
-            if (GM_getValue("Notice.bro", true)) {
+            if (Utils.flag("Notice.bro", true)) {
                 try {
                     GM_notification({
                         title: GM_info.script.name + ` ${icon}`,
@@ -901,6 +901,40 @@ const __scBgKeepAlive = (function() {
             });
         },
 
+        /* 所有「开关型」配置的唯一读法。
+           checkbox 存成什么类型各家管理器不一样：真布尔、字符串 "true"/"false"、
+           数字 1/0、甚至空串都见过。以前各处直接写 `!GM_getValue(key, true)`：
+             · 存成字符串 "false" 时它是「真值」→ 开关关掉了照样跑；
+             · 读取失败/存成空值时又被当成「已关闭」→ 日志写「已关闭」但实际还在跑。
+           这里统一翻译成布尔：只有明确表示「关」的值才算关，其余按默认值兜底。 */
+        flag(key, def = true) {
+            let raw;
+            try { raw = GM_getValue(key, def); } catch (_) { return def; }
+            if (raw === undefined || raw === null) return def;
+            if (typeof raw === "boolean") return raw;
+            if (typeof raw === "number") return raw !== 0;
+            const s = String(raw).trim().toLowerCase();
+            if (!s) return def;
+            if (["false", "0", "off", "no", "n", "false;", "关闭", "否"].indexOf(s) >= 0) return false;
+            if (["true", "1", "on", "yes", "y", "开启", "是"].indexOf(s) >= 0) return true;
+            return def;
+        },
+
+        /* 任务开关（Tasks.*）专用别名，语义上更直白，实际走同一个翻译。 */
+        taskOn(key, def = true) {
+            return this.flag(key, def);
+        },
+
+        /* 「这个键有没有值」—— 给 token / 授权码这类**文本型**配置用。
+           它们不能用 flag()：一串 M.C5xx… 既不是 "true" 也不是 "false"，
+           flag 会按默认值兜底成「没有」，于是整条依赖它的链路被静默掐断。 */
+        has(key) {
+            let raw;
+            try { raw = GM_getValue(key, undefined); } catch (_) { return false; }
+            if (raw === undefined || raw === null || raw === false) return false;
+            return String(raw).trim().length > 0;
+        },
+
         randomRange(min, max) {
             return Math.floor(Math.random() * (max - min + 1) + min);
         },
@@ -1141,7 +1175,7 @@ const __scBgKeepAlive = (function() {
         PROBE_TIMEOUT: 8000,
 
         enabled() {
-            return !!GM_getValue("Config.lock", true);
+            return Utils.flag("Config.lock", true);
         },
 
         HOSTING_RE: /cloudflare|digitalocean|vultr|linode|akamai|fastly|amazon|aws|google\s*cloud|azure|alibaba|aliyun|alicloud|tencent\s*cloud|qcloud|huawei\s*cloud|hetzner|ovh|leaseweb|contabo|hostwinds|hostinger|racknerd|colocrossing|sharktech|psychz|choopa|m247|datacamp|zenlayer|layerstack|gcore|oracle\s*cloud|\bvpn\b|\bproxy\b|tor\s*exit|ipvanish|nordvpn|expressvpn|surfshark|mullvad/i,
@@ -1473,7 +1507,7 @@ const __scBgKeepAlive = (function() {
         },
 
         used(code) {
-            if (!GM_getValue("Config.codeUsed", false)) return false;
+            if (!Utils.flag("Config.codeUsed", false)) return false;
             const fp = String(GM_getValue("Config.codeFingerprint", ""));
             return !fp || fp === String(code || "").slice(-32);
         },
@@ -1584,7 +1618,7 @@ const __scBgKeepAlive = (function() {
 
 
         async autoFetch(reason) {
-            if (!GM_getValue("Config.autoAuth", true)) {
+            if (!Utils.flag("Config.autoAuth", true)) {
                 Utils.log("🔴", `${reason}，且配置里已关闭「自动检测授权码」：请点菜单「🔑 手动授权」，登录后把跳转地址粘贴到「📋 粘贴授权码」。`);
                 return {};
             }
@@ -3003,7 +3037,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async renewToken() {
-            if (!GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true)) return true;
+            if (!Utils.taskOn("Tasks.sign") && !Utils.taskOn("Tasks.read")) return true;
             const cachedAt = GM_getValue("Config.accessTokenTime", 0);
             const cachedAT = GM_getValue("Config.accessToken", "");
             if (cachedAT && cachedAt && Date.now() - cachedAt < 45 * 60 * 1000) {
@@ -3515,7 +3549,7 @@ const __scBgKeepAlive = (function() {
             try {
                 const res = await this.withTokenRetry(token => Utils.xhr({
                     url: RewardsAuto.appConfig.dapiMeUrl,
-                    headers: Utils.appHeaders(token, { country: GM_getValue("Config.lock", true) ? "cn" : "us" })
+                    headers: Utils.appHeaders(token, { country: Utils.flag("Config.lock", true) ? "cn" : "us" })
                 }));
                 if (Utils.isJSON(res)) {
                     const list = JSON.parse(res).response?.promotions || [];
@@ -3735,7 +3769,7 @@ const __scBgKeepAlive = (function() {
                     history: null
                 };
             } catch (e) {
-                if (GM_getValue("Config.debugDAPI", false)) {
+                if (Utils.flag("Config.debugDAPI", false)) {
                     Utils.log("🟡", `getuserinfo 查询失败: ${e.message}`);
                 }
                 return false;
@@ -4235,7 +4269,7 @@ const __scBgKeepAlive = (function() {
            调用方回退到后台 GM_xhr（那种方式对应用专属卡不记账，但聊胜于无）。 */
         async _reportAppSearchViaCdp(query, params, origin) {
             if (typeof WebSocket === "undefined") return null;
-            if (!GM_getValue("Config.questViaCdp", true)) return null;
+            if (!Utils.flag("Config.questViaCdp", true)) return null;
             let page = null;
             try {
                 if (!(await CDP.available())) return null;
@@ -4695,11 +4729,11 @@ const __scBgKeepAlive = (function() {
         startPageServer() {
             if (typeof GM_getValue !== "function") return;
             if (this._pageServerStarted) return;
-            if (GM_getValue("Config.pageServerOff", false)) return;
+            if (Utils.flag("Config.pageServerOff", false)) return;
             this._pageServerStarted = true;
             const tick = async () => {
                 try {
-                    if (GM_getValue("Config.pageServerOff", false)) { this._pageServerStarted = false; return; }
+                    if (Utils.flag("Config.pageServerOff", false)) { this._pageServerStarted = false; return; }
                     GM_setValue(this.PAGE_BOX.alive, Date.now());
                     await this.pageServeOnce();
                 } catch (_) {}
@@ -4722,7 +4756,7 @@ const __scBgKeepAlive = (function() {
         async _ensurePageChannel() {
             /* 页面代发通道已停用（开出来的页还要手动再跑一次脚本，收益低），
                方法保留，恒定返回 null。 */
-            if (!GM_getValue("Config.allowOpenTab", false)) return null;
+            if (!Utils.flag("Config.allowOpenTab", false)) return null;
             Utils.log("🖥️", "已跳过「打开页面代发通道」：只有 CDP 任务才允许开标签页");
             return null;
         },
@@ -4888,7 +4922,7 @@ const __scBgKeepAlive = (function() {
            于是整天漏做）。CDP 不可用（没配 CDP / 今日已封盘 / 开不出页）时退回 GM 直读，
            并把 lockTrusted 置 false —— 调用方改按 offerId 里的星期推断，不再拿 isLocked 当判据。 */
         async _readQuestPage(url, { create = false } = {}) {
-            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+            if (Utils.flag("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
                 try {
                     if (await CDP.available()) {
                         const page = await CDP.ensurePage(url, { nav: false, create: !!create, reason: "desktop" });
@@ -5562,7 +5596,7 @@ const __scBgKeepAlive = (function() {
                 ...RewardsAuto.desktopAppHeaders
             };
 
-            if (GM_getValue("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
+            if (Utils.flag("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
                 try {
                     if (await CDP.available()) {
                         const page = await CDP.ensurePage("https://rewards.bing.com/earn",
@@ -5593,7 +5627,7 @@ const __scBgKeepAlive = (function() {
                 }
             }
 
-            if (GM_getValue("Config.usePageChannel", false)) {
+            if (Utils.flag("Config.usePageChannel", false)) {
                 let tabId = null;
                 if (!this._pageChannelAlive()) {
                     tabId = await this._ensurePageChannel();
@@ -6063,7 +6097,7 @@ const __scBgKeepAlive = (function() {
                 );
                 const accepted = !!hit.ok;
 
-                if (!accepted || GM_getValue("Config.debugDAPI", false)) {
+                if (!accepted || Utils.flag("Config.debugDAPI", false)) {
                     Utils.log("🔬", `交卷响应(${String(card.offerId).slice(0, 36)})：`
                         + `受理=${accepted} 通道=${hit.variant || "无"}${hit.tried ? `(${hit.tried})` : ""} `
                         + `ua=${useAppUA ? "app" : "pc"} dpl=${dpl || "无"} `
@@ -6205,7 +6239,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async getSearchPage(query, isMobile = false) {
-            const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
+            const mkt = Utils.flag("Config.lock", true) ? "&mkt=zh-CN" : "";
             const deviceType = isMobile ? "m" : "d";
             try { await this.getCookieHeader(); } catch (_) {}
             return Utils.xhr({
@@ -6224,7 +6258,7 @@ const __scBgKeepAlive = (function() {
         async reportSearch(html, query, isMobile = false) {
             try {
                 const ig = this.extractIG(html) || Utils.getRandomUUID();
-                const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
+                const mkt = Utils.flag("Config.lock", true) ? "&mkt=zh-CN" : "";
                 const params = `q=${encodeURIComponent(query)}&form=QBLH${mkt}`;
                 const deviceType = isMobile ? "m" : "d";
                 try { await this.getCookieHeader(); } catch (_) {}
@@ -7226,7 +7260,7 @@ const __scBgKeepAlive = (function() {
            国际版卡片也是打微软的接口，打太快同样有风控风险，
            所以不给自己留「1.5~3 秒连打 5 张」这种口子。 */
         async run({ reason = "国际版每日活动", gap = 0, deadline = 0 } = {}) {
-            if (!GM_getValue("Tasks.intlDaily", true)) return null;
+            if (!Utils.taskOn("Tasks.intlDaily")) return null;
             /* 这里不校验 Token：面板走的是 bing.com 的登录 Cookie，
                而不是 prod.rewardsplatform 的 OAuth Token，没有 Token 也能做。 */
 
@@ -7784,8 +7818,14 @@ const __scBgKeepAlive = (function() {
 
         /* 只读刷新一次 profile，不上报不激活。EdgePacer 有节流，
            不刷新汇总会显示很早以前的陈旧进度。 */
+        /* 开关的唯一判定口：日志、诊断、汇总、执行都走这里，
+           免得一处读成「开」、另一处读成「关」，自相矛盾。 */
+        enabled() {
+            return Utils.taskOn("Tasks.edge");
+        },
+
         async refreshFromServer() {
-            if (!GM_getValue("Tasks.edge", true)) return null;
+            if (!this.enabled()) return null;
             if (!GM_getValue("Config.token", false)) return null;
             try {
                 const region = API.edgeRegion();
@@ -7806,10 +7846,21 @@ const __scBgKeepAlive = (function() {
         },
 
         async run() {
-            if (!GM_getValue("Tasks.edge", true)) return null;
-            if (!GM_getValue("Config.token", false)) return null;
+            if (!EdgeStreak.enabled()) return null;
+            /* 这里判的是「有没有 refresh_token」，不是布尔开关：
+               token 是一串 M.C5xx… 的文本，用 flag() 会把它翻译成默认值（=没有），
+               于是上报链在第一步就被挡回去，日志里什么都不会出现。 */
+            if (!Utils.has("Config.token")) {
+                /* 开关开着却没授权：这是「为什么什么都不发生」最常见的原因，
+                   必须写出来，否则日志里只剩一句「检查进度」然后没了。 */
+                Utils.logSilenced("🟡", "Edge 浏览连签：还没有授权（缺 refresh_token），跳过；请先完成一次授权", "edgeNoToken", 6 * 60 * 60 * 1000);
+                return null;
+            }
             if (this._running) return null;
-            if (!Utils.acquireLock("Config.edgeLock", 3 * 60 * 1000)) return null;
+            if (!Utils.acquireLock("Config.edgeLock", 3 * 60 * 1000)) {
+                Utils.logSilenced("🟡", "Edge 浏览连签：另一个上下文正在累计，本次跳过", "edgeLocked", 10 * 60 * 1000);
+                return null;
+            }
             this._running = true;
             try {
                 return await this.step();
@@ -7827,7 +7878,7 @@ const __scBgKeepAlive = (function() {
            服务端延迟记账而和真实进度差很远。以前拿它当进度显示，
            于是出现「页面 30/30 已完成，推送却说 0/6 ⏳」这种自相矛盾。 */
         summary() {
-            if (!GM_getValue("Tasks.edge", true)) return null;
+            if (!this.enabled()) return null;
             const st = this.state();
             const done = !!st.complete;
             /* 分母只能是「活动要求的分钟数」。服务端若给出可信值才采用，
@@ -7863,6 +7914,7 @@ const __scBgKeepAlive = (function() {
             if (Date.now() < this.nextAt) return null;
             if (!(await RegionGuard.allow())) {
                 this.nextAt = Date.now() + 5 * 60 * 1000;
+                Utils.logSilenced("🟡", "Edge 浏览连签：网络出口未通过检测，本次不上报", "edgeRegion", 30 * 60 * 1000);
                 return null;
             }
             this.busy = true;
@@ -8046,8 +8098,11 @@ const __scBgKeepAlive = (function() {
             this.hbTimer = setInterval(() => {
                 try { this.heartbeat(); } catch (_) {}
                 /* Edge 连签挂在轮内心跳上：只在「本轮执行」期间上报，
-                   EdgePacer 自按 intervalMin 节流，一轮 20 分钟推进 3~4 次。 */
-                try { EdgePacer.maybeReport().catch(() => {}); } catch (_) {}
+                   EdgePacer 自按 intervalMin 节流，一轮 20 分钟推进 3~4 次。
+                   开关关着就别再空转这条链（心跳每 30 秒一次，白跑很吵）。 */
+                if (EdgeStreak.enabled()) {
+                    try { EdgePacer.maybeReport().catch(() => {}); } catch (_) {}
+                }
             }, RUN_HEARTBEAT_GAP);
         },
 
@@ -8238,7 +8293,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doSign() {
-            if (!GM_getValue("Tasks.sign", true) || this.signTimes > 2) return;
+            if (!Utils.taskOn("Tasks.sign") || this.signTimes > 2) return;
             if (this.signPoint >= 0 && this.signDate === RewardsAuto.state.dateNowNum) {
                 Utils.log("✅", `签入已完成(${this.signPoint}积分)`);
                 return;
@@ -8277,7 +8332,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doRead(roundDeadline) {
-            if (!GM_getValue("Tasks.read", true) || this.readTimes > 2) return;
+            if (!Utils.taskOn("Tasks.read") || this.readTimes > 2) return;
             if (this.readDate === RewardsAuto.state.dateNowNum) {
                 const verifyProgress = await API.getReadProgress();
                 if (verifyProgress && verifyProgress.progress >= verifyProgress.max) {
@@ -8403,7 +8458,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doDesktopWeekly() {
-            if (!GM_getValue("Tasks.desktopWeekly", true)) return true;
+            if (!Utils.taskOn("Tasks.desktopWeekly")) return true;
             try {
                 const weekly = await API.runDesktopWeeklyQuests();
                 RewardsAuto.state.weeklyQuestDone = weekly.done || 0;
@@ -8417,7 +8472,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doMonthlyPlan() {
-            if (!GM_getValue("Tasks.monthly", true)) {
+            if (!Utils.taskOn("Tasks.monthly")) {
                 RewardsAuto.state.monthlyComplete = false;
                 RewardsAuto.state.monthlyFound = 0;
                 RewardsAuto.state.monthlyPending = 0;
@@ -8438,7 +8493,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doPromos(roundDeadline) {
-            if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 2) return true;
+            if (!Utils.taskOn("Tasks.promos") || this.promosTimes > 2) return true;
             if (this.promosDate === RewardsAuto.state.dateNowNum) {
                 Utils.log("✅", "活动卡片已完成");
                 return true;
@@ -8497,7 +8552,7 @@ const __scBgKeepAlive = (function() {
                 Utils.log("🔴", "CDP 异常：" + e.message);
             }
 
-            const shouldSkip = (card) => card.kind === "quiz" && !GM_getValue("Tasks.quiz", true);
+            const shouldSkip = (card) => card.kind === "quiz" && !Utils.taskOn("Tasks.quiz");
             let ok = 0, fail = 0;
             let gap = SEARCH_PACER.startGap();
             let outOfTime = false;
@@ -8560,7 +8615,7 @@ const __scBgKeepAlive = (function() {
         },
 
         async doSearch(roundDeadline) {
-            if (!GM_getValue("Tasks.search", true)) return;
+            if (!Utils.taskOn("Tasks.search")) return;
             /* 开跑前用 getPcQuota（面板优先）校正一次进度：earn 页 pointsCounters
                可能没刷新，拿偏低基数会让每次回读都误判成「刚涨了」。 */
             let progress = 0, max = 0;
@@ -8911,7 +8966,7 @@ const __scBgKeepAlive = (function() {
 
         async doClaimPoints() {
             await RegionGuard.guard("领取积分");
-            if (!GM_getValue("Tasks.claimPoints", true)) {
+            if (!Utils.taskOn("Tasks.claimPoints")) {
                 this.claimSummary = "⏭️ 已关闭";
                 Utils.log("✅", "自动领取待领积分已关闭（Config：Tasks.claimPoints）");
                 return;
@@ -9160,7 +9215,7 @@ const __scBgKeepAlive = (function() {
                手动「🚀 立即运行」是用户的明确意图 —— force=true 表示「我知道今天做完了，
                现在就是要再跑一轮」，所以这里必须让开，否则点了没反应。
                要立刻重跑就点它；定时唤醒仍然会被这条挡住。 */
-            if (!force && !GM_getValue("Config.keep", true)
+            if (!force && !Utils.flag("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum()) {
                 Utils.log("💤", "今日任务已全部完成且「持续检测」已关闭，本次定时唤醒不执行；明天自动恢复");
                 Sched.state("done");
@@ -9295,7 +9350,7 @@ const __scBgKeepAlive = (function() {
                 }
                 /* 国际版每日活动：必应面板里那 5 张卡，纯接口完成，不占 CDP 也不开标签页 */
                 let intlDailyRes = null;
-                if (!GM_getValue("Tasks.intlDaily", true)) {
+                if (!Utils.taskOn("Tasks.intlDaily")) {
                     Utils.log("  ", "国际版每日活动已关闭（任务开关）");
                 } else if (roundExpired()) {
                     skipByDeadline("国际版每日活动");
@@ -9323,7 +9378,7 @@ const __scBgKeepAlive = (function() {
                             await RegionGuard.guard("二次扫描");
                             this.tick();
                             Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
-                            if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
+                            if (card.kind === "quiz" && !Utils.taskOn("Tasks.quiz")) continue;
                             if (!SEARCH_PACER.fits(roundDeadline, rescanGap)) {
                                 Utils.log("🟡", `二次扫描到点交班，剩余卡片留给下一轮（当前节拍 ${Math.round(rescanGap / 1000)} 秒）`);
                                 break;
@@ -9338,8 +9393,27 @@ const __scBgKeepAlive = (function() {
                         Utils.log("✅", "二次扫描：无新卡片");
                     }
                 }
-                Utils.log("🌐", "检查 Edge 浏览连签进度...");
-                await EdgePacer.maybeReport();
+                /* 关掉时必须连「检查」这一步都不做：以前这里无条件打日志 + 调上报，
+                   开关关着也照样看到 Edge 相关的输出，看起来就像没生效。 */
+                if (EdgeStreak.enabled()) {
+                    Utils.log("🌐", "检查 Edge 浏览连签进度...");
+                    const edgeRes = await EdgePacer.maybeReport();
+                    /* 把「这一步到底做了什么」写全：没结果时至少说明卡在哪，
+                       否则日志里只有一句「检查进度」，看起来就像开关没生效。 */
+                    if (!edgeRes) {
+                        Utils.log("  ", "Edge 浏览连签：本轮没有推进（间隔未到 / 未授权 / 出口未通过，详见上面的说明）");
+                    } else if (edgeRes.done) {
+                        Utils.log("  ", "Edge 浏览连签：今日已达标");
+                    } else if (edgeRes.skipped) {
+                        Utils.log("  ", "Edge 浏览连签：今日已跳过（账号无此活动或已暂停）");
+                    } else {
+                        const mins = Math.max(1, Math.round((edgeRes.waitMs || 0) / 60000));
+                        Utils.log("  ", "Edge 浏览连签：已上报 " + edgeRes.count + "/" + edgeRes.total + " 次，"
+                            + "下次约 " + mins + " 分钟后");
+                    }
+                } else {
+                    Utils.log("⏭️", "Edge 浏览连签已在设置里关闭，本轮跳过（Tasks.edge=关闭）");
+                }
                 /* CDP 收尾（整轮唯一出口）：把本轮自己开的临时标签页全部关掉。
                    只有「活动卡全清 + 首页待领取也过」才封盘到今天结束；
                    否则下一轮（可能 20 分钟后）还允许再开一次。 */
@@ -9398,7 +9472,7 @@ const __scBgKeepAlive = (function() {
                     const dailyOk = !!dailySetRes;
                     /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
                        intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
-                    const intlOk = !GM_getValue("Tasks.intlDaily", true) || intlDailyRes !== false;
+                    const intlOk = !Utils.taskOn("Tasks.intlDaily") || intlDailyRes !== false;
                     const edge = EdgeStreak.summary();
                     const edgeOk = !edge || edge.done || edge.skipped;
                     const mob = info.mobile || {};
@@ -9464,7 +9538,7 @@ const __scBgKeepAlive = (function() {
                         row("🧩 活动卡片", promosOn, promosOk, "");
                     }
                     row("✨ 每日活动", true, dailyOk, this.dailySetSummary || "");
-                    const intlOn = GM_getValue("Tasks.intlDaily", true);
+                    const intlOn = Utils.taskOn("Tasks.intlDaily");
                     const intlFound = Number(RewardsAuto.state.intlFound) || 0;
                     if (!intlOn) {
                         row("🌍 国际版每日活动", false, true, "");
@@ -9570,7 +9644,7 @@ const __scBgKeepAlive = (function() {
                 }
                 /* 「持续检测」关掉后，用 dayVerified（服务端口径）或 isDayComplete()（本地标记）
                    任一成立就封盘 —— 两个判据取并集，避免一个没写标记就停不下来。 */
-                if (!GM_getValue("Config.keep", true) && (dayVerified || isDayComplete())) {
+                if (!Utils.flag("Config.keep", true) && (dayVerified || isDayComplete())) {
                     markDayComplete();
                 }
             } catch (e) {
@@ -9643,7 +9717,7 @@ const __scBgKeepAlive = (function() {
         const env = BrowserEnv.info();
         const saved = String(GM_getValue("Config.claimVariant", "") || "");
         let text = "🎁 待领积分 / 领取通道诊断\n\n";
-        text += `任务开关：${GM_getValue("Tasks.claimPoints", true) ? "开启" : "关闭"}\n`;
+        text += `任务开关：${Utils.taskOn("Tasks.claimPoints") ? "开启" : "关闭"}\n`;
         text += `当前浏览器：${BrowserEnv.summary()}${env.extOriginRisky ? "（新版本，后台直发大概率被拒）" : ""}\n`;
         text += `已记住通道：${saved || "未记录（会按 page → proxy → xhr 逐个试）"}\n`;
         const cdpOk = await CDP.available();
@@ -9685,8 +9759,16 @@ const __scBgKeepAlive = (function() {
         return text;
     };
 
+    /* 诊断专用：把原始值按「人能看懂」的方式打出来，读失败也不要抛。 */
+    const safeRaw = (key) => {
+        try { const v = GM_getValue(key, "(未设置)"); return JSON.stringify(v); } catch (_) { return "(读取失败)"; }
+    };
+    const safeType = (key) => {
+        try { return typeof GM_getValue(key, undefined); } catch (_) { return "unknown"; }
+    };
+
     const diagEdgeStreak = () => {
-        const enabled = GM_getValue("Tasks.edge", true);
+        const enabled = Utils.taskOn("Tasks.edge");
         const st = EdgeStreak.state();
         const total = st.total || Math.ceil(EDGE.TARGET_MINUTES / Math.max(1, st.intervalMin));
         /* 等待时间与上报逻辑同一口径：锚点 + 第 N 个窗口，且不早于上次上报 + 一个窗口。
@@ -9699,7 +9781,11 @@ const __scBgKeepAlive = (function() {
             ) - Date.now())
             : 0;
         let text = "🌐 Edge 浏览连签\n\n";
-        text += `任务开关：${enabled ? "开启" : "关闭"}\n`;
+        /* 把「存了什么、什么类型、翻译成什么」一起打出来：
+           开关行为和设置页对不上时，这一行能直接看出是管理器存成了字符串，
+           还是根本没读到（以前只能靠猜）。 */
+        text += `任务开关：${enabled ? "开启" : "关闭"}`
+            + `（Tasks.edge 原始值=${safeRaw("Tasks.edge")}，类型=${safeType("Tasks.edge")}）\n`;
         /* 汇总口径（服务端为准）放在最前面，和推送里那一行保持一致 */
         {
             const sum = EdgeStreak.summary();
@@ -9718,9 +9804,15 @@ const __scBgKeepAlive = (function() {
         }
         text += `活动激活：${st.activated ? "已尝试" : "未尝试"}${st.extra ? `（已重来 ${st.extra}/${EDGE.MAX_EXTRA_ROUNDS} 轮）` : ""}\n`;
         text += `客户端：${RewardsAuto.ua.edge}\n\n`;
-        text += "现在立刻推进一次（不足一个计费窗口会自动跳过，不刷接口）。";
-        EdgePacer.nextAt = 0;
-        EdgePacer.maybeReport().catch(e => Utils.log("🟡", `Edge 连签手动推进失败：${e.message}`));
+        /* 开关关着就别「顺手推进一次」：诊断面板不该变成绕过开关的后门。 */
+        if (enabled) {
+            text += "现在立刻推进一次（不足一个计费窗口会自动跳过，不刷接口）。";
+            EdgePacer.nextAt = 0;
+            EdgePacer.maybeReport().catch(e => Utils.log("🟡", `Edge 连签手动推进失败：${e.message}`));
+        } else {
+            text += "任务开关已关闭：不会上报、不会激活、也不会打开任何页面。\n"
+                + "要恢复请到脚本设置里勾选「Edge 浏览连签」。";
+        }
         return text;
     };
 
@@ -9729,7 +9821,7 @@ const __scBgKeepAlive = (function() {
         const guard = API.searchGuard();
         const coolLeft = API.searchCooldownLeft();
         let text = "🔍 PC 搜索诊断\n\n";
-        text += `任务开关：${GM_getValue("Tasks.search", true) ? "开启" : "关闭"}\n`;
+        text += `任务开关：${Utils.taskOn("Tasks.search") ? "开启" : "关闭"}\n`;
         text += `搜索间隔：${Math.max(SEARCH_PACER.FLOOR_MS / 1000, pacer.min - SEARCH_PACER.JITTER_MS / 1000)} ~ ${pacer.min + SEARCH_PACER.JITTER_MS / 1000} 秒（对称随机 ±${SEARCH_PACER.JITTER_MS / 1000}，基准 ${pacer.min} 秒）\n`;
         text += `间隔来源：Config.span（基准最低 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒，不设上限；配更小会夹到 ${SEARCH_PACER.SPAN_MIN_MS / 1000} 秒）\n`;
         text += `间隔自证：日志里的「本轮周期 N 秒」才是间隔；「等待 N 秒」是扣掉观察/复核后的剩余，比周期小是正常的\n`;
@@ -9932,14 +10024,20 @@ const __scBgKeepAlive = (function() {
     });
 
     const updateBroMenu = () => {
-        const enabled = GM_getValue("Notice.bro", true);
+        const enabled = Utils.flag("Notice.bro", true);
         return enabled ? "🔕 关闭浏览器通知" : "🔔 开启浏览器通知";
     };
     GM_registerMenuCommand(updateBroMenu(), () => {
-        const current = GM_getValue("Notice.bro", true);
+        const current = Utils.flag("Notice.bro", true);
         GM_setValue("Notice.bro", !current);
         Utils.uiAlert(`浏览器通知已${!current ? "开启" : "关闭"}`);
         try { if (Utils.hasDOM()) location.reload(); } catch (_) {}
+    });
+
+    /* 开关和设置页对不上时，用户需要一个能自己看的地方：
+       这个入口会打出「存的原始值 / 类型 / 翻译结果」以及整条链路的状态。 */
+    GM_registerMenuCommand("🌐 Edge 连签诊断", () => {
+        try { Utils.uiAlert(diagEdgeStreak()); } catch (e) { Utils.uiAlert("诊断失败：" + (e && e.message)); }
     });
 
     GM_registerMenuCommand("📋 查看通知状态", () => {
@@ -10416,7 +10514,7 @@ const __scBgKeepAlive = (function() {
             /* ④ 关了「持续检测」且今天已封盘（doneDate 是 today）：醒来什么都不做。
                doneDate 由 markDayComplete() 写，而它现在看的是「服务端结论 ∪ 本地标记」，
                所以面板显示全部完成时这里一定也能停下来。 */
-            const stopped = !GM_getValue("Config.keep", true)
+            const stopped = !Utils.flag("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
             if (stopped) {
                 this.state("done");
@@ -10523,7 +10621,7 @@ const __scBgKeepAlive = (function() {
         Utils.probeCookiePermission().catch(() => {});
 
         const consumePendingPaste = () => {
-            if (!GM_getValue("Config.pendingPaste", false) || !Utils.hasDOM()) return false;
+            if (!Utils.flag("Config.pendingPaste", false) || !Utils.hasDOM()) return false;
             GM_setValue("Config.pendingPaste", false);
             Utils.waitForBody().then(ok => {
                 if (!ok) return;
@@ -10547,13 +10645,13 @@ const __scBgKeepAlive = (function() {
         const processed = GM_getValue("Config.dailySetProcessed", []);
         const dailySetDone = (Array.isArray(processed) && processed.length > 0 && processed[0]?.date === today)
             || (Number(GM_getValue("Config.dailySetDoneDate", 0)) || 0) === today;
-        const edgeDone = !GM_getValue("Tasks.edge", true)
-            || !GM_getValue("Config.token", false)
+        const edgeDone = !EdgeStreak.enabled()
+            || !Utils.has("Config.token")
             || (() => { const st = EdgeStreak.state(); return st.complete || st.giveUp; })();
-        return checkDone(GM_getValue("Tasks.sign"), TaskManager.signDate) &&
-            checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
-            checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
-            checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
+        return checkDone(Utils.taskOn("Tasks.sign"), TaskManager.signDate) &&
+            checkDone(Utils.taskOn("Tasks.read"), TaskManager.readDate) &&
+            checkDone(Utils.taskOn("Tasks.promos"), TaskManager.promosDate) &&
+            checkDone(Utils.taskOn("Tasks.search"), TaskManager.searchDate) &&
             dailySetDone &&
             edgeDone;
     };
@@ -10574,7 +10672,7 @@ const __scBgKeepAlive = (function() {
         const force = !!(opts && opts.force);
         bootstrap();
 
-        const isKeep = GM_getValue("Config.keep", true);
+        const isKeep = Utils.flag("Config.keep", true);
         if (!force && !isKeep && isDayComplete()) {
             markDayComplete();
             Sched.finish(false);
