@@ -10034,12 +10034,6 @@ const __scBgKeepAlive = (function() {
         try { if (Utils.hasDOM()) location.reload(); } catch (_) {}
     });
 
-    /* 开关和设置页对不上时，用户需要一个能自己看的地方：
-       这个入口会打出「存的原始值 / 类型 / 翻译结果」以及整条链路的状态。 */
-    GM_registerMenuCommand("🌐 Edge 连签诊断", () => {
-        try { Utils.uiAlert(diagEdgeStreak()); } catch (e) { Utils.uiAlert("诊断失败：" + (e && e.message)); }
-    });
-
     GM_registerMenuCommand("📋 查看通知状态", () => {
         const wework = GM_getValue("Notice.wework", "");
         const dingding = GM_getValue("Notice.dingding", "");
