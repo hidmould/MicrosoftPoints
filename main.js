@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分（优化版）
 // @namespace    https://rewards.bing.com/
-// @version      1.6.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅在 Outlook 中探索、✅出口检测（非大陆 IP 直接停手）
+// @version      1.6.1
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅自动领取待领积分、✅连签任务检测、✅每日活动自动上报、✅桌面应用每周专属任务、✅月度计划、✅Edge 浏览连签、✅国际版每日活动、✅出口检测（非大陆 IP 直接停手）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @homepage     https://scriptcat.org/script-show-page/8787
@@ -125,11 +125,6 @@ Tasks:
         default: true
     intlDaily:
         title: 国际版每日活动
-        type: checkbox
-        default: true
-    outlook:
-        title: 在 Outlook 中探索
-        description: Outlook 网页版右侧积分面板里的几张 +10 卡（同样走 bing 接口，不需要开 Outlook）
         type: checkbox
         default: true
 Notice:
@@ -359,18 +354,12 @@ const __scBgKeepAlive = (function() {
             intlPending: 0,
             /* 面板上有、但脚本处理不了的卡（缺 hash 等）。>0 时不能报「全部完成」 */
             intlDropped: 0,
-            /* 两个「为什么没有这一行」的标记，互斥：
-               intlAbsent = 面板里确实没有这组卡（地区/账号不支持或尚未下发）
-               都为 false 且 intlFound=0 = 本轮没跑到（出口拦截/被预算挤掉）
-               没有「今日已封盘」这种状态了：每轮都真的重新拉面板。 */
+            /* 三个「为什么没有这一行」的标记，互斥：
+               intlAbsent = 账号面板里确实没有这组卡（地区/账号不支持）
+               intlCached = 今天已封盘，本轮没再拉面板（数值来自缓存）
+               都为 false 且 intlFound=0 = 本轮没跑到（出口拦截/被预算挤掉） */
             intlAbsent: false,
-            /* 「在 Outlook 中探索」：Outlook 面板里那几张 +10 卡（走 bing 的 flyout 接口）。
-               标记的含义与 intl* 完全一样，避免汇总里把「没查到」说成「做完了」。 */
-            outlookFound: 0,
-            outlookDone: 0,
-            outlookPending: 0,
-            outlookDropped: 0,
-            outlookAbsent: false,
+            intlCached: false,
             webNoAuth: false,
             webFailStreak: 0,
             /* 活动卡片「数据源不可用，无法判断是否完成」。和 webNoAuth 一样是
@@ -1805,6 +1794,7 @@ const __scBgKeepAlive = (function() {
         _wsUrl: "",
 
         OWNED_KEY: "Config.cdpOwnedTabs",
+        DONE_KEY: "Config.cdpDoneDate",
 
         /* ---------------- 开页闸门 ----------------
            只有「确实必须用 CDP」的任务才能拿到令牌，其余一律开不出页。
@@ -1831,6 +1821,15 @@ const __scBgKeepAlive = (function() {
             const key = this._allowOnce;
             this._allowOnce = "";
             return Object.prototype.hasOwnProperty.call(this.ALLOW_REASONS, key) ? key : "";
+        },
+
+        todayDone() {
+            const d = Number(GM_getValue(this.DONE_KEY, 0)) || 0;
+            return !!d && d === Utils.getTodayNum();
+        },
+
+        markTodayDone() {
+            try { GM_setValue(this.DONE_KEY, Utils.getTodayNum()); } catch (_) {}
         },
 
         ownedStored() {
@@ -1993,6 +1992,7 @@ const __scBgKeepAlive = (function() {
             if (!create) return null;
             if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
+            if (this.todayDone()) return null;
             const page = await this.openSilent(fallbackUrl || "https://rewards.bing.com/earn");
             return page;
         },
@@ -2132,6 +2132,7 @@ const __scBgKeepAlive = (function() {
             if (!create) return null;
             if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
+            if (this.todayDone()) return null;
             Utils.log("🖱️", "CDP 可用，静默打开一个后台标签页（不会切走你当前的页面）…");
             const page = await this.openSilent(want);
             if (page) Utils.log("🖱️", "后台标签页已就绪（本轮用完自动关闭）");
@@ -2404,6 +2405,10 @@ const __scBgKeepAlive = (function() {
 
         async claimAll(maxCards, { create = true } = {}) {
             const cap = Number(maxCards) || 6;
+            if (this.todayDone()) {
+                Utils.log("🖱️", "今天需要 CDP 的任务都已处理完，本轮不再连接浏览器调试端口");
+                return { ok: true, handled: 0, done: 0, total: 0, skipped: true };
+            }
             if (!(await this.available())) {
                 const reason = "本地调试端口 " + this.PORT + " 上没有 CDP 服务";
                 this.warn(reason);
@@ -4914,7 +4919,7 @@ const __scBgKeepAlive = (function() {
         /* 读 quest 详情页：优先 CDP 页面通道 + Network.setUserAgentOverride 切桌面应用 UA。
            只有这种读法的 isLocked 才是真值：GM 直读改不了 UA，非应用身份下服务端会把
            整周子项一律渲染成 isLocked=true（2026-11-19 实测：周四那张本已解锁仍报锁定，
-           于是整天漏做）。CDP 不可用（没配 CDP / 开不出页）时退回 GM 直读，
+           于是整天漏做）。CDP 不可用（没配 CDP / 今日已封盘 / 开不出页）时退回 GM 直读，
            并把 lockTrusted 置 false —— 调用方改按 offerId 里的星期推断，不再拿 isLocked 当判据。 */
         async _readQuestPage(url, { create = false } = {}) {
             if (Utils.flag("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
@@ -5708,9 +5713,9 @@ const __scBgKeepAlive = (function() {
 
             let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
             /* 本轮是否还有「该做但没做成 / 解锁态没确认」的桌面任务 ——
-               收尾只是写一句状态；封盘已移除，下一轮照样会开页。 */
+               有的话收尾不能封盘，否则下一轮开不出 CDP 页，整天都补不上。 */
             let desktopNeedCdp = false;
-            /* 这次运行里 CDP 到底能不能用：决定「解锁态没读到」要不要标记桌面任务未收工。 */
+            /* 这次运行里 CDP 到底能不能用：决定「解锁态没读到」要不要拦住收尾封盘。 */
             const cdpUsable = await CDP.available();
             for (const parentId of questIds) {
                 let snap;
@@ -5735,8 +5740,8 @@ const __scBgKeepAlive = (function() {
                     continue;
                 }
                 /* 读到的解锁态不可信 = 这张「当天该做」的判断本身没证据。
-                   只有在 CDP 真的能用时才标记未收工：没有 CDP 的环境（Chrome 常见）
-                   再怎么等也读不到应用身份页面，硬标只会让日志一直说「还要开页」。 */
+                   只有在 CDP 真的能用时才拉住封盘：没有 CDP 的环境（Chrome 常见）
+                   再怎么等也读不到应用身份页面，硬拦只会让日志一直说「还要开页」。 */
                 if (!snap.lockTrusted && cdpUsable) desktopNeedCdp = true;
                 totalFound += snap.cards.length;
                 const open = snap.cards.filter(c => !c.isCompleted);
@@ -5771,7 +5776,7 @@ const __scBgKeepAlive = (function() {
 
                 /* 判据分两套，取决于这次读到的 isLocked 可不可信：
                    ① lockTrusted（CDP 应用身份读的）：isLocked 是真值，照常用；
-                   ② 不可信（没配 CDP / 开不出页，退回 GM 直读）：非应用身份下服务端会把
+                   ② 不可信（没配 CDP / 今日已封盘，退回 GM 直读）：非应用身份下服务端会把
                       整周子项都渲染成 isLocked=true，再拿它当判据就是「今天这张明明解锁也漏做」，
                       所以改按 offerId 里的星期推断：只做「星期已到」的那几张。 */
                 const lockTrusted = !!snap.lockTrusted;
@@ -5921,7 +5926,7 @@ const __scBgKeepAlive = (function() {
                         : 0;
                     const leftLocked = leftLockedCards.length;
                     /* 今天该做的没做成 / 解锁态没读准 —— 都算「桌面任务还没收工」，
-                       收尾只写状态，下一轮继续开页确认并补做。 */
+                       收尾不能封盘，下一轮继续开页确认并补做。 */
                     if (leftUnlocked.length > 0 || (leftOverdue > 0 && cdpUsable) || (!vTrusted && cdpUsable)) {
                         desktopNeedCdp = true;
                     }
@@ -5957,8 +5962,9 @@ const __scBgKeepAlive = (function() {
                 /* 只写日志：这类失败下一轮会重试，收尾通知里也会点名 */
                 Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`);
             }
-            /* 桌面任务同样靠 CDP 的应用身份通道：这里只记录「本轮还没收工」，
-               收尾时用来写一句状态，不再据此把 CDP 封到明天。 */
+            /* 让桌面任务也参与收尾封盘：它同样依赖 CDP 的应用身份通道。
+               以前只有活动卡片会写 _promosClean，于是「今天没卡片」时收尾就把今天封盘，
+               而桌面周任务那张当天已解锁的卡还没做，下一轮连页都开不出来，整天不处理。 */
             if (desktopNeedCdp) CDP._desktopNeed = true;
             return { found: totalFound, done: totalDone, pending: totalPending, failed: totalFailed };
         },
@@ -6573,10 +6579,7 @@ const __scBgKeepAlive = (function() {
         /* 面板数据一次性取回：拿到卡片列表 + 请求体要用的身份字段。
            返回 null 表示「国际版面板不可用 / 没登录」，调用方要当无事发生。 */
         async fetchPanel(host) {
-            /* 必须打破 HTTP 缓存：这个接口是 GET，整份 70 KB 的响应会被浏览器 / GM 缓存。
-               一旦读到上一天的面板，昨天的 complete=true 就会把今天判成「已完成」，
-               今天新下发的卡再也不会被扫（2026-11-24 实测踩到）。 */
-            const url = `https://${host}${this.PATH}&_=${Date.now()}&rn=${Math.random().toString(36).slice(2, 8)}`;
+            const url = `https://${host}${this.PATH}`;
             let text = "";
             try {
                 text = await Utils.xhr({
@@ -6585,9 +6588,7 @@ const __scBgKeepAlive = (function() {
                         "accept": "application/json, text/plain, */*",
                         "user-agent": RewardsAuto.ua.pc,
                         "referer": `https://${host}/`,
-                        "x-requested-with": "XMLHttpRequest",
-                        "cache-control": "no-cache",
-                        "pragma": "no-cache"
+                        "x-requested-with": "XMLHttpRequest"
                     },
                     timeout: 20000
                 });
@@ -6649,17 +6650,7 @@ const __scBgKeepAlive = (function() {
                 if (!id) continue;
                 completeById.set(id, String(a.complete).toLowerCase() === "true");
             }
-            return {
-                host,
-                identity,
-                promos,
-                completeById,
-                balance: Number((data.userInfo || {}).balance) || 0,
-                /* 服务端每次真实应答都会换一个 traceId / impressionId（实测）。
-                   两次读取拿到完全一样的值 = 读的是同一份缓存响应，不是新数据。 */
-                trace: String((data.flyoutResult || {}).traceId || "")
-                    + "|" + String((data.loggingContext || {}).impressionId || "")
-            };
+            return { host, identity, promos, completeById, balance: Number((data.userInfo || {}).balance) || 0 };
         },
 
         /* 从面板数据里挑出国际版每日活动的卡片。
@@ -7313,32 +7304,8 @@ const __scBgKeepAlive = (function() {
             const doneIds = new Set(cards.filter(c => c.complete).map(c => c.offerId));
             const todo = cards.filter(c => !c.complete);
             if (todo.length === 0) {
-                /* 「面板说全完成」必须复核才能认 —— 这是 2026-11-24 那次误报的根因：
-                   面板接口是 GET，一份 70 KB 的响应会被浏览器/GM 缓存，读到上周一天的面板后，
-                   昨天的 complete=true 就把今天判成「已完成」，今天新下发的卡再也不会被扫。
-                   复核方式：立刻再读一次，指纹（traceId + impressionId + 卡片摘要）必须变；
-                   指纹一样 = 拿到的是同一份响应，证明不了今天真做完了，本轮不认。 */
-                let fresh = false;
-                try {
-                    const again = await this.fetchPanel(panel.host);
-                    fresh = !!again && !!again.trace && again.trace !== panel.trace;
-                } catch (_) {}
-                if (!fresh) {
-                    Utils.log("🟡", `国际版面板显示 ${cards.length} 张都已完成，但重新读取拿到的还是同一份响应`
-                        + `（疑似缓存的旧面板），本轮不认，下一轮再确认`);
-                    return {
-                        found: cards.length,
-                        done: 0,
-                        pending: cards.length,
-                        dropped: droppedCards.length,
-                        points: 0,
-                        reason: "面板可能是缓存的旧数据，未能确认"
-                    };
-                }
                 Utils.log("✅", `国际版每日活动已完成（${cards.length} 张）`);
-                /* dropped 必须一起返回：否则上层会按 dropped=0 封盘，
-                   面板上那些没 hash 的卡当天再也不会被处理。 */
-                return { found: cards.length, done: cards.length, pending: 0, dropped: droppedCards.length, points: 0 };
+                return { found: cards.length, done: cards.length, pending: 0, points: 0 };
             }
             Utils.log("🌍", `${reason}：发现 ${todo.length} 张待完成（共 ${cards.length} 张）`);
 
@@ -7547,459 +7514,6 @@ const __scBgKeepAlive = (function() {
                    那正是以前虚报 +35 而实际只有 +20 的原因。 */
                 points: gained > 0 ? gained : 0,
                 /* 汇总里要能说清「为什么还差」：只取第一句原因，别把 5 条通道全塞进去 */
-                reason: pending === 0 ? "" : (outOfTime
-                    ? "本轮时间不够，剩下的下一轮继续"
-                    : String(lastReason || "").split("；")[0].slice(0, 60))
-            };
-        }
-    };
-
-    /* ── 在 Outlook 中探索（Outlook 面板里的「exo-activityChecklist」几张卡）────────
-       Outlook 网页版右侧的「微软积分商城」不是独立接口：它是 OWA 里的一个 iframe，
-       iframe 的地址就是 bing 的 /rewards/panelflyout。所以这组卡和「国际版每日活动」
-       完全同源 —— 纯接口就能拿到卡片和 hash，再打一次 reportactivity 就记账，
-       既不需要 CDP，也不需要真的打开 Outlook（记账不依赖打开落地页）。
-
-       实测要点（2026-11 逐个接口验过）：
-       · channel 固定 BingFlyout；partnerId 只有 OutlookMini / OutlookIOS 这类值在
-         flyout 上真能返回 JSON。OWA 面板自己传的是 OutlookOwa（Monarch 版是
-         OutlookMonarch，还有 Win32 / Android），这几个在 flyout 上直接回
-         「必应当前不可用」错误页（约 14 KB HTML），一张卡片都拿不到。
-       · 卡片位于 flyoutResult.exploreOnOutlookPromotions；未登录或未下发时是空数组，
-         所以「空数组」只说明这轮没有，绝不能当成「已完成」。
-       · 卡片结构与普通推广卡一致：offerId / hash / complete / pointProgressMax /
-         attributes.title / attributes.destination / activityType。
-       · 面板里点卡片时做的事：reportActivity(卡片, hash) 成功后再跳 destination ——
-         记账只需要那一次上报，落地页只是给用户看内容。
-       · 上报体与「国际版每日活动」完全一致（ActivityType / ActivitySubType / OfferId /
-         Channel / PartnerId / UserId / AuthKey / ActivityCount），所以判据直接复用
-         IntlDaily._readReport，不要另写一套成功判定。 */
-    const OutlookExplore = {
-        CHANNEL: "BingFlyout",
-        /* 只有这两个 partnerId 在 flyout 上返回正常 JSON，其余是错误页 */
-        PARTNERS: ["OutlookMini", "OutlookIOS"],
-        REPORT_PATH: "/msrewards/api/v1/reportactivity",
-        CARD_ID: "exo-activityChecklist",
-        MAX_ATTEMPTS: 2,
-
-        /* 每次都带一个随机串：这是 GET，整份响应会被浏览器/GM 缓存，
-           读到旧面板就会把昨天做完的卡当成今天做完（国际版踩过同一个坑）。 */
-        path(partnerId) {
-            return "/rewards/panelflyout/getuserinfo?channel=" + this.CHANNEL
-                + "&partnerId=" + encodeURIComponent(partnerId) + "&lat=1&lang=zh-CN"
-                + "&_=" + Date.now() + "&rn=" + Math.random().toString(36).slice(2, 8);
-        },
-
-        /* 面板同挂在 bing 搜索域下，主机选择与国际版共用一套 */
-        hosts() {
-            return IntlDaily.hosts();
-        },
-
-        /* 取一次面板：卡片 + 上报要用的身份字段。
-           返回 null = 这个 host/partner 不可用，调用方换下一个。 */
-        async fetchPanel(host, partnerId) {
-            const url = "https://" + host + this.path(partnerId);
-            let text = "";
-            try {
-                text = await Utils.xhr({
-                    url,
-                    headers: {
-                        "accept": "application/json, text/plain, */*",
-                        "user-agent": RewardsAuto.ua.pc,
-                        "referer": "https://" + host + "/",
-                        "x-requested-with": "XMLHttpRequest",
-                        "cache-control": "no-cache",
-                        "pragma": "no-cache"
-                    },
-                    timeout: 20000
-                });
-            } catch (e) {
-                Utils.log("  ", "Outlook 面板读取失败（" + host + "/" + partnerId + "）：" + e.message);
-                return null;
-            }
-            const data = Utils.parseJSON(text);
-            if (!data || data.isError === true) return null;
-            const flyout = data.flyoutResult || {};
-            const promos = Array.isArray(flyout.exploreOnOutlookPromotions)
-                ? flyout.exploreOnOutlookPromotions.filter(x => x && typeof x === "object")
-                : [];
-            const pickStr = (...vals) => {
-                for (const v of vals) {
-                    const t = String(v == null ? "" : v).trim();
-                    if (t && t !== "undefined" && t !== "null") return t;
-                }
-                return "";
-            };
-            const identity = {
-                channel: pickStr(data.channel, flyout.channel, this.CHANNEL),
-                partnerId: pickStr(data.partnerId, flyout.partnerId, partnerId),
-                userId: pickStr(
-                    data.userId,
-                    data.UserId,
-                    data.userInfo && data.userInfo.userId,
-                    data.userInfo && data.userInfo.UserId,
-                    flyout.profile && flyout.profile.userId,
-                    data.loggingContext && data.loggingContext.userId
-                )
-            };
-            /* 拿不到 UserId：服务端会把上报当游客（IsRewardsUser=false），
-               交了也不记账，所以直接视为「这轮没数据」。 */
-            if (!identity.userId) {
-                Utils.log("  ", "Outlook 面板缺少 UserId（未登录/未授权），本轮跳过");
-                return null;
-            }
-            /* userInfo.promotions 里的 complete 是权威值，用来校正卡片自身的字段 */
-            const completeById = new Map();
-            for (const p of (data.userInfo && data.userInfo.promotions) || []) {
-                const a = (p && p.attributes) || {};
-                const id = String(a.offerId || a.offerid || p.name || "");
-                if (id) completeById.set(id, String(a.complete).toLowerCase() === "true");
-            }
-            return {
-                host,
-                partnerId,
-                identity,
-                promos,
-                completeById,
-                balance: Number((data.userInfo || {}).balance) || 0,
-                /* 同国际版：traceId 相同即缓存，用来复核「面板说全完成」 */
-                trace: String((data.flyoutResult || {}).traceId || "")
-                    + "|" + String((data.loggingContext || {}).impressionId || "")
-            };
-        },
-
-        /* 只认这组卡本身：面板里还有每日签到、连签、兑换广告等，一律忽略。
-           处理不了的卡记进 dropped，避免出现「面板还亮着卡、汇总却说全完成」。 */
-        pickCards(panel) {
-            const seen = new Map();
-            const dropped = [];
-            for (const p of panel.promos) {
-                const attr = p.attributes || {};
-                const offerId = String(p.offerId || attr.offerId || attr.offerid || p.name || "");
-                if (!offerId) continue;
-                const title = String(attr.title || p.title || p.name || offerId);
-                if (seen.has(offerId)) {
-                    dropped.push({ offerId, title, why: "重复 offerId" });
-                    continue;
-                }
-                if (!p.hash) {
-                    dropped.push({ offerId, title, why: "面板未下发 hash，无法交卷" });
-                    continue;
-                }
-                /* complete 有三种形态都要认：布尔、字符串 "True"、promotions 里的权威值 */
-                const done = p.complete === true
-                    || String(p.complete).toLowerCase() === "true"
-                    || String(attr.complete).toLowerCase() === "true"
-                    || panel.completeById.get(offerId) === true;
-                const lock = CardLock.probe({
-                    ...attr,
-                    offerId,
-                    title,
-                    name: p.name || offerId,
-                    State: p.State || attr.State
-                });
-                seen.set(offerId, {
-                    offerId,
-                    title,
-                    activityType: p.activityType || "outlookredirect",
-                    hash: p.hash,
-                    points: Number(p.pointProgressMax || attr.pointProgressMax || 10) || 10,
-                    complete: done,
-                    destination: String(attr.destination || ""),
-                    /* 锁态只作参考：带锁也照样试着交，失败后如实汇报 */
-                    locked: lock.locked === true,
-                    lockReason: lock.reason || "",
-                    needApp: !!lock.appExclusive || lock.appOnly === true
-                });
-            }
-            const out = [...seen.values()];
-            Object.defineProperty(out, "dropped", {
-                value: dropped, enumerable: false, configurable: true, writable: true
-            });
-            return out;
-        },
-
-        _bodyFor(panel, card) {
-            return {
-                ActivityType: card.activityType,
-                ActivitySubType: "",
-                OfferId: card.offerId,
-                Channel: panel.identity.channel,
-                PartnerId: panel.identity.partnerId,
-                UserId: panel.identity.userId,
-                AuthKey: card.hash,
-                ActivityCount: 1
-            };
-        },
-
-        /* 交卷通道：与面板自己的 XHR 一致（text/plain + Origin）。
-           ① native：cookie:false，让 GM 直接带浏览器 cookie（登录态最完整）；
-           ② plain+origin：手工形态，兼容另一条链路；
-           ③ 页面代发：前两条都被拒时才用。判据一律走 IntlDaily._readReport。 */
-        async report(panel, card) {
-            const payload = JSON.stringify(this._bodyFor(panel, card));
-            const url = "https://" + panel.host + this.REPORT_PATH;
-            const origin = "https://" + panel.host;
-            const base = {
-                "accept": "application/json, text/plain, */*",
-                "user-agent": RewardsAuto.ua.pc,
-                "referer": "https://" + panel.host + "/"
-            };
-            const variants = [
-                { name: "native", cookie: false, headers: { ...base, "content-type": "text/plain;charset=UTF-8", origin } },
-                { name: "plain+origin", headers: { ...base, "content-type": "text/plain;charset=UTF-8", origin } }
-            ];
-            const reasons = [];
-            for (const v of variants) {
-                let res = null;
-                try {
-                    res = await Utils.xhrFull({
-                        method: "POST",
-                        url,
-                        headers: v.headers,
-                        data: payload,
-                        timeout: 20000,
-                        redirect: "manual",
-                        ...(v.cookie === false ? { cookie: false } : {})
-                    });
-                } catch (e) {
-                    reasons.push(v.name + ": " + e.message);
-                    continue;
-                }
-                const status = Number(res && res.status) || 0;
-                if (status >= 300 && status < 400) {
-                    reasons.push(v.name + ": HTTP " + status + " 被重定向");
-                    continue;
-                }
-                const r = IntlDaily._readReport(String((res && res.text) || ""));
-                if (!r.json) { reasons.push(v.name + ": 返回非 JSON"); continue; }
-                if (r.errorCode) { reasons.push(v.name + ": ErrorCode=" + r.errorCode); continue; }
-                if (r.isRewardsUser === false) { reasons.push(v.name + ": 未识别登录态"); continue; }
-                if (r.earned > 0 || r.activityComplete === true || r.offerComplete === true) {
-                    return { ok: true, via: v.name, points: r.earned, balance: r.balance };
-                }
-                reasons.push(v.name + ": 已受理但未新增记账");
-            }
-            if (typeof API !== "undefined" && API._pageChannelAlive && API._pageChannelAlive()) {
-                try {
-                    const out = await API.viaPageChannel(
-                        url,
-                        { ...base, "content-type": "text/plain;charset=UTF-8" },
-                        payload,
-                        20000,
-                        "POST"
-                    );
-                    const r = IntlDaily._readReport((out && out.text) || "");
-                    if (r.json && !r.errorCode && r.isRewardsUser !== false
-                        && (r.earned > 0 || r.activityComplete === true || r.offerComplete === true)) {
-                        return { ok: true, via: "page", points: r.earned, balance: r.balance };
-                    }
-                    reasons.push("page: " + (r.json
-                        ? (r.errorCode ? "ErrorCode=" + r.errorCode : "已受理但未新增记账")
-                        : "返回非 JSON"));
-                } catch (e) {
-                    reasons.push("page: " + e.message);
-                }
-            }
-            return { ok: false, reason: reasons.join("；") || "全部通道失败" };
-        },
-
-        /* 主流程：取面板 → 挑卡 → 逐张交卷 → 回读确认（交卷≠到账）。
-           返回 {found, done, pending, dropped, points, reason}；面板没这组卡时 found=0。 */
-        async run({ reason = "在 Outlook 中探索", gap = 0, deadline = 0 } = {}) {
-            if (!Utils.taskOn("Tasks.outlook")) return null;
-            let panel = null;
-            let lastPanel = null;
-            let cards = [];
-            /* 主机 × partnerId 逐个试：只有真返回 JSON 的那个才算数 */
-            for (const host of this.hosts()) {
-                for (const pid of this.PARTNERS) {
-                    const p = await this.fetchPanel(host, pid);
-                    if (!p) continue;
-                    if (!lastPanel) lastPanel = p;
-                    const picked = this.pickCards(p);
-                    if (picked.length > 0) { panel = p; cards = picked; break; }
-                }
-                if (panel) break;
-            }
-            if (!panel) {
-                if (!lastPanel) return null;
-                panel = lastPanel;
-                cards = this.pickCards(panel);
-            }
-            const droppedCards = (cards && cards.dropped) || [];
-            if (droppedCards.length > 0) {
-                Utils.log("🟠", "Outlook 面板里有 " + droppedCards.length + " 张卡处理不了："
-                    + droppedCards.map(c => c.title + "（" + c.why + "）").join("、"));
-            }
-            if (cards.length === 0) {
-                Utils.log("  ", "Outlook 面板里没有探索卡片（服务端这轮没下发，稍后重查）");
-                return { found: 0, done: 0, pending: 0, dropped: droppedCards.length, points: 0, reason: "" };
-            }
-            const doneIds = new Set(cards.filter(c => c.complete).map(c => c.offerId));
-            const todo = cards.filter(c => !c.complete);
-            if (todo.length === 0) {
-                /* 与国际版同一条规则：「面板说全完成」必须复核。
-                   两次读取的指纹相同 = 拿到的是缓存里的同一份响应，
-                   证明不了今天真的做完了，不能据此封盘。 */
-                let fresh = false;
-                try {
-                    const again = await this.fetchPanel(panel.host, panel.partnerId);
-                    fresh = !!again && !!again.trace && again.trace !== panel.trace;
-                } catch (_) {}
-                if (!fresh) {
-                    Utils.log("🟡", "Outlook 面板显示 " + cards.length + " 张都已完成，但重新读取拿到的还是同一份响应"
-                        + "（疑似缓存的旧面板），本轮不认，下一轮再确认");
-                    return {
-                        found: cards.length,
-                        done: 0,
-                        pending: cards.length,
-                        dropped: droppedCards.length,
-                        points: 0,
-                        reason: "面板可能是缓存的旧数据，未能确认"
-                    };
-                }
-                Utils.log("✅", "在 Outlook 中探索已全部完成（" + cards.length + " 张）");
-                return { found: cards.length, done: cards.length, pending: 0, dropped: droppedCards.length, points: 0, reason: "" };
-            }
-            Utils.log("📮", reason + "：发现 " + todo.length + " 张待完成（面板共 " + cards.length + " 张）");
-
-            const balanceBefore = panel.balance;
-            const pacer = (typeof SEARCH_PACER !== "undefined") ? SEARCH_PACER : null;
-            let beatGap = Number(gap) > 0 ? Number(gap) : (pacer ? pacer.startGap() : 60 * 1000);
-            const failed = [];
-            let lastReason = "";
-            let outOfTime = false;
-            let idx = 0;
-            for (const card of todo) {
-                if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) {
-                    outOfTime = true;
-                    Utils.log("🟡", "在 Outlook 中探索到点交班，剩余 " + (todo.length - idx) + " 张留给下一轮");
-                    break;
-                }
-                idx++;
-                let last = null;
-                for (let attempt = 1; attempt <= this.MAX_ATTEMPTS; attempt++) {
-                    last = await this.report(panel, card);
-                    if (last && last.ok) break;
-                    lastReason = (last && last.reason) || "未知原因";
-                    if (attempt < this.MAX_ATTEMPTS) await Utils.randomDelay(3000, 8000);
-                }
-                if (last && last.ok) {
-                    Utils.log("📮", "Outlook 卡片已交卷（待服务端确认）：" + card.title + " 名义 +" + card.points + "p");
-                } else {
-                    failed.push({ name: card.title, reason: lastReason });
-                }
-                const isLast = idx >= todo.length;
-                if (isLast) continue;
-                if (pacer) {
-                    beatGap = pacer.nextGap(beatGap, !!(last && last.ok));
-                    if (deadline > 0 && !pacer.fits(deadline, beatGap)) {
-                        outOfTime = true;
-                        Utils.log("🟡", "在 Outlook 中探索到点交班，剩余 " + (todo.length - idx) + " 张留给下一轮");
-                        break;
-                    }
-                    await pacer.beat(beatGap);
-                } else {
-                    await Utils.randomDelay(1500, 3000);
-                }
-            }
-            if (failed.length > 0) {
-                Utils.log("🟠", "Outlook 卡片交卷未受理 " + failed.length + " 张："
-                    + failed.map(f => f.name).join("、")
-                    + "（" + String(failed[0].reason).split("；")[0] + "）");
-            }
-
-            /* 判据只认面板回读的 complete：交卷≠到账，服务端入账是异步的 */
-            let gained = 0;
-            const confirmedIds = new Set(doneIds);
-            const readBack = async () => {
-                let after = await this.fetchPanel(panel.host, panel.partnerId);
-                if (!after) {
-                    await Utils.delay(4000);
-                    after = await this.fetchPanel(panel.host, panel.partnerId);
-                }
-                if (!after) return null;
-                const nowCards = this.pickCards(after);
-                for (const c of nowCards) {
-                    if (c.complete) {
-                        doneIds.add(c.offerId);
-                        confirmedIds.add(c.offerId);
-                    }
-                }
-                gained = Math.max(gained, after.balance - balanceBefore);
-                return { cards: nowCards };
-            };
-            try {
-                await Utils.delay(2500);
-                const first = await readBack();
-                if (first) {
-                    const acked = [];
-                    const notAcked = [];
-                    for (const card of todo) {
-                        const now = first.cards.find(c => c.offerId === card.offerId);
-                        if (now && now.complete) acked.push(card.title + " +" + card.points + "p");
-                        else notAcked.push(card.title);
-                    }
-                    if (acked.length > 0) {
-                        Utils.log("✅", "服务端已确认到账 " + acked.length + " 张：" + acked.join("、"));
-                    }
-                    if (notAcked.length > 0) {
-                        Utils.log("🟡", "服务端未确认到账 " + notAcked.length + " 张：" + notAcked.join("、") + "（下一轮继续）");
-                    }
-                }
-                /* 补做一轮：还有没确认的，隔一个节拍再来一次（只 1 轮，避免挤掉后续任务） */
-                const still = todo.filter(c => !confirmedIds.has(c.offerId));
-                if (still.length > 0) {
-                    if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) {
-                        Utils.log("🟡", "在 Outlook 中探索到点：还剩 " + still.length + " 张，交给下一轮");
-                    } else {
-                        Utils.log("  ", "Outlook 补做一轮：" + still.length + " 张未确认，"
-                            + Math.round((pacer ? pacer.minMs() : 60000) / 1000) + " 秒后重试");
-                        if (pacer) await pacer.beat(beatGap);
-                        else await Utils.randomDelay(30000, 45000);
-                        for (const card of still) {
-                            if (pacer && deadline > 0 && !pacer.fits(deadline, beatGap)) break;
-                            const last = await this.report(panel, card);
-                            if (last && last.ok) {
-                                Utils.log("📮", "Outlook 卡片补做已交卷（待确认）：" + card.title);
-                            }
-                            if (pacer) await pacer.beat(beatGap);
-                        }
-                        await Utils.delay(2500);
-                        await readBack();
-                    }
-                }
-            } catch (_) { }
-
-            const pending = cards.filter(c => !confirmedIds.has(c.offerId)).length;
-            const confirmedCount = cards.length - pending;
-            const droppedNote = droppedCards.length > 0
-                ? "；另有 " + droppedCards.length + " 张处理不了（" + droppedCards.map(c => c.title).join("、") + "）"
-                : "";
-            if (pending === 0 && droppedCards.length === 0) {
-                Utils.log("✅", "在 Outlook 中探索全部完成（" + cards.length + " 张）"
-                    + (gained > 0 ? "（余额 +" + gained + "）" : "（服务端已确认）"));
-            } else if (pending === 0) {
-                /* 能交卷的都到账了，但面板上还有卡脚本拿不到 hash：
-                   不能报「全部完成」，也不能说成「下一轮继续」（这些卡再来一轮也一样） */
-                Utils.log("🟡", "在 Outlook 中探索：可处理的 " + confirmedCount + " 张已到账，"
-                    + "另有 " + droppedCards.length + " 张面板没给 hash，脚本交不了，需要手动点一下");
-            } else if (confirmedCount === 0) {
-                Utils.log("🟠", "Outlook 探索：" + cards.length + " 张均未确认到账"
-                    + "（交卷已发，服务端回读仍未完成）"
-                    + (lastReason ? "：" + String(lastReason).split("；")[0] : "") + droppedNote);
-            } else {
-                Utils.log("🟡", "Outlook 探索：确认到账 " + confirmedCount + "/" + cards.length + " 张"
-                    + "，还差 " + pending + " 张，下一轮继续" + droppedNote);
-            }
-            return {
-                found: cards.length,
-                done: confirmedCount,
-                pending,
-                dropped: droppedCards.length,
-                /* 分数只报实测余额增量，不用「名义分值 × 次数」估算 */
-                points: gained > 0 ? gained : 0,
                 reason: pending === 0 ? "" : (outOfTime
                     ? "本轮时间不够，剩下的下一轮继续"
                     : String(lastReason || "").split("；")[0].slice(0, 60))
@@ -8660,11 +8174,7 @@ const __scBgKeepAlive = (function() {
                 s.intlDone = 0;
                 s.intlPending = 0;
                 s.intlAbsent = false;
-                s.outlookFound = 0;
-                s.outlookDone = 0;
-                s.outlookPending = 0;
-                s.outlookDropped = 0;
-                s.outlookAbsent = false;
+                s.intlCached = false;
                 s.webNoAuth = false;
                 s.webFailStreak = 0;
                 s.sendMSG = "";
@@ -8681,9 +8191,9 @@ const __scBgKeepAlive = (function() {
                 API._ckAt = 0;
             });
 
-            /* ④ CDP 的一次性令牌与本轮结论标记。
-               _promosClean / _desktopNeed 只描述**本轮**状态（开页白名单、日志口径），
-               不再是「今天不用再开页」的封盘位，因此每轮都会清零重算。 */
+            /* ④ CDP 的一次性令牌与封盘标记。
+               _promosClean 表示「本轮活动卡是否全清」，是**本轮**结论，
+               跨轮沿用会让下一轮误以为可以直接封盘。 */
             soft("CDP令牌", () => {
                 CDP.revokeAllow();
                 CDP._promosClean = false;
@@ -8784,9 +8294,10 @@ const __scBgKeepAlive = (function() {
 
         async doSign() {
             if (!Utils.taskOn("Tasks.sign") || this.signTimes > 2) return;
-            /* 以前这里按 signDate 直接短路，等于当天封盘。
-               但同一天也可能再出一次签入（换区、掉签、服务端回滚），
-               交给签入接口自己判重：重复打只会回「已签到」，不会重复加分。 */
+            if (this.signPoint >= 0 && this.signDate === RewardsAuto.state.dateNowNum) {
+                Utils.log("✅", `签入已完成(${this.signPoint}积分)`);
+                return;
+            }
             await RegionGuard.guard("签入");
             await Utils.randomDelay();
             let totalPoint = 0;
@@ -8813,10 +8324,7 @@ const __scBgKeepAlive = (function() {
                 this.signDate = RewardsAuto.state.dateNowNum;
                 GM_setValue("Config.signPoint", totalPoint);
                 this.save();
-                /* 封盘移除后每轮都会重打一次签入：服务端判重、不会重复加分，
-                   所以「本轮 +0」只当背景信息，别每 20 分钟刷一条 🔵。 */
-                if (totalPoint > 0) Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
-                else Utils.logSilenced("  ", "签入已完成（服务端已确认，本轮无新增积分）", "signQuiet", 30 * 60 * 1000);
+                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
             } else {
                 this.signTimes++;
                 Utils.log("🟡", `签入失败，稍后重试`);
@@ -8986,9 +8494,10 @@ const __scBgKeepAlive = (function() {
 
         async doPromos(roundDeadline) {
             if (!Utils.taskOn("Tasks.promos") || this.promosTimes > 2) return true;
-            /* 不再按 promosDate 短路：当天封盘已移除。
-               每轮都重新扫一遍卡片，已完成的卡由 claimCard 里的
-               isOfferCompleteAny 去重，不会重复上报。 */
+            if (this.promosDate === RewardsAuto.state.dateNowNum) {
+                Utils.log("✅", "活动卡片已完成");
+                return true;
+            }
             Utils.log("🧩", "扫描活动卡片...");
             try { await API.getCookieHeader(); } catch (_) {}
             const cards = await API.discoverCards();
@@ -9019,7 +8528,7 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.promosUnknown = false;
                 Utils.log("✅", "未发现待处理活动卡片");
                 this.promosDate = RewardsAuto.state.dateNowNum;
-                CDP._promosClean = true;   /* 没有卡片 = 本轮不需要 CDP 开页（只是本轮结论，不按天封盘） */
+                CDP._promosClean = true;   /* 没有卡片 = 今天不需要 CDP，收尾时直接封盘 */
                 this.save();
                 return true;
             }
@@ -9080,10 +8589,13 @@ const __scBgKeepAlive = (function() {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
             }
-            /* 只记录「本轮 CDP 是否干净」供收尾日志用；不再写任何「今天不用再开页」的日期标记。
-               当天封盘已经移除：下一轮哪怕还缺一张卡，也照样允许再开一次页。 */
+            /* 本轮的 CDP 结果先记着，收标签页与封盘放到整轮末尾做。
+               还有 lockedNow / outOfTime 就不能封盘。 */
             const stillNeedsCdp = outOfTime || lockedNow > 0 || pending > 0;
             CDP._promosClean = !stillNeedsCdp;
+            if (stillNeedsCdp) {
+                try { GM_setValue(CDP.DONE_KEY, 0); } catch (_) {}
+            }
             const manualCards = (RewardsAuto.state.manualCards || []);
             if (manualCards.length > 0) {
                 /* 过程状态：每轮都会重现同一批卡，推送只会变成噪音 */
@@ -9529,9 +9041,39 @@ const __scBgKeepAlive = (function() {
             /* 节拍与搜索/阅读共用 Config.span（最低 60 秒）：
                5 张卡之间各隔一个节拍，而不是十几秒内连着打完。 */
             const gap = SEARCH_PACER.startGap();
-            /* 当天封盘已整体移除：不再读 Config.intlDailyDate 的「今天已完成」记录，
-               也不再因为「上一轮面板里没卡」而跳过。每一轮都真的重新拉面板，
-               已完成与否只认这一轮服务端返回的卡片状态（面板说全完成时仍会复核新鲜度）。 */
+            const today = Utils.getTodayNum();
+            const key = "Config.intlDailyDate";
+            const st = GM_getValue(key, null);
+
+            /* found=0 的记录不能走这里：那只是「这一轮面板没卡」，不是「今天做完了」，
+               交给下面的重新检查分支处理 */
+            if (st && Number(st.date) === today && Number(st.pending) === 0 && Number(st.found) > 0) {
+                RewardsAuto.state.intlFound = Number(st.found) || 0;
+                RewardsAuto.state.intlDone = Number(st.done) || 0;
+                RewardsAuto.state.intlPending = 0;
+                RewardsAuto.state.intlReason = "";
+                RewardsAuto.state.intlCached = true;
+                Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
+                return true;
+            }
+            /* 「本轮面板没卡」≠「今天没有这组活动」：推广位是陆续下发的。
+               found=0 只当短时结论，过一会儿重新拉面板。 */
+            if (st && Number(st.date) === today && Number(st.found) === 0) {
+                const stamped = Number(st.at) || 0;
+                const waited = Date.now() - stamped;
+                const RELOOK = 30 * 60 * 1000;
+                if (stamped > 0 && waited < RELOOK) {
+                    RewardsAuto.state.intlFound = 0;
+                    RewardsAuto.state.intlDone = 0;
+                    RewardsAuto.state.intlPending = 0;
+                    RewardsAuto.state.intlAbsent = true;
+                    RewardsAuto.state.intlCached = true;
+                    Utils.log("  ", `国际版每日活动：本轮面板里没有这组卡片`
+                        + `（${Math.max(1, Math.round((RELOOK - waited) / 60000))} 分钟后重新检查）`);
+                    return true;
+                }
+                Utils.log("  ", "国际版每日活动：上次没看到卡片，这次重新拉一次面板");
+            }
             let res = null;
             try {
                 res = await IntlDaily.run({ reason: "国际版每日活动", gap, deadline: roundDeadline });
@@ -9542,8 +9084,8 @@ const __scBgKeepAlive = (function() {
             if (!res) return false;
             if (res.found === 0) {
                 /* 面板里一张都没有：这账号本来就没有这组活动（地区/账号不支持）。
-                   和「代码没跑到」是两回事，日志里要能一眼区分，否则下次又得回来查。
-                   不写任何当日记录：下一轮照常重新拉面板。 */
+                   和「代码没跑到」是两回事，日志里要能一眼区分，否则下次又得回来查。 */
+                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0, at: Date.now() });
                 RewardsAuto.state.intlFound = 0;
                 RewardsAuto.state.intlDone = 0;
                 RewardsAuto.state.intlPending = 0;
@@ -9552,58 +9094,16 @@ const __scBgKeepAlive = (function() {
                 return true;
             }
             RewardsAuto.state.intlAbsent = false;
-            /* 不再写当日封盘记录：每轮都以这一轮的面板结果为准 */
+            RewardsAuto.state.intlCached = false;
+            /* 把 dropped 也存进去：只有「没有待办 + 没有把握不了的卡」才允许封盘。
+               否则那些没 hash 的卡会被永久跳过（封盘后当天不再重试）。 */
             const droppedN = Number(res.dropped) || 0;
+            GM_setValue(key, { date: today, found: res.found, done: res.done, pending: res.pending, dropped: droppedN, at: Date.now() });
             RewardsAuto.state.intlFound = res.found;
             RewardsAuto.state.intlDone = res.done;
             RewardsAuto.state.intlPending = res.pending;
             RewardsAuto.state.intlDropped = droppedN;
             RewardsAuto.state.intlReason = res.reason || "";
-            return res.pending === 0 && droppedN === 0;
-        },
-
-        /* 在 Outlook 中探索：与 doIntlDaily 同一套写法，state 字段分开，两边互不影响。
-           注意：这里不写任何「今天已完成」的封盘记录，每轮都重新拉面板。 */
-        async doOutlookExplore(roundDeadline) {
-            /* 同样用 allow()：这组卡只是额外的分数，出口探测抖动不该中断整轮 */
-            if (!(await RegionGuard.allow())) {
-                Utils.log("🟡", "出口探测未通过，在 Outlook 中探索本轮跳过");
-                return false;
-            }
-            const gap = SEARCH_PACER.startGap();
-            /* 当天封盘已整体移除：不再读 Config.outlookDate 的「今天已完成」记录，
-               也不再因为「上一轮面板里没卡」而跳过；每轮都真的重新拉一次面板。 */
-            let res = null;
-            try {
-                res = await OutlookExplore.run({
-                    reason: "在 Outlook 中探索",
-                    gap,
-                    deadline: roundDeadline
-                });
-            } catch (e) {
-                Utils.log("🟡", `在 Outlook 中探索异常：${e.message}（不影响其它任务）`);
-                return false;
-            }
-            if (!res) return false;
-            if (res.found === 0) {
-                /* 面板里一张都没有：可能这账号本来就没有这组卡，也可能服务端还没下发。
-                   和「代码没跑到」是两回事，日志与汇总都要能一眼区分。
-                   不写当日记录：下一轮照常重新拉面板。 */
-                RewardsAuto.state.outlookFound = 0;
-                RewardsAuto.state.outlookDone = 0;
-                RewardsAuto.state.outlookPending = 0;
-                RewardsAuto.state.outlookAbsent = true;
-                Utils.log("  ", "在 Outlook 中探索：面板里没有这组卡片（地区/账号不支持或尚未下发）");
-                return true;
-            }
-            RewardsAuto.state.outlookAbsent = false;
-            /* 不再写当日封盘记录：每轮都以这一轮的面板结果为准 */
-            const droppedN = Number(res.dropped) || 0;
-            RewardsAuto.state.outlookFound = res.found;
-            RewardsAuto.state.outlookDone = res.done;
-            RewardsAuto.state.outlookPending = res.pending;
-            RewardsAuto.state.outlookDropped = droppedN;
-            RewardsAuto.state.outlookReason = res.reason || "";
             return res.pending === 0 && droppedN === 0;
         },
 
@@ -9858,27 +9358,15 @@ const __scBgKeepAlive = (function() {
                     await Utils.randomDelay();
                     intlDailyRes = await this.doIntlDaily(roundDeadline);
                 }
-                /* 在 Outlook 中探索：Outlook 右侧积分面板里那几张 +10 卡。
-                   面板本身就是 bing 的 flyout iframe，所以同样是纯接口完成，
-                   不占 CDP、不开标签页、也不需要真的打开 Outlook。 */
-                if (!Utils.taskOn("Tasks.outlook")) {
-                    Utils.log("  ", "在 Outlook 中探索已关闭（任务开关）");
-                } else if (roundExpired()) {
-                    skipByDeadline("在 Outlook 中探索");
-                } else {
-                    await Utils.randomDelay();
-                    await this.doOutlookExplore(roundDeadline);
-                }
                 try {
                     await this.doClaimPoints();
                 } catch (e) {
                     if (e && e.regionBlocked) throw e;
                     Utils.log("🟡", `领取积分执行异常: ${e.message}`);
                 }
-                /* 二次扫描不再被「本轮预算到点」跳过：用户要的是每次都要扫一遍。
-                   单张卡之间仍用 SEARCH_PACER.fits 逐张判断，真到点了只停剩下的卡，
-                   整轮下次唤醒照常重扫。 */
-                {
+                if (roundExpired()) {
+                    skipByDeadline("二次扫描");
+                } else {
                     Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
                     await Utils.randomDelay(3000, 8000);
                     const newCards = await API.discoverCards();
@@ -9926,15 +9414,26 @@ const __scBgKeepAlive = (function() {
                 } else {
                     Utils.log("⏭️", "Edge 浏览连签已在设置里关闭，本轮跳过（Tasks.edge=关闭）");
                 }
-                /* CDP 收尾（整轮唯一出口）：只把本轮自己开的临时标签页关掉。
-                   这里以前会写「今天不用再开页」的日期标记，等于把 CDP 断到明天；
-                   现在只关页不封盘 —— 下一轮真需要开页时照样能开。 */
+                /* CDP 收尾（整轮唯一出口）：把本轮自己开的临时标签页全部关掉。
+                   只有「活动卡全清 + 首页待领取也过」才封盘到今天结束；
+                   否则下一轮（可能 20 分钟后）还允许再开一次。 */
                 try {
                     const closed = await CDP.closeOwned();
                     if (closed > 0) Utils.log("🖱️", `已关闭 ${closed} 个本轮临时标签页`);
+                    const claimBad = /未成功|异常|待复核/.test(this.claimSummary || "");
+                    /* 桌面周任务也要点头才封盘：它同样靠 CDP 的应用身份通道，
+                       今天那张已解锁的卡没做完就不该把 CDP 断到明天。 */
                     const desktopNeed = !!CDP._desktopNeed;
                     CDP._desktopNeed = false;
-                    if (desktopNeed) Utils.log("🖱️", "还有桌面专属任务没做完，下一轮会自动再开页（不再按天封盘）");
+                    if (CDP._promosClean && !claimBad && !desktopNeed) {
+                        CDP.markTodayDone();
+                        Utils.log("🖱️", "今天所有需要 CDP 的任务都处理完了，之后不再打开标签页（明天自动恢复）");
+                    } else {
+                        CDP._promosClean = false;
+                        Utils.log("🖱️", desktopNeed
+                            ? "还有桌面专属任务没做完，下一轮还要开页（暂不封盘）"
+                            : "还有需要 CDP 的项未完成，下一轮需要时再静默开页");
+                    }
                 } catch (_) {}
                 const endTime = Utils.getTimestamp();
                 const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
@@ -9972,10 +9471,8 @@ const __scBgKeepAlive = (function() {
                     const promosUnknown = !!RewardsAuto.state.promosUnknown && !promosOk;
                     const dailyOk = !!dailySetRes;
                     /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
-                       intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（关闭/到点交班）。 */
+                       intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
                     const intlOk = !Utils.taskOn("Tasks.intlDaily") || intlDailyRes !== false;
-                    /* 同理：Outlook 探索也只是额外分，不参与「全部完成」分母，只做展示；
-                       它的完成口径在下面用 outlookComplete 单独判（含 dropped）。 */
                     const edge = EdgeStreak.summary();
                     const edgeOk = !edge || edge.done || edge.skipped;
                     const mob = info.mobile || {};
@@ -10054,33 +9551,17 @@ const __scBgKeepAlive = (function() {
                                 + " 未确认到账（已交卷，服务端回读仍未完成）");
                         } else {
                             row("🌍 国际版每日活动", intlOn, intlDone >= intlFound,
-                                intlDone + "/" + intlFound);
+                                intlDone + "/" + intlFound
+                                + (RewardsAuto.state.intlCached ? "（今日已封盘）" : ""));
                         }
                     } else if (RewardsAuto.state.intlAbsent) {
                         /* 面板没有这组卡不再是「今天彻底没有」：可能是服务端还没下发，
                            也可能只是这台主机这次没给，稍后会自动重查 */
-                        rows.push("🌍 国际版每日活动 · ⏭️ 本次面板里没有这组卡（下一轮自动重查）");
+                        rows.push(RewardsAuto.state.intlCached
+                            ? "🌍 国际版每日活动 · ⏳ 面板暂未下发这组卡（稍后自动重查）"
+                            : "🌍 国际版每日活动 · ⏭️ 本次面板里没有这组卡（稍后自动重查）");
                     } else {
                         rows.push("🌍 国际版每日活动 · ⏳ 本轮未检查（下一轮再试）");
-                    }
-                    const outlookOn = Utils.taskOn("Tasks.outlook");
-                    const outlookFound = Number(RewardsAuto.state.outlookFound) || 0;
-                    if (!outlookOn) {
-                        row("📮 在 Outlook 中探索", false, true, "");
-                    } else if (outlookFound > 0) {
-                        const oDone = Number(RewardsAuto.state.outlookDone) || 0;
-                        const oPending = Number(RewardsAuto.state.outlookPending) || 0;
-                        if (oDone === 0 && oPending > 0) {
-                            rows.push("📮 在 Outlook 中探索 · ❌ 0/" + outlookFound
-                                + " 未确认到账（已交卷，服务端回读仍未完成）");
-                        } else {
-                            row("📮 在 Outlook 中探索", outlookOn, oDone >= outlookFound,
-                                oDone + "/" + outlookFound);
-                        }
-                    } else if (RewardsAuto.state.outlookAbsent) {
-                        rows.push("📮 在 Outlook 中探索 · ⏭️ 本次面板里没有这组卡（下一轮自动重查）");
-                    } else {
-                        rows.push("📮 在 Outlook 中探索 · ⏳ 本轮未检查（下一轮再试）");
                     }
                     row("🖥️ 桌面专属任务", desktopOn, desktopPending === 0 && desktopFailed === 0,
                         desktopPending > 0 ? `${desktopPending} 张未记账`
@@ -10123,27 +9604,13 @@ const __scBgKeepAlive = (function() {
                             + (!droppedN ? (why ? `（${why}）` : "（下一轮继续）") : ""));
                     }
 
-                    const outlookDroppedN = Number(RewardsAuto.state.outlookDropped) || 0;
-                    const outlookShort = outlookOn && outlookFound > 0
-                        && ((Number(RewardsAuto.state.outlookDone) || 0) < outlookFound
-                            || outlookDroppedN > 0);
-                    if (outlookShort) {
-                        const why = String(RewardsAuto.state.outlookReason || "").trim();
-                        blocked.push(`📮 在 Outlook 中探索 ${Number(RewardsAuto.state.outlookDone) || 0}/${outlookFound} 张`
-                            + (outlookDroppedN > 0 ? `（另有 ${outlookDroppedN} 张面板未下发 hash，脚本无法交卷）` : "")
-                            + (!outlookDroppedN ? (why ? `（${why}）` : "（下一轮继续）") : ""));
-                    }
-
 
                     /* intlDropped > 0 = 面板上还有卡脚本处理不了（如没下发 hash）。
                        这种不算「全部完成」，否则就是骗人：面板亮着卡、却说全完了。 */
                     const intlDroppedN = Number(RewardsAuto.state.intlDropped) || 0;
                     const intlComplete = !intlOn || intlFound === 0
                         || ((Number(RewardsAuto.state.intlDone) || 0) >= intlFound && intlDroppedN === 0);
-                    /* 同理：Outlook 探索还有卡没确认到账时不能报「全部完成」 */
-                    const outlookComplete = !outlookOn || outlookFound === 0
-                        || ((Number(RewardsAuto.state.outlookDone) || 0) >= outlookFound && outlookDroppedN === 0);
-                    const canNotify = allDone && blocked.length === 0 && intlComplete && outlookComplete;
+                    const canNotify = allDone && blocked.length === 0 && intlComplete;
                     const head = allDone
                         ? (canNotify ? "今日任务已全部完成！" : "今日主要任务已完成")
                         : "本轮结果 · 还差 " + (goals.length - doneCount) + " 项";
@@ -10255,7 +9722,7 @@ const __scBgKeepAlive = (function() {
         text += `已记住通道：${saved || "未记录（会按 page → proxy → xhr 逐个试）"}\n`;
         const cdpOk = await CDP.available();
         text += `CDP 调试端口 ${CDP.PORT}：${cdpOk ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
-        text += "临时标签页：按需静默打开，用完自动关闭（不按天封盘）\n";
+        text += `临时标签页：${CDP.todayDone() ? "今日已封盘（CDP 任务都做完了，不再开页）" : "按需静默打开，用完自动关闭"}\n`;
         text += `页面代发服务：${API._pageChannelAlive() ? "✅ 在线" : "❌ 不在线"}\n`;
         const table = ActionMap._readMap();
         text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
@@ -10395,7 +9862,7 @@ const __scBgKeepAlive = (function() {
     GM_registerMenuCommand("🚀 立即运行", async () => {
         const now = Date.now();
         /* 手动运行是强制的：既不看运行时段，也不看今日是否已完成。
-           今天「持续检测」已关闭且判定完成时多说一句，免得用户以为是 bug。 */
+           今天已封盘时多说一句，免得用户以为是 bug。 */
         const dayDone = (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
         Utils.log("🚀", dayDone
             ? "手动触发：今日任务已完成，仍按你的要求强制跑一轮"
@@ -10462,7 +9929,7 @@ const __scBgKeepAlive = (function() {
     const DAILY_KEYS = [
         "Config.tasks", "Config.signPoint",
         "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
-        "Config.edge", "Config.monthlyState",
+        "Config.edge", "Config.monthlyState", "Config.intlDailyDate",
         "Config.searchGuard",
     ];
 
@@ -11038,9 +10505,9 @@ const __scBgKeepAlive = (function() {
             /* 时段内：记一个「窗口开着」的标记，供窗口结束那一刻判断是否要做清理 */
             if (!Number(GM_getValue("Config.windowOpenAt", 0))) GM_setValue("Config.windowOpenAt", now);
 
-            /* ④ 只有「持续检测」关掉时才会停：doneDate 是 today 就不唤醒。
-               doneDate 由 markDayComplete() 写，而它只在 Config.keep=false 时才会被调用，
-               所以开着「持续检测」时这里永远不成立 —— 每轮都会完整重扫。 */
+            /* ④ 关了「持续检测」且今天已封盘（doneDate 是 today）：醒来什么都不做。
+               doneDate 由 markDayComplete() 写，而它现在看的是「服务端结论 ∪ 本地标记」，
+               所以面板显示全部完成时这里一定也能停下来。 */
             const stopped = !Utils.flag("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
             if (stopped) {
@@ -11183,8 +10650,6 @@ const __scBgKeepAlive = (function() {
             edgeDone;
     };
 
-    /* 只在「持续检测」关闭时被调用（唯一两个调用点都先判了 Config.keep）：
-       这是脚本里仅存的「今天不再检测」，其余按天封盘都已移除。 */
     const markDayComplete = () => {
         const today = RewardsAuto.state.dateNowNum;
         const prev = Number(GM_getValue("Config.doneDate", 0)) || 0;
@@ -11343,6 +10808,10 @@ const __scBgKeepAlive = (function() {
         } catch (_) {}
     }
 
+    /* 定时模式入口：只有后台（@crontab 唤醒）上下文才发起任务轮。
+       页面上下文只承担页面代发 / 菜单 / 授权，不再自己跑一轮。
+       runOnce 返回的是「这一轮跑完」的 Promise，跑完上下文就正常结束 ——
+       不再用「永不 resolve 的 Promise」挂住后台，避免每次唤醒都堆一个实例。 */
     if (inBgCtx) {
         return Sched.runOnce(init);
     }
