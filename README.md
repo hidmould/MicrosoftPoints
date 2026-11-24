@@ -84,7 +84,6 @@ https://login.live.com/oauth20_desktop.srf?code=M.C561_BAY.2.U.MsaArtifacts.xxxx
 ---
 
 ## 四、常见问题
-（作者频繁切换账号和IP已被封了个接近 60000 积分的账号）
 
 1. 尽量**同一电脑设备**不要同时维护 2 个及 2 个以上账号 
 
