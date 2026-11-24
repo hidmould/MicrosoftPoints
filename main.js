@@ -359,20 +359,18 @@ const __scBgKeepAlive = (function() {
             intlPending: 0,
             /* 面板上有、但脚本处理不了的卡（缺 hash 等）。>0 时不能报「全部完成」 */
             intlDropped: 0,
-            /* 三个「为什么没有这一行」的标记，互斥：
-               intlAbsent = 账号面板里确实没有这组卡（地区/账号不支持）
-               intlCached = 今天已封盘，本轮没再拉面板（数值来自缓存）
-               都为 false 且 intlFound=0 = 本轮没跑到（出口拦截/被预算挤掉） */
+            /* 两个「为什么没有这一行」的标记，互斥：
+               intlAbsent = 面板里确实没有这组卡（地区/账号不支持或尚未下发）
+               都为 false 且 intlFound=0 = 本轮没跑到（出口拦截/被预算挤掉）
+               没有「今日已封盘」这种状态了：每轮都真的重新拉面板。 */
             intlAbsent: false,
-            intlCached: false,
             /* 「在 Outlook 中探索」：Outlook 面板里那几张 +10 卡（走 bing 的 flyout 接口）。
-               三个标记的含义与 intl* 完全一样，避免汇总里把「没查到」说成「做完了」。 */
+               标记的含义与 intl* 完全一样，避免汇总里把「没查到」说成「做完了」。 */
             outlookFound: 0,
             outlookDone: 0,
             outlookPending: 0,
             outlookDropped: 0,
             outlookAbsent: false,
-            outlookCached: false,
             webNoAuth: false,
             webFailStreak: 0,
             /* 活动卡片「数据源不可用，无法判断是否完成」。和 webNoAuth 一样是
@@ -1807,7 +1805,6 @@ const __scBgKeepAlive = (function() {
         _wsUrl: "",
 
         OWNED_KEY: "Config.cdpOwnedTabs",
-        DONE_KEY: "Config.cdpDoneDate",
 
         /* ---------------- 开页闸门 ----------------
            只有「确实必须用 CDP」的任务才能拿到令牌，其余一律开不出页。
@@ -1834,15 +1831,6 @@ const __scBgKeepAlive = (function() {
             const key = this._allowOnce;
             this._allowOnce = "";
             return Object.prototype.hasOwnProperty.call(this.ALLOW_REASONS, key) ? key : "";
-        },
-
-        todayDone() {
-            const d = Number(GM_getValue(this.DONE_KEY, 0)) || 0;
-            return !!d && d === Utils.getTodayNum();
-        },
-
-        markTodayDone() {
-            try { GM_setValue(this.DONE_KEY, Utils.getTodayNum()); } catch (_) {}
         },
 
         ownedStored() {
@@ -2005,7 +1993,6 @@ const __scBgKeepAlive = (function() {
             if (!create) return null;
             if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
-            if (this.todayDone()) return null;
             const page = await this.openSilent(fallbackUrl || "https://rewards.bing.com/earn");
             return page;
         },
@@ -2145,7 +2132,6 @@ const __scBgKeepAlive = (function() {
             if (!create) return null;
             if (!this.grantOnce(reason)) return null;
             if (!(await this.available())) return null;
-            if (this.todayDone()) return null;
             Utils.log("🖱️", "CDP 可用，静默打开一个后台标签页（不会切走你当前的页面）…");
             const page = await this.openSilent(want);
             if (page) Utils.log("🖱️", "后台标签页已就绪（本轮用完自动关闭）");
@@ -2418,10 +2404,6 @@ const __scBgKeepAlive = (function() {
 
         async claimAll(maxCards, { create = true } = {}) {
             const cap = Number(maxCards) || 6;
-            if (this.todayDone()) {
-                Utils.log("🖱️", "今天需要 CDP 的任务都已处理完，本轮不再连接浏览器调试端口");
-                return { ok: true, handled: 0, done: 0, total: 0, skipped: true };
-            }
             if (!(await this.available())) {
                 const reason = "本地调试端口 " + this.PORT + " 上没有 CDP 服务";
                 this.warn(reason);
@@ -4932,7 +4914,7 @@ const __scBgKeepAlive = (function() {
         /* 读 quest 详情页：优先 CDP 页面通道 + Network.setUserAgentOverride 切桌面应用 UA。
            只有这种读法的 isLocked 才是真值：GM 直读改不了 UA，非应用身份下服务端会把
            整周子项一律渲染成 isLocked=true（2026-11-19 实测：周四那张本已解锁仍报锁定，
-           于是整天漏做）。CDP 不可用（没配 CDP / 今日已封盘 / 开不出页）时退回 GM 直读，
+           于是整天漏做）。CDP 不可用（没配 CDP / 开不出页）时退回 GM 直读，
            并把 lockTrusted 置 false —— 调用方改按 offerId 里的星期推断，不再拿 isLocked 当判据。 */
         async _readQuestPage(url, { create = false } = {}) {
             if (Utils.flag("Config.questViaCdp", true) && typeof WebSocket !== "undefined") {
@@ -5726,9 +5708,9 @@ const __scBgKeepAlive = (function() {
 
             let totalDone = 0, totalFound = 0, totalPending = 0, totalFailed = 0;
             /* 本轮是否还有「该做但没做成 / 解锁态没确认」的桌面任务 ——
-               有的话收尾不能封盘，否则下一轮开不出 CDP 页，整天都补不上。 */
+               收尾只是写一句状态；封盘已移除，下一轮照样会开页。 */
             let desktopNeedCdp = false;
-            /* 这次运行里 CDP 到底能不能用：决定「解锁态没读到」要不要拦住收尾封盘。 */
+            /* 这次运行里 CDP 到底能不能用：决定「解锁态没读到」要不要标记桌面任务未收工。 */
             const cdpUsable = await CDP.available();
             for (const parentId of questIds) {
                 let snap;
@@ -5753,8 +5735,8 @@ const __scBgKeepAlive = (function() {
                     continue;
                 }
                 /* 读到的解锁态不可信 = 这张「当天该做」的判断本身没证据。
-                   只有在 CDP 真的能用时才拉住封盘：没有 CDP 的环境（Chrome 常见）
-                   再怎么等也读不到应用身份页面，硬拦只会让日志一直说「还要开页」。 */
+                   只有在 CDP 真的能用时才标记未收工：没有 CDP 的环境（Chrome 常见）
+                   再怎么等也读不到应用身份页面，硬标只会让日志一直说「还要开页」。 */
                 if (!snap.lockTrusted && cdpUsable) desktopNeedCdp = true;
                 totalFound += snap.cards.length;
                 const open = snap.cards.filter(c => !c.isCompleted);
@@ -5789,7 +5771,7 @@ const __scBgKeepAlive = (function() {
 
                 /* 判据分两套，取决于这次读到的 isLocked 可不可信：
                    ① lockTrusted（CDP 应用身份读的）：isLocked 是真值，照常用；
-                   ② 不可信（没配 CDP / 今日已封盘，退回 GM 直读）：非应用身份下服务端会把
+                   ② 不可信（没配 CDP / 开不出页，退回 GM 直读）：非应用身份下服务端会把
                       整周子项都渲染成 isLocked=true，再拿它当判据就是「今天这张明明解锁也漏做」，
                       所以改按 offerId 里的星期推断：只做「星期已到」的那几张。 */
                 const lockTrusted = !!snap.lockTrusted;
@@ -5939,7 +5921,7 @@ const __scBgKeepAlive = (function() {
                         : 0;
                     const leftLocked = leftLockedCards.length;
                     /* 今天该做的没做成 / 解锁态没读准 —— 都算「桌面任务还没收工」，
-                       收尾不能封盘，下一轮继续开页确认并补做。 */
+                       收尾只写状态，下一轮继续开页确认并补做。 */
                     if (leftUnlocked.length > 0 || (leftOverdue > 0 && cdpUsable) || (!vTrusted && cdpUsable)) {
                         desktopNeedCdp = true;
                     }
@@ -5975,9 +5957,8 @@ const __scBgKeepAlive = (function() {
                 /* 只写日志：这类失败下一轮会重试，收尾通知里也会点名 */
                 Utils.log("🟠", `桌面专属任务本轮有 ${totalFailed} 个入口读取失败，下一轮会再试`);
             }
-            /* 让桌面任务也参与收尾封盘：它同样依赖 CDP 的应用身份通道。
-               以前只有活动卡片会写 _promosClean，于是「今天没卡片」时收尾就把今天封盘，
-               而桌面周任务那张当天已解锁的卡还没做，下一轮连页都开不出来，整天不处理。 */
+            /* 桌面任务同样靠 CDP 的应用身份通道：这里只记录「本轮还没收工」，
+               收尾时用来写一句状态，不再据此把 CDP 封到明天。 */
             if (desktopNeedCdp) CDP._desktopNeed = true;
             return { found: totalFound, done: totalDone, pending: totalPending, failed: totalFailed };
         },
@@ -8679,13 +8660,11 @@ const __scBgKeepAlive = (function() {
                 s.intlDone = 0;
                 s.intlPending = 0;
                 s.intlAbsent = false;
-                s.intlCached = false;
                 s.outlookFound = 0;
                 s.outlookDone = 0;
                 s.outlookPending = 0;
                 s.outlookDropped = 0;
                 s.outlookAbsent = false;
-                s.outlookCached = false;
                 s.webNoAuth = false;
                 s.webFailStreak = 0;
                 s.sendMSG = "";
@@ -8702,9 +8681,9 @@ const __scBgKeepAlive = (function() {
                 API._ckAt = 0;
             });
 
-            /* ④ CDP 的一次性令牌与封盘标记。
-               _promosClean 表示「本轮活动卡是否全清」，是**本轮**结论，
-               跨轮沿用会让下一轮误以为可以直接封盘。 */
+            /* ④ CDP 的一次性令牌与本轮结论标记。
+               _promosClean / _desktopNeed 只描述**本轮**状态（开页白名单、日志口径），
+               不再是「今天不用再开页」的封盘位，因此每轮都会清零重算。 */
             soft("CDP令牌", () => {
                 CDP.revokeAllow();
                 CDP._promosClean = false;
@@ -8805,10 +8784,9 @@ const __scBgKeepAlive = (function() {
 
         async doSign() {
             if (!Utils.taskOn("Tasks.sign") || this.signTimes > 2) return;
-            if (this.signPoint >= 0 && this.signDate === RewardsAuto.state.dateNowNum) {
-                Utils.log("✅", `签入已完成(${this.signPoint}积分)`);
-                return;
-            }
+            /* 以前这里按 signDate 直接短路，等于当天封盘。
+               但同一天也可能再出一次签入（换区、掉签、服务端回滚），
+               交给签入接口自己判重：重复打只会回「已签到」，不会重复加分。 */
             await RegionGuard.guard("签入");
             await Utils.randomDelay();
             let totalPoint = 0;
@@ -8835,7 +8813,10 @@ const __scBgKeepAlive = (function() {
                 this.signDate = RewardsAuto.state.dateNowNum;
                 GM_setValue("Config.signPoint", totalPoint);
                 this.save();
-                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
+                /* 封盘移除后每轮都会重打一次签入：服务端判重、不会重复加分，
+                   所以「本轮 +0」只当背景信息，别每 20 分钟刷一条 🔵。 */
+                if (totalPoint > 0) Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
+                else Utils.logSilenced("  ", "签入已完成（服务端已确认，本轮无新增积分）", "signQuiet", 30 * 60 * 1000);
             } else {
                 this.signTimes++;
                 Utils.log("🟡", `签入失败，稍后重试`);
@@ -9005,10 +8986,9 @@ const __scBgKeepAlive = (function() {
 
         async doPromos(roundDeadline) {
             if (!Utils.taskOn("Tasks.promos") || this.promosTimes > 2) return true;
-            if (this.promosDate === RewardsAuto.state.dateNowNum) {
-                Utils.log("✅", "活动卡片已完成");
-                return true;
-            }
+            /* 不再按 promosDate 短路：当天封盘已移除。
+               每轮都重新扫一遍卡片，已完成的卡由 claimCard 里的
+               isOfferCompleteAny 去重，不会重复上报。 */
             Utils.log("🧩", "扫描活动卡片...");
             try { await API.getCookieHeader(); } catch (_) {}
             const cards = await API.discoverCards();
@@ -9039,7 +9019,7 @@ const __scBgKeepAlive = (function() {
                 RewardsAuto.state.promosUnknown = false;
                 Utils.log("✅", "未发现待处理活动卡片");
                 this.promosDate = RewardsAuto.state.dateNowNum;
-                CDP._promosClean = true;   /* 没有卡片 = 今天不需要 CDP，收尾时直接封盘 */
+                CDP._promosClean = true;   /* 没有卡片 = 本轮不需要 CDP 开页（只是本轮结论，不按天封盘） */
                 this.save();
                 return true;
             }
@@ -9100,13 +9080,10 @@ const __scBgKeepAlive = (function() {
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
             }
-            /* 本轮的 CDP 结果先记着，收标签页与封盘放到整轮末尾做。
-               还有 lockedNow / outOfTime 就不能封盘。 */
+            /* 只记录「本轮 CDP 是否干净」供收尾日志用；不再写任何「今天不用再开页」的日期标记。
+               当天封盘已经移除：下一轮哪怕还缺一张卡，也照样允许再开一次页。 */
             const stillNeedsCdp = outOfTime || lockedNow > 0 || pending > 0;
             CDP._promosClean = !stillNeedsCdp;
-            if (stillNeedsCdp) {
-                try { GM_setValue(CDP.DONE_KEY, 0); } catch (_) {}
-            }
             const manualCards = (RewardsAuto.state.manualCards || []);
             if (manualCards.length > 0) {
                 /* 过程状态：每轮都会重现同一批卡，推送只会变成噪音 */
@@ -9552,44 +9529,9 @@ const __scBgKeepAlive = (function() {
             /* 节拍与搜索/阅读共用 Config.span（最低 60 秒）：
                5 张卡之间各隔一个节拍，而不是十几秒内连着打完。 */
             const gap = SEARCH_PACER.startGap();
-            const today = Utils.getTodayNum();
-            const key = "Config.intlDailyDate";
-            const st = GM_getValue(key, null);
-
-            /* found=0 的记录不能走这里：那只是「这一轮面板没卡」，不是「今天做完了」，
-               交给下面的重新检查分支处理 */
-            /* 封盘条件必须同时满足「没有待办」和「没有处理不了的卡」：
-               只判 pending 的话，缺 hash 的卡会被封盘后永久跳过（与 Outlook 那侧一致）。 */
-            /* v 是封盘记录的版本号：旧格式（没有 dropped、也没做过新鲜度复核）
-               写下的「已完成」一律不认，否则今天会被那条误报的缓存继续压住。 */
-            if (st && Number(st.v) === 2 && Number(st.date) === today && Number(st.pending) === 0
-                && Number(st.found) > 0 && Number(st.dropped || 0) === 0) {
-                RewardsAuto.state.intlFound = Number(st.found) || 0;
-                RewardsAuto.state.intlDone = Number(st.done) || 0;
-                RewardsAuto.state.intlPending = 0;
-                RewardsAuto.state.intlReason = "";
-                RewardsAuto.state.intlCached = true;
-                Utils.log("  ", `国际版每日活动今日已完成（${st.done}/${st.found}），跳过`);
-                return true;
-            }
-            /* 「本轮面板没卡」≠「今天没有这组活动」：推广位是陆续下发的。
-               found=0 只当短时结论，过一会儿重新拉面板。 */
-            if (st && Number(st.date) === today && Number(st.found) === 0) {
-                const stamped = Number(st.at) || 0;
-                const waited = Date.now() - stamped;
-                const RELOOK = 30 * 60 * 1000;
-                if (stamped > 0 && waited < RELOOK) {
-                    RewardsAuto.state.intlFound = 0;
-                    RewardsAuto.state.intlDone = 0;
-                    RewardsAuto.state.intlPending = 0;
-                    RewardsAuto.state.intlAbsent = true;
-                    RewardsAuto.state.intlCached = true;
-                    Utils.log("  ", `国际版每日活动：本轮面板里没有这组卡片`
-                        + `（${Math.max(1, Math.round((RELOOK - waited) / 60000))} 分钟后重新检查）`);
-                    return true;
-                }
-                Utils.log("  ", "国际版每日活动：上次没看到卡片，这次重新拉一次面板");
-            }
+            /* 当天封盘已整体移除：不再读 Config.intlDailyDate 的「今天已完成」记录，
+               也不再因为「上一轮面板里没卡」而跳过。每一轮都真的重新拉面板，
+               已完成与否只认这一轮服务端返回的卡片状态（面板说全完成时仍会复核新鲜度）。 */
             let res = null;
             try {
                 res = await IntlDaily.run({ reason: "国际版每日活动", gap, deadline: roundDeadline });
@@ -9600,8 +9542,8 @@ const __scBgKeepAlive = (function() {
             if (!res) return false;
             if (res.found === 0) {
                 /* 面板里一张都没有：这账号本来就没有这组活动（地区/账号不支持）。
-                   和「代码没跑到」是两回事，日志里要能一眼区分，否则下次又得回来查。 */
-                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0, at: Date.now() });
+                   和「代码没跑到」是两回事，日志里要能一眼区分，否则下次又得回来查。
+                   不写任何当日记录：下一轮照常重新拉面板。 */
                 RewardsAuto.state.intlFound = 0;
                 RewardsAuto.state.intlDone = 0;
                 RewardsAuto.state.intlPending = 0;
@@ -9610,11 +9552,8 @@ const __scBgKeepAlive = (function() {
                 return true;
             }
             RewardsAuto.state.intlAbsent = false;
-            RewardsAuto.state.intlCached = false;
-            /* 把 dropped 也存进去：只有「没有待办 + 没有把握不了的卡」才允许封盘。
-               否则那些没 hash 的卡会被永久跳过（封盘后当天不再重试）。 */
+            /* 不再写当日封盘记录：每轮都以这一轮的面板结果为准 */
             const droppedN = Number(res.dropped) || 0;
-            GM_setValue(key, { v: 2, date: today, found: res.found, done: res.done, pending: res.pending, dropped: droppedN, at: Date.now() });
             RewardsAuto.state.intlFound = res.found;
             RewardsAuto.state.intlDone = res.done;
             RewardsAuto.state.intlPending = res.pending;
@@ -9623,8 +9562,8 @@ const __scBgKeepAlive = (function() {
             return res.pending === 0 && droppedN === 0;
         },
 
-        /* 在 Outlook 中探索：与 doIntlDaily 同一套「今天做完就封盘」的写法，
-           但记录的键与 state 字段都分开，两边互不影响。 */
+        /* 在 Outlook 中探索：与 doIntlDaily 同一套写法，state 字段分开，两边互不影响。
+           注意：这里不写任何「今天已完成」的封盘记录，每轮都重新拉面板。 */
         async doOutlookExplore(roundDeadline) {
             /* 同样用 allow()：这组卡只是额外的分数，出口探测抖动不该中断整轮 */
             if (!(await RegionGuard.allow())) {
@@ -9632,38 +9571,8 @@ const __scBgKeepAlive = (function() {
                 return false;
             }
             const gap = SEARCH_PACER.startGap();
-            const today = Utils.getTodayNum();
-            const key = "Config.outlookDate";
-            const st = GM_getValue(key, null);
-
-            /* found=0 的记录不能当「今天做完了」，原因同国际版：那只是这一轮面板没给卡 */
-            /* 同上：旧格式记录不认，需重新确认一次 */
-            if (st && Number(st.v) === 2 && Number(st.date) === today && Number(st.pending) === 0
-                && Number(st.found) > 0 && Number(st.dropped || 0) === 0) {
-                RewardsAuto.state.outlookFound = Number(st.found) || 0;
-                RewardsAuto.state.outlookDone = Number(st.done) || 0;
-                RewardsAuto.state.outlookPending = 0;
-                RewardsAuto.state.outlookReason = "";
-                RewardsAuto.state.outlookCached = true;
-                Utils.log("  ", `在 Outlook 中探索今日已完成（${st.done}/${st.found}），跳过`);
-                return true;
-            }
-            if (st && Number(st.date) === today && Number(st.found) === 0) {
-                const stamped = Number(st.at) || 0;
-                const waited = Date.now() - stamped;
-                const RELOOK = 30 * 60 * 1000;
-                if (stamped > 0 && waited < RELOOK) {
-                    RewardsAuto.state.outlookFound = 0;
-                    RewardsAuto.state.outlookDone = 0;
-                    RewardsAuto.state.outlookPending = 0;
-                    RewardsAuto.state.outlookAbsent = true;
-                    RewardsAuto.state.outlookCached = true;
-                    Utils.log("  ", `在 Outlook 中探索：本轮面板里没有这组卡片`
-                        + `（${Math.max(1, Math.round((RELOOK - waited) / 60000))} 分钟后重新检查）`);
-                    return true;
-                }
-                Utils.log("  ", "在 Outlook 中探索：上次没看到卡片，这次重新拉一次面板");
-            }
+            /* 当天封盘已整体移除：不再读 Config.outlookDate 的「今天已完成」记录，
+               也不再因为「上一轮面板里没卡」而跳过；每轮都真的重新拉一次面板。 */
             let res = null;
             try {
                 res = await OutlookExplore.run({
@@ -9678,8 +9587,8 @@ const __scBgKeepAlive = (function() {
             if (!res) return false;
             if (res.found === 0) {
                 /* 面板里一张都没有：可能这账号本来就没有这组卡，也可能服务端还没下发。
-                   和「代码没跑到」是两回事，日志与汇总都要能一眼区分。 */
-                GM_setValue(key, { date: today, found: 0, done: 0, pending: 0, dropped: 0, at: Date.now() });
+                   和「代码没跑到」是两回事，日志与汇总都要能一眼区分。
+                   不写当日记录：下一轮照常重新拉面板。 */
                 RewardsAuto.state.outlookFound = 0;
                 RewardsAuto.state.outlookDone = 0;
                 RewardsAuto.state.outlookPending = 0;
@@ -9688,18 +9597,8 @@ const __scBgKeepAlive = (function() {
                 return true;
             }
             RewardsAuto.state.outlookAbsent = false;
-            RewardsAuto.state.outlookCached = false;
-            /* dropped 一起存：只有「没有待办 + 没有处理不了的卡」才允许封盘 */
+            /* 不再写当日封盘记录：每轮都以这一轮的面板结果为准 */
             const droppedN = Number(res.dropped) || 0;
-            GM_setValue(key, {
-                v: 2,
-                date: today,
-                found: res.found,
-                done: res.done,
-                pending: res.pending,
-                dropped: droppedN,
-                at: Date.now()
-            });
             RewardsAuto.state.outlookFound = res.found;
             RewardsAuto.state.outlookDone = res.done;
             RewardsAuto.state.outlookPending = res.pending;
@@ -9976,9 +9875,10 @@ const __scBgKeepAlive = (function() {
                     if (e && e.regionBlocked) throw e;
                     Utils.log("🟡", `领取积分执行异常: ${e.message}`);
                 }
-                if (roundExpired()) {
-                    skipByDeadline("二次扫描");
-                } else {
+                /* 二次扫描不再被「本轮预算到点」跳过：用户要的是每次都要扫一遍。
+                   单张卡之间仍用 SEARCH_PACER.fits 逐张判断，真到点了只停剩下的卡，
+                   整轮下次唤醒照常重扫。 */
+                {
                     Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
                     await Utils.randomDelay(3000, 8000);
                     const newCards = await API.discoverCards();
@@ -10026,26 +9926,15 @@ const __scBgKeepAlive = (function() {
                 } else {
                     Utils.log("⏭️", "Edge 浏览连签已在设置里关闭，本轮跳过（Tasks.edge=关闭）");
                 }
-                /* CDP 收尾（整轮唯一出口）：把本轮自己开的临时标签页全部关掉。
-                   只有「活动卡全清 + 首页待领取也过」才封盘到今天结束；
-                   否则下一轮（可能 20 分钟后）还允许再开一次。 */
+                /* CDP 收尾（整轮唯一出口）：只把本轮自己开的临时标签页关掉。
+                   这里以前会写「今天不用再开页」的日期标记，等于把 CDP 断到明天；
+                   现在只关页不封盘 —— 下一轮真需要开页时照样能开。 */
                 try {
                     const closed = await CDP.closeOwned();
                     if (closed > 0) Utils.log("🖱️", `已关闭 ${closed} 个本轮临时标签页`);
-                    const claimBad = /未成功|异常|待复核/.test(this.claimSummary || "");
-                    /* 桌面周任务也要点头才封盘：它同样靠 CDP 的应用身份通道，
-                       今天那张已解锁的卡没做完就不该把 CDP 断到明天。 */
                     const desktopNeed = !!CDP._desktopNeed;
                     CDP._desktopNeed = false;
-                    if (CDP._promosClean && !claimBad && !desktopNeed) {
-                        CDP.markTodayDone();
-                        Utils.log("🖱️", "今天所有需要 CDP 的任务都处理完了，之后不再打开标签页（明天自动恢复）");
-                    } else {
-                        CDP._promosClean = false;
-                        Utils.log("🖱️", desktopNeed
-                            ? "还有桌面专属任务没做完，下一轮还要开页（暂不封盘）"
-                            : "还有需要 CDP 的项未完成，下一轮需要时再静默开页");
-                    }
+                    if (desktopNeed) Utils.log("🖱️", "还有桌面专属任务没做完，下一轮会自动再开页（不再按天封盘）");
                 } catch (_) {}
                 const endTime = Utils.getTimestamp();
                 const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
@@ -10083,7 +9972,7 @@ const __scBgKeepAlive = (function() {
                     const promosUnknown = !!RewardsAuto.state.promosUnknown && !promosOk;
                     const dailyOk = !!dailySetRes;
                     /* 国际版每日活动是额外 25 分，不参与「全部完成」判定，只做展示。
-                       intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（封盘/关闭）。 */
+                       intlDailyRes 为 false 表示本轮交卷有失败；null 表示没跑（关闭/到点交班）。 */
                     const intlOk = !Utils.taskOn("Tasks.intlDaily") || intlDailyRes !== false;
                     /* 同理：Outlook 探索也只是额外分，不参与「全部完成」分母，只做展示；
                        它的完成口径在下面用 outlookComplete 单独判（含 dropped）。 */
@@ -10165,15 +10054,12 @@ const __scBgKeepAlive = (function() {
                                 + " 未确认到账（已交卷，服务端回读仍未完成）");
                         } else {
                             row("🌍 国际版每日活动", intlOn, intlDone >= intlFound,
-                                intlDone + "/" + intlFound
-                                + (RewardsAuto.state.intlCached ? "（今日已封盘）" : ""));
+                                intlDone + "/" + intlFound);
                         }
                     } else if (RewardsAuto.state.intlAbsent) {
                         /* 面板没有这组卡不再是「今天彻底没有」：可能是服务端还没下发，
                            也可能只是这台主机这次没给，稍后会自动重查 */
-                        rows.push(RewardsAuto.state.intlCached
-                            ? "🌍 国际版每日活动 · ⏳ 面板暂未下发这组卡（稍后自动重查）"
-                            : "🌍 国际版每日活动 · ⏭️ 本次面板里没有这组卡（稍后自动重查）");
+                        rows.push("🌍 国际版每日活动 · ⏭️ 本次面板里没有这组卡（下一轮自动重查）");
                     } else {
                         rows.push("🌍 国际版每日活动 · ⏳ 本轮未检查（下一轮再试）");
                     }
@@ -10189,13 +10075,10 @@ const __scBgKeepAlive = (function() {
                                 + " 未确认到账（已交卷，服务端回读仍未完成）");
                         } else {
                             row("📮 在 Outlook 中探索", outlookOn, oDone >= outlookFound,
-                                oDone + "/" + outlookFound
-                                + (RewardsAuto.state.outlookCached ? "（今日已封盘）" : ""));
+                                oDone + "/" + outlookFound);
                         }
                     } else if (RewardsAuto.state.outlookAbsent) {
-                        rows.push(RewardsAuto.state.outlookCached
-                            ? "📮 在 Outlook 中探索 · ⏳ 面板暂未下发这组卡（稍后自动重查）"
-                            : "📮 在 Outlook 中探索 · ⏭️ 本次面板里没有这组卡（稍后自动重查）");
+                        rows.push("📮 在 Outlook 中探索 · ⏭️ 本次面板里没有这组卡（下一轮自动重查）");
                     } else {
                         rows.push("📮 在 Outlook 中探索 · ⏳ 本轮未检查（下一轮再试）");
                     }
@@ -10372,7 +10255,7 @@ const __scBgKeepAlive = (function() {
         text += `已记住通道：${saved || "未记录（会按 page → proxy → xhr 逐个试）"}\n`;
         const cdpOk = await CDP.available();
         text += `CDP 调试端口 ${CDP.PORT}：${cdpOk ? `✅ 可连（${CDP.base()}）` : "❌ 不可连"}\n`;
-        text += `临时标签页：${CDP.todayDone() ? "今日已封盘（CDP 任务都做完了，不再开页）" : "按需静默打开，用完自动关闭"}\n`;
+        text += "临时标签页：按需静默打开，用完自动关闭（不按天封盘）\n";
         text += `页面代发服务：${API._pageChannelAlive() ? "✅ 在线" : "❌ 不在线"}\n`;
         const table = ActionMap._readMap();
         text += `标识表：${Object.keys(table).length ? `已缓存 ${Object.keys(table).length} 个（部署 ${GM_getValue("Config.actionDpl", "未知")}）` : "空（用已知兜底标识）"}\n`;
@@ -10512,7 +10395,7 @@ const __scBgKeepAlive = (function() {
     GM_registerMenuCommand("🚀 立即运行", async () => {
         const now = Date.now();
         /* 手动运行是强制的：既不看运行时段，也不看今日是否已完成。
-           今天已封盘时多说一句，免得用户以为是 bug。 */
+           今天「持续检测」已关闭且判定完成时多说一句，免得用户以为是 bug。 */
         const dayDone = (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
         Utils.log("🚀", dayDone
             ? "手动触发：今日任务已完成，仍按你的要求强制跑一轮"
@@ -10579,8 +10462,7 @@ const __scBgKeepAlive = (function() {
     const DAILY_KEYS = [
         "Config.tasks", "Config.signPoint",
         "Config.dailySetProcessed", "Config.dailySetDoneDate", "Config.doneDate",
-        "Config.edge", "Config.monthlyState", "Config.intlDailyDate",
-        "Config.outlookDate",
+        "Config.edge", "Config.monthlyState",
         "Config.searchGuard",
     ];
 
@@ -11156,9 +11038,9 @@ const __scBgKeepAlive = (function() {
             /* 时段内：记一个「窗口开着」的标记，供窗口结束那一刻判断是否要做清理 */
             if (!Number(GM_getValue("Config.windowOpenAt", 0))) GM_setValue("Config.windowOpenAt", now);
 
-            /* ④ 关了「持续检测」且今天已封盘（doneDate 是 today）：醒来什么都不做。
-               doneDate 由 markDayComplete() 写，而它现在看的是「服务端结论 ∪ 本地标记」，
-               所以面板显示全部完成时这里一定也能停下来。 */
+            /* ④ 只有「持续检测」关掉时才会停：doneDate 是 today 就不唤醒。
+               doneDate 由 markDayComplete() 写，而它只在 Config.keep=false 时才会被调用，
+               所以开着「持续检测」时这里永远不成立 —— 每轮都会完整重扫。 */
             const stopped = !Utils.flag("Config.keep", true)
                 && (Number(GM_getValue("Config.doneDate", 0)) || 0) === Utils.getTodayNum();
             if (stopped) {
@@ -11301,6 +11183,8 @@ const __scBgKeepAlive = (function() {
             edgeDone;
     };
 
+    /* 只在「持续检测」关闭时被调用（唯一两个调用点都先判了 Config.keep）：
+       这是脚本里仅存的「今天不再检测」，其余按天封盘都已移除。 */
     const markDayComplete = () => {
         const today = RewardsAuto.state.dateNowNum;
         const prev = Number(GM_getValue("Config.doneDate", 0)) || 0;
@@ -11459,10 +11343,6 @@ const __scBgKeepAlive = (function() {
         } catch (_) {}
     }
 
-    /* 定时模式入口：只有后台（@crontab 唤醒）上下文才发起任务轮。
-       页面上下文只承担页面代发 / 菜单 / 授权，不再自己跑一轮。
-       runOnce 返回的是「这一轮跑完」的 Promise，跑完上下文就正常结束 ——
-       不再用「永不 resolve 的 Promise」挂住后台，避免每次唤醒都堆一个实例。 */
     if (inBgCtx) {
         return Sched.runOnce(init);
     }
